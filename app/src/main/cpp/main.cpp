@@ -4608,7 +4608,7 @@ void android_main(struct android_app *state)
                 engine.alignedSnapshot.headPose.quat[2] = dp.orientation.z;
                 engine.alignedSnapshot.headPose.quat[3] = dp.orientation.w;
                 engine.alignedSnapshot.headPose.valid = true;
-            }
+            }fuck
             // Hand tracking
             auto& snap = engine.alignedSnapshot;
             snap.leftHand.active = engine.mHandTrackerLogic.LeftHandIsActive;
