@@ -196,7 +196,7 @@ bool DatasetRecorder::writeCaptureStatusJson(const std::string& state, const Raw
     }
 
     const int64_t nowMs = currentUnixTimeMs();
-    const int64_t captureDurationMs = (mCaptureStartUnixMs > 0) ? (mCaptureStopUnixMs - mCaptureStartUnixMs) : 0;
+    const int64_t captureDurationMs = (mCaptureStartUnixMs > 0 && mCaptureStopUnixMs > 0) ? (mCaptureStopUnixMs - mCaptureStartUnixMs) : 0;
 
     const std::string jsonPath = mDatasetDir + "/capture_status.json";
     std::ofstream f(jsonPath, std::ios::out | std::ios::trunc);
