@@ -100,6 +100,7 @@ bool RawDateSave::StartNewSession(const std::string& csvPath) {
 
     m_csvFile << GenerateCsvHeader();
     m_csvFile.flush();
+    m_finished = false;
     m_sessionActive = true;
 
     LOGI("RawDateSave session started: %s", csvPath.c_str());
@@ -107,6 +108,16 @@ bool RawDateSave::StartNewSession(const std::string& csvPath) {
 }
 
 void RawDateSave::StopSession() {
+    m_isPaused = false;
+    m_queueCondition.notify_all();
+
+    {
+        std::unique_lock<std::mutex> lock(m_queueMutex);
+        m_queueCondition.wait(lock, [this] {
+            return m_frameQueue.empty() && !m_isSaving.load();
+        });
+    }
+
     m_sessionActive = false;
 
     std::lock_guard<std::mutex> lock(m_csvMutex);
@@ -114,6 +125,7 @@ void RawDateSave::StopSession() {
         m_csvFile.flush();
         m_csvFile.close();
     }
+    m_finished = true;
 
     LOGI("RawDateSave session stopped");
 }
@@ -213,15 +225,14 @@ void RawDateSave::SaveWorkerThread() {
                 continue;
             }
 
+            m_isSaving = true;
             frameData = m_frameQueue.front();
             m_frameQueue.pop();
         }
 
-        // 保存数据
-        m_isSaving = true;
-
         if (!m_sessionActive.load()) {
             m_isSaving = false;
+            m_queueCondition.notify_all();
             continue;
         }
 
@@ -237,6 +248,7 @@ void RawDateSave::SaveWorkerThread() {
 
         m_savedFrameCount++;
         m_isSaving = false;
+        m_queueCondition.notify_all();
     }
 
     LOGI("SaveWorkerThread ended");

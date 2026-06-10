@@ -27,6 +27,7 @@ public:
     void stop();
 
     bool isRecording() const { return mRunning.load(); }
+    bool isFinished() const { return mFinished.load(); }
 
 private:
     void initEncoder(const std::string& outputPath);
@@ -56,6 +57,7 @@ private:
     std::thread mInputThread;
     std::thread mOutputThread;
     std::atomic<bool> mRunning{false};
+    std::atomic<bool> mFinished{ false};
     std::mutex mMutex;
 
     std::queue<PcmFrame> mPcmQueue;

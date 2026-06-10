@@ -101,6 +101,8 @@ public:
     // 设置是否正在保存
     bool IsSaving() const { return m_isSaving.load(); }
 
+    bool IsFinished() const { return m_finished.load(); }
+
     // 重置帧计数器
     void ResetFrameCounter() { m_frameCounter = 0; }
 
@@ -159,6 +161,7 @@ private:
 
     // Whether a recording session is active
     std::atomic<bool> m_sessionActive{false};
+    std::atomic<bool> m_finished{false};
 };
 
 #endif //HELLOXR_RAWDATESAVE_H

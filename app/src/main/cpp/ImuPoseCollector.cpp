@@ -51,6 +51,7 @@ bool ImuPoseCollector::start(const std::string& accelCsvPath, const std::string&
     mWriterThread = std::thread(&ImuPoseCollector::writerThreadFunc, this);
 
     mRunning = true;
+    mFinished = false;
     mSensorThread = std::thread(&ImuPoseCollector::sensorThreadFunc, this);
 
     LOGI("ImuPoseCollector started: %s, %s", accelCsvPath.c_str(), gyroCsvPath.c_str());
@@ -84,6 +85,8 @@ void ImuPoseCollector::stop() {
 
     if (mAccelFile.is_open()) { mAccelFile.flush(); mAccelFile.close(); }
     if (mGyroFile.is_open()) { mGyroFile.flush(); mGyroFile.close(); }
+
+    mFinished = true;
 
     LOGI("ImuPoseCollector stopped. Accel: %lu, Gyro: %lu",
          (unsigned long)mAccelCount.load(), (unsigned long)mGyroCount.load());

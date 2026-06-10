@@ -164,6 +164,7 @@ bool AudioEncoder::start(const std::string& outputPath) {
     }
 
     mRunning = true;
+    mFinished = false;
     mRecordingThread = std::thread(&AudioEncoder::recordingLoop, this);
     mInputThread = std::thread(&AudioEncoder::inputLoop, this);
     mOutputThread = std::thread(&AudioEncoder::outputLoop, this);
@@ -477,6 +478,8 @@ void AudioEncoder::stop() {
         std::lock_guard<std::mutex> lock(mQueueMutex);
         while (!mPcmQueue.empty()) mPcmQueue.pop();
     }
+
+    mFinished = true;
 
     AE_LOGI("AudioEncoder stopped: %s (read=%lu, dropped=%lu)",
             mOutputPath.c_str(),

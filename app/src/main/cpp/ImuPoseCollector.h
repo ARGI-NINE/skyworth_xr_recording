@@ -22,6 +22,7 @@ public:
     void stop();
 
     bool isRunning() const { return mRunning.load(); }
+    bool isFinished() const { return mFinished.load(); }
 
 private:
     void sensorThreadFunc();
@@ -40,6 +41,7 @@ private:
     ALooper* mLooper{nullptr};
     std::thread mSensorThread;
     std::atomic<bool> mRunning{false};
+    std::atomic<bool> mFinished{false};
 
     // Write queue
     std::queue<ImuEvent> mWriteQueue;

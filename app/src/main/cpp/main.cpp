@@ -2885,6 +2885,8 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartRecording(JNIEnv *env, jobjec
         } else {
             g_engine->mHandTrackerLogic.rawDateSave->StartNewSession(
                 g_engine->mDatasetRecorder.getHandTrackingCsvPath());
+            g_engine->mDatasetRecorder.writeCaptureStatusJson(
+                "recording", g_engine->mHandTrackerLogic.rawDateSave);
         }
         ttsSpeak("开始录制");
     }
@@ -2895,6 +2897,10 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeStopRecording(JNIEnv *env, jobject
     if (g_engine && g_engine->mDatasetRecorder.isRecording()) {
         LOGI("Stop recording via intent (async)");
         g_engine->mCameraAccessExtension.encodingEnabled = false;
+        if (!g_engine->useControllerMode) {
+            g_engine->mDatasetRecorder.writeCaptureStatusJson(
+                "finalizing", g_engine->mHandTrackerLogic.rawDateSave);
+        }
         // Stop encoder first, then stop recorder in the same async thread.
         // This ordering guarantees that saveAlignedSensorData (called from the
         // render thread during encoder submission) completes before the recorder
@@ -2908,6 +2914,8 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeStopRecording(JNIEnv *env, jobject
                 g_engine->mControllerPoseSaver.StopSession();
             } else {
                 g_engine->mHandTrackerLogic.rawDateSave->StopSession();
+                g_engine->mDatasetRecorder.writeCaptureStatusJson(
+                    "complete", g_engine->mHandTrackerLogic.rawDateSave);
             }
             ttsSpeak("录制已保存");
             LOGI("Intent: Async encoder + recorder stop completed");
@@ -4722,11 +4730,17 @@ void android_main(struct android_app *state)
                 } else {
                     engine.mHandTrackerLogic.rawDateSave->StartNewSession(
                         engine.mDatasetRecorder.getHandTrackingCsvPath());
+                    engine.mDatasetRecorder.writeCaptureStatusJson(
+                        "recording", engine.mHandTrackerLogic.rawDateSave);
                 }
                 ttsSpeak("开始录制");
             } else {
                 LOGI("Stopping dataset recording (right B, async)...");
                 engine.mCameraAccessExtension.encodingEnabled = false;
+                if (!engine.useControllerMode) {
+                    engine.mDatasetRecorder.writeCaptureStatusJson(
+                        "finalizing", engine.mHandTrackerLogic.rawDateSave);
+                }
                 std::thread([&engine]() {
                     engine.mCameraAccessExtension.stopEncoder();
                     engine.mCameraAccessExtension.encoderBaseDir.clear();
@@ -4736,6 +4750,8 @@ void android_main(struct android_app *state)
                         engine.mControllerPoseSaver.StopSession();
                     } else {
                         engine.mHandTrackerLogic.rawDateSave->StopSession();
+                        engine.mDatasetRecorder.writeCaptureStatusJson(
+                            "complete", engine.mHandTrackerLogic.rawDateSave);
                     }
                     ttsSpeak("录制已保存");
                     LOGI("Right B: Async encoder + recorder stop completed");
