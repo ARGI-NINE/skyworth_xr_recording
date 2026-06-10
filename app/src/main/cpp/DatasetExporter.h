@@ -25,6 +25,8 @@ private:
     std::vector<std::string> listDatasetDirs() const;
     bool isComplete(const std::string& datasetDir) const;
     bool exportDataset(const std::string& datasetDir) const;
+    bool copyFile(const std::string& srcPath, const std::string& dstPath) const;
+    bool deleteDir(const std::string& dirPath) const;
     std::string readJsonToString(const std::string& filepath) const;
     std::string joinPath(const std::string& dir1, const std::string& dir2) const;
 
