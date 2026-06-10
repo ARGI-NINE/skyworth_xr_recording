@@ -196,11 +196,7 @@ bool DatasetRecorder::writeCaptureStatusJson(const std::string& state, const Raw
     }
 
     const int64_t nowMs = currentUnixTimeMs();
-    const bool captureEnded = captureState != "recording";
-    const int64_t endedAtUnixMs = mCaptureStopUnixMs > 0 ? mCaptureStopUnixMs : (captureEnded ? nowMs : 0);
-    const int64_t durationMs = (mCaptureStartUnixMs > 0)
-        ? ((endedAtUnixMs > 0 ? endedAtUnixMs : nowMs) - mCaptureStartUnixMs)
-        : 0;
+    const int64_t captureDurationMs = (mCaptureStartUnixMs > 0) ? (mCaptureStopUnixMs - mCaptureStartUnixMs) : 0;
 
     const std::string jsonPath = mDatasetDir + "/capture_status.json";
     std::ofstream f(jsonPath, std::ios::out | std::ios::trunc);
@@ -213,9 +209,9 @@ bool DatasetRecorder::writeCaptureStatusJson(const std::string& state, const Raw
     json << "{\n"
          << "  \"state\": \"" << captureState << "\",\n"
          << "  \"dataset_dir\": \"" << mDatasetDir << "\",\n"
-         << "  \"started_time_at_local\": \"" << formatUnixTimeMs(mCaptureStartUnixMs) << "\",\n"
-         << "  \"ended_time_at_local\": \"" << formatUnixTimeMs(endedAtUnixMs) << "\",\n"
-         << "  \"duration_ms\": " << durationMs << "\n"
+         << "  \"capture_started_at_local\": \"" << formatUnixTimeMs(mCaptureStartUnixMs) << "\",\n"
+         << "  \"capture_ended_at_local\": \"" << formatUnixTimeMs(mCaptureStopUnixMs) << "\",\n"
+         << "  \"capture_duration_ms\": " << captureDurationMs << ",\n"
          << "}\n";
 
     f << json.str();
