@@ -25,6 +25,7 @@ import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Message;
 import android.preference.PreferenceManager;
@@ -63,11 +64,14 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     public static final String ACTION_SAVE_IMAGE = "com.ssnwt.helloxr.SAVE_IMAGE";
     public static final String ACTION_START_RECORDING = "com.ssnwt.helloxr.START_RECORDING";
     public static final String ACTION_STOP_RECORDING = "com.ssnwt.helloxr.STOP_RECORDING";
+    private static final String EXPORT_DIR_NAME = "Export";
 
     // Native methods for intent control
     public native void nativeRequestSnapshot();
     public native void nativeStartRecording();
     public native void nativeStopRecording();
+    public native void nativeStartExportManager(String datasetRoot, String exportRoot);
+    public native void nativeStopExportManager();
     private BatteryManager mBatteryManager;
     private BatteryInfo mBatteryInfo;
     private boolean isRegisterReceiver = false;
@@ -84,6 +88,8 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     private int mSoundImageFailed;
     private int mSoundRecordingStart;
     private int mSoundRecordingStop;
+    private String mDatasetRootPath;
+    private String mActiveExportRoot;
     private Handler mHandler = new Handler() {
         @Override public void handleMessage(@NonNull Message msg) {
             switch (msg.what) {
@@ -129,6 +135,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         }
 
         super.onCreate(savedInstanceState);
+        initExportManagerConfig();
         initSvrApi();
         mBatteryManager = (BatteryManager) getSystemService(BATTERY_SERVICE);
         mBatteryInfo = new BatteryInfo();
@@ -391,6 +398,17 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             cmdFilter.addAction(ACTION_STOP_RECORDING);
             registerReceiver(mCommandReceiver, cmdFilter);
 
+            IntentFilter usbFilter = new IntentFilter();
+            usbFilter.addAction(Intent.ACTION_MEDIA_MOUNTED);
+            usbFilter.addAction(Intent.ACTION_MEDIA_UNMOUNTED);
+            usbFilter.addAction(Intent.ACTION_MEDIA_REMOVED);
+            usbFilter.addAction(Intent.ACTION_MEDIA_EJECT);
+            usbFilter.addAction(Intent.ACTION_MEDIA_BAD_REMOVAL);
+            usbFilter.addDataScheme("file");
+            registerReceiver(mUsbReceiver, usbFilter);
+
+            refreshExportUsbRoot();
+
             isRegisterReceiver = true;
         }
     }
@@ -401,6 +419,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             unregisterReceiver(mBroadcastReceiver);
             unregisterReceiver(bluetoothReceiver);
             unregisterReceiver(mCommandReceiver);
+            unregisterReceiver(mUsbReceiver);
             isRegisterReceiver = false;
         }
     }
@@ -462,6 +481,88 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         while ((read = in.read(buffer)) != -1) {
             out.write(buffer, 0, read);
         }
+    }
+
+    private void initExportManagerConfig() {
+        File externalFilesDir = getExternalFilesDir(null);
+        if (externalFilesDir == null) {
+            Log.w(TAG, "initExportManagerConfig: external files dir is null");
+            return;
+        }
+
+        File datasetRoot = new File(externalFilesDir, "dataset");
+        mDatasetRootPath = datasetRoot.getAbsolutePath();
+    }
+
+    private void refreshExportUsbRoot() {
+        if (mDatasetRootPath == null || mDatasetRootPath.isEmpty()) {
+            Log.w(TAG, "refreshExportUsbRoot: dataset root not ready");
+            return;
+        }
+
+        String usbRoot = findMountedUsbRoot();
+        if (usbRoot == null) {
+            Log.i(TAG, "refreshExportUsbRoot: no mounted removable storage");
+            if (mActiveExportRoot == null) {
+                return;
+            }
+            try {
+                nativeStopExportManager();
+                mActiveExportRoot = null;
+            } catch (UnsatisfiedLinkError e) {
+                Log.w(TAG, "nativeStopExportManager not implemented yet", e);
+            }
+            return;
+        }
+
+        File exportRoot = new File(usbRoot, EXPORT_DIR_NAME);
+        String exportRootPath = exportRoot.getAbsolutePath();
+        if (exportRootPath.equals(mActiveExportRoot)) {
+            return;
+        }
+
+        if (mActiveExportRoot != null) {
+            try {
+                nativeStopExportManager();
+            } catch (UnsatisfiedLinkError e) {
+                Log.w(TAG, "nativeStopExportManager not implemented yet", e);
+            }
+        }
+
+        Log.i(TAG, "refreshExportUsbRoot: start export manager with " + exportRootPath);
+        try {
+            nativeStartExportManager(mDatasetRootPath, exportRootPath);
+            mActiveExportRoot = exportRootPath;
+        } catch (UnsatisfiedLinkError e) {
+            Log.w(TAG, "nativeStartExportManager not implemented yet", e);
+        }
+    }
+
+    private String findMountedUsbRoot() {
+        File[] externalDirs = getExternalFilesDirs(null);
+        if (externalDirs == null) {
+            return null;
+        }
+
+        for (File dir : externalDirs) {
+            if (dir == null) {
+                continue;
+            }
+            if (!Environment.MEDIA_MOUNTED.equals(Environment.getExternalStorageState(dir))) {
+                continue;
+            }
+            if (!Environment.isExternalStorageRemovable(dir)) {
+                continue;
+            }
+
+            String path = dir.getAbsolutePath();
+            int androidDataIndex = path.indexOf("/Android/data/");
+            if (androidDataIndex <= 0) {
+                continue;
+            }
+            return path.substring(0, androidDataIndex);
+        }
+        return null;
     }
 
     @Override public void onStartHome() {
@@ -612,6 +713,15 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
                 Log.i(TAG, "Intent: STOP_RECORDING");
                 nativeStopRecording();
             }
+        }
+    };
+
+    private final BroadcastReceiver mUsbReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            Log.i(TAG, "USB storage broadcast: " + action);
+            refreshExportUsbRoot();
         }
     };
 }

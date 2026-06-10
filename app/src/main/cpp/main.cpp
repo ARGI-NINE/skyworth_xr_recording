@@ -2625,6 +2625,7 @@ struct engine : public AppCommon::base_engine {
     HandTrackerLogic mHandTrackerLogic{this};
     HandOverlayRenderer handOverlay;
     DatasetRecorder mDatasetRecorder;
+    DatasetExporter mDatasetExporter;
     ControllerPoseSaver mControllerPoseSaver;
     uint64_t controllerFrameCounter = 0;
     std::unique_ptr<Input> inputPtr;
