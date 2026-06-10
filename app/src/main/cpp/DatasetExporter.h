@@ -3,6 +3,7 @@
 #include <string>
 #include <mutex>
 #include <atomic>
+#include <thread>
 
 class DatasetExporter {
 public:
@@ -18,10 +19,12 @@ public:
     bool isRunning() const { return mRunning.load(); }
 
 private:
+    void workThreadFunc();
+
     std::mutex mMutex;
     std::string mBasePath;
     std::string mExportPath;
-
+    std::thread mWorkThread;
     std::atomic<bool> mRunning;
 };
 

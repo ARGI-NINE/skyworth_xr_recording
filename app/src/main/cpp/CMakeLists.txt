@@ -89,9 +89,6 @@ target_link_libraries(qxr-app-common PRIVATE
         qxr-thirdparty-openxr
         )
 file(GLOB main_src "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
-list(APPEND main_src
-        ${CMAKE_CURRENT_SOURCE_DIR}/DatasetExporter.cpp)
-list(REMOVE_DUPLICATES main_src)
 add_library(mixedreality SHARED ${main_src})
 set(LINKED_LIBRARIES
         mixedreality

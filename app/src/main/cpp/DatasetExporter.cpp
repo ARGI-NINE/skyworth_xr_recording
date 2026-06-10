@@ -19,6 +19,8 @@ DatasetExporter::~DatasetExporter() {
 
 void DatasetExporter::init(const std::string &datasetPath) {
     mBasePath = datasetPath;
+    LOGI("DatasetExporter initialized with datasetPath: %s", datasetPath.c_str());
+}
 }
 
 void DatasetExporter::start(const std::string &exportPath) {
@@ -29,8 +31,25 @@ void DatasetExporter::start(const std::string &exportPath) {
     }
 
     mExportPath = exportPath;
+    mRunning = true;
+    mWorkThread = std::thread(&DatasetExporter::workThreadFunc, this);
+    LOGI("Dataset exporting started: %s", mExportPath.c_str());
 }
 
 void DatasetExporter::stop() {
+    {
+        std::lock_guard<std::mutex > lock(mMutex);
+        if (!mRunning.load()) return;
+        mRunning = false;
+    }
 
+    LOGI("DatasetExporter stop");
+}
+
+void DatasetExporter::workThreadFunc() {
+    LOGI("DatasetExporter work thread started");
+    while (mRunning.load()) {
+        std::string datasetRoot;
+
+    }
 }
