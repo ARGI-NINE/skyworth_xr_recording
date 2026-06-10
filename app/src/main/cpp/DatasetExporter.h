@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <mutex>
 #include <atomic>
 #include <thread>
@@ -21,8 +22,14 @@ public:
 private:
     void workThreadFunc();
 
+    std::vector<std::string> listDatasetDirs() const;
+    bool isComplete(const std::string& datasetDir) const;
+    bool exportDataset(const std::string& datasetDir) const;
+    std::string readJsonToString(const std::string& filepath) const;
+    std::string joinPath(const std::string& dir1, const std::string& dir2) const;
+
     std::mutex mMutex;
-    std::string mBasePath;
+    std::string mDatasetPath;
     std::string mExportPath;
     std::thread mWorkThread;
     std::atomic<bool> mRunning;
