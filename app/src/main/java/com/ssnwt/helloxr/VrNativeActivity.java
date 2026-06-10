@@ -70,8 +70,8 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     public native void nativeRequestSnapshot();
     public native void nativeStartRecording();
     public native void nativeStopRecording();
-    public native void nativeStartExportManager(String datasetRoot, String exportRoot);
-    public native void nativeStopExportManager();
+    public native void nativeStartExporter(String datasetPath, String exportPath);
+    public native void nativeStopExporter();
     private BatteryManager mBatteryManager;
     private BatteryInfo mBatteryInfo;
     private boolean isRegisterReceiver = false;
@@ -135,7 +135,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         }
 
         super.onCreate(savedInstanceState);
-        initExportManagerConfig();
+        initExporterConfig();
         initSvrApi();
         mBatteryManager = (BatteryManager) getSystemService(BATTERY_SERVICE);
         mBatteryInfo = new BatteryInfo();
@@ -483,10 +483,10 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         }
     }
 
-    private void initExportManagerConfig() {
+    private void initExporterConfig() {
         File externalFilesDir = getExternalFilesDir(null);
         if (externalFilesDir == null) {
-            Log.w(TAG, "initExportManagerConfig: external files dir is null");
+            Log.w(TAG, "initExporterConfig: external files dir is null");
             return;
         }
 
@@ -507,10 +507,10 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
                 return;
             }
             try {
-                nativeStopExportManager();
+                nativeStopExporter();
                 mActiveExportRoot = null;
             } catch (UnsatisfiedLinkError e) {
-                Log.w(TAG, "nativeStopExportManager not implemented yet", e);
+                Log.w(TAG, "nativeStopExporter not implemented yet", e);
             }
             return;
         }
@@ -523,18 +523,18 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
 
         if (mActiveExportRoot != null) {
             try {
-                nativeStopExportManager();
+                nativeStopExporter();
             } catch (UnsatisfiedLinkError e) {
-                Log.w(TAG, "nativeStopExportManager not implemented yet", e);
+                Log.w(TAG, "nativeStopExporter not implemented yet", e);
             }
         }
 
-        Log.i(TAG, "refreshExportUsbRoot: start export manager with " + exportRootPath);
+        Log.i(TAG, "refreshExportUsbRoot: start exporter with " + exportRootPath);
         try {
-            nativeStartExportManager(mDatasetRootPath, exportRootPath);
+            nativeStartExporter(mDatasetRootPath, exportRootPath);
             mActiveExportRoot = exportRootPath;
         } catch (UnsatisfiedLinkError e) {
-            Log.w(TAG, "nativeStartExportManager not implemented yet", e);
+            Log.w(TAG, "nativeStartExporter not implemented yet", e);
         }
     }
 

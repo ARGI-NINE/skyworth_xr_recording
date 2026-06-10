@@ -69,6 +69,7 @@ namespace glext {
 #include "RawDateSave.h"
 #include "input.h"
 #include "DatasetRecorder.h"
+#include "DatasetExporter.h"
 #include "ControllerPoseSaver.h"
 #include <sys/system_properties.h>
 
@@ -2924,6 +2925,46 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeStopRecording(JNIEnv *env, jobject
     }
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartExporter(
+        JNIEnv *env, jobject thiz, jstring datasetPath, jstring exportPath) {
+    if (!g_engine) {
+        LOGW("nativeStartExporter: g_engine is null");
+        return;
+    }
+    if (!datasetPath || !exportPath) {
+        LOGW("nativeStartExporter: datasetPath/exportPath is null");
+        return;
+    }
+
+    const char* datasetPathChars = env->GetStringUTFChars(datasetPath, nullptr);
+    const char* exportPathChars = env->GetStringUTFChars(exportPath, nullptr);
+
+    std::string datasetPathStr = datasetPathChars;
+    std::string exportPathStr = exportPathChars;
+
+    env->ReleaseStringUTFChars(datasetPath, datasetPathChars);
+    env->ReleaseStringUTFChars(exportPath, exportPathChars);
+
+    LOGI("nativeStartExporter: datasetPath=%s exportPath=%s",
+         datasetPathStr.c_str(), exportPathStr.c_str());
+
+    g_engine->mDatasetExporter.stop();
+    g_engine->mDatasetExporter.init(datasetPathStr);
+    g_engine->mDatasetExporter.start(exportPathStr);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_ssnwt_helloxr_VrNativeActivity_nativeStopExporter(
+        JNIEnv *env, jobject thiz) {
+    if (!g_engine) {
+        LOGW("nativeStopExporter: g_engine is null");
+        return;
+    }
+
+    LOGI("nativeStopExporter");
+    g_engine->mDatasetExporter.stop();
+}
 
 // CameraInfoPanel implementation (needs complete engine type)
 void CameraInfoPanel::update(struct engine* engine) {
