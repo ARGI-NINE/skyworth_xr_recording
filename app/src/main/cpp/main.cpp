@@ -2927,23 +2927,19 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeStopRecording(JNIEnv *env, jobject
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartExporter(
-        JNIEnv *env, jobject thiz, jstring datasetPath, jstring exportPath) {
+        JNIEnv *env, jobject thiz, jstring exportPath) {
     if (!g_engine) {
         LOGW("nativeStartExporter: g_engine is null");
         return;
     }
-    if (!datasetPath || !exportPath) {
-        LOGW("nativeStartExporter: datasetPath/exportPath is null");
+    if (!exportPath) {
+        LOGW("nativeStartExporter: exportPath is null");
         return;
     }
 
-    const char* datasetPathChars = env->GetStringUTFChars(datasetPath, nullptr);
     const char* exportPathChars = env->GetStringUTFChars(exportPath, nullptr);
-
-    std::string datasetPathStr = datasetPathChars;
     std::string exportPathStr = exportPathChars;
-
-    env->ReleaseStringUTFChars(datasetPath, datasetPathChars);
+    std::string datasetPathStr = std::string(storagePath) + "/dataset";
     env->ReleaseStringUTFChars(exportPath, exportPathChars);
 
     LOGI("nativeStartExporter: datasetPath=%s exportPath=%s",
@@ -3648,7 +3644,7 @@ static void draw(struct engine *engine,uint32_t imgIndex){
     GL(glEnable(GL_DEPTH_TEST));
 
     mNotificationShader->Bind();
-    LOGI("render_gles,srcTex:%d",engine->testTexture);
+    // LOGI("render_gles,srcTex:%d",engine->testTexture);
     mNotificationShader->SetUniformSampler("srcTex", engine->testTexture, GL_TEXTURE_2D, 0);
     mNotificationMesh.Submit();
     mNotificationShader->Unbind();
@@ -4516,7 +4512,7 @@ void android_main(struct android_app *state)
             // If the timeout is negative, waits indefinitely until an event appears.
             const int timeoutMilliseconds =
                     (!engine.state.Resumed && !engine.ready) ? -1 : 0;
-            if (ALooper_pollAll(timeoutMilliseconds, nullptr, &events, (void**)&source) < 0) {
+            if (ALooper_pollOnce(timeoutMilliseconds, nullptr, &events, (void**)&source) < 0) {
                 break;
             }
 

@@ -478,19 +478,19 @@ namespace QtiGL
             switch (samplerType)
             {
             case GL_TEXTURE_2D:
-                SHADER_LOGD("Shader::SetUniformSampler", "    %s: Texture Unit = %d; Sampler = %d; Type = GL_TEXTURE_2D", name, uniform.textureUnit, samplerId);
+                // SHADER_LOGD("Shader::SetUniformSampler", "    %s: Texture Unit = %d; Sampler = %d; Type = GL_TEXTURE_2D", name, uniform.textureUnit, samplerId);
                 break;
 
             case GL_TEXTURE_CUBE_MAP:
-                SHADER_LOGD("Shader::SetUniformSampler", "    %s: Texture Unit = %d; Sampler = %d; Type = GL_TEXTURE_CUBE_MAP", name, uniform.textureUnit, samplerId);
+                // SHADER_LOGD("Shader::SetUniformSampler", "    %s: Texture Unit = %d; Sampler = %d; Type = GL_TEXTURE_CUBE_MAP", name, uniform.textureUnit, samplerId);
                 break;
 
             case GL_TEXTURE_EXTERNAL_OES:
-                SHADER_LOGD("Shader::SetUniformSampler", "    %s: Texture Unit = %d; Sampler = %d; Type = GL_TEXTURE_EXTERNAL_OES", name, uniform.textureUnit, samplerId);
+                // SHADER_LOGD("Shader::SetUniformSampler", "    %s: Texture Unit = %d; Sampler = %d; Type = GL_TEXTURE_EXTERNAL_OES", name, uniform.textureUnit, samplerId);
                 break;
 
             default:
-                SHADER_LOGD("Shader::SetUniformSampler", "    %s: Texture Unit = %d; Sampler = %d; Type = %d", name, uniform.textureUnit, samplerId, samplerType);
+                // SHADER_LOGD("Shader::SetUniformSampler", "    %s: Texture Unit = %d; Sampler = %d; Type = %d", name, uniform.textureUnit, samplerId, samplerType);
                 break;
             }
 

@@ -190,11 +190,11 @@ bool DatasetExporter::copyFile(const std::string& srcPath, const std::string& ds
         return false;
     }
 
-    char buffer[DATASET_EXPORT_BUFFER];
+    std::vector<char> buffer(DATASET_EXPORT_BUFFER);
     bool ret = true;
 
     while (true) {
-        ssize_t readSize = read(srcfd, buffer, sizeof(buffer));
+        ssize_t readSize = read(srcfd, buffer.data(), buffer.size());
         if (readSize == 0) {
             break;
         }
@@ -209,7 +209,7 @@ bool DatasetExporter::copyFile(const std::string& srcPath, const std::string& ds
 
         ssize_t curSize = 0;
         while (curSize < readSize) {
-            ssize_t writeSize = write(dstfd, buffer + curSize, readSize - curSize);
+            ssize_t writeSize = write(dstfd, buffer.data() + curSize, readSize - curSize);
             if (writeSize < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -225,6 +225,7 @@ bool DatasetExporter::copyFile(const std::string& srcPath, const std::string& ds
             break;
         }
     }
+    fsync(dstfd);
 
     close(dstfd);
     close(srcfd);
@@ -277,5 +278,3 @@ std::string DatasetExporter::joinPath(const std::string& dir1, const std::string
         return dir1 + dir2;
     return dir1 + '/' + dir2;
 }
-
-

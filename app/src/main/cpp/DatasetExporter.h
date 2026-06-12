@@ -36,4 +36,3 @@ private:
     std::thread mWorkThread;
     std::atomic<bool> mRunning;
 };
-

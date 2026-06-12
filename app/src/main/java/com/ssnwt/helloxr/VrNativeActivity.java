@@ -20,15 +20,19 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
 import android.media.MediaRecorder;
+import android.net.Uri;
 import android.net.wifi.WifiConfiguration;
 import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.storage.StorageManager;
+import android.os.storage.StorageVolume;
 import android.os.Handler;
 import android.os.Message;
 import android.preference.PreferenceManager;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
@@ -45,7 +49,10 @@ import java.io.OutputStream;
 import android.media.AudioAttributes;
 import android.media.SoundPool;
 import android.speech.tts.TextToSpeech;
+import java.text.SimpleDateFormat;
 import java.util.Arrays;
+import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 
 public class VrNativeActivity extends NativeActivity implements SystemEventUtils.Listener, TextToSpeech.OnInitListener {
@@ -65,12 +72,14 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     public static final String ACTION_START_RECORDING = "com.ssnwt.helloxr.START_RECORDING";
     public static final String ACTION_STOP_RECORDING = "com.ssnwt.helloxr.STOP_RECORDING";
     private static final String EXPORT_DIR_NAME = "Export";
+    private static final String USB_DEBUG_LOG_NAME = "usb_debug.log";
+    private static final String USB_PROBE_LOG_NAME = "usb_debug_probe.txt";
 
     // Native methods for intent control
     public native void nativeRequestSnapshot();
     public native void nativeStartRecording();
     public native void nativeStopRecording();
-    public native void nativeStartExporter(String datasetPath, String exportPath);
+    public native void nativeStartExporter(String exportPath);
     public native void nativeStopExporter();
     private BatteryManager mBatteryManager;
     private BatteryInfo mBatteryInfo;
@@ -134,8 +143,9 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             copyAssetsToExternal();
         }
 
-        super.onCreate(savedInstanceState);
         initExporterConfig();
+        super.onCreate(savedInstanceState);
+        ensureManageExternalStoragePermission();
         initSvrApi();
         mBatteryManager = (BatteryManager) getSystemService(BATTERY_SERVICE);
         mBatteryInfo = new BatteryInfo();
@@ -404,9 +414,11 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             usbFilter.addAction(Intent.ACTION_MEDIA_REMOVED);
             usbFilter.addAction(Intent.ACTION_MEDIA_EJECT);
             usbFilter.addAction(Intent.ACTION_MEDIA_BAD_REMOVAL);
+            usbFilter.addAction(Intent.ACTION_MEDIA_CHECKING);
             usbFilter.addDataScheme("file");
             registerReceiver(mUsbReceiver, usbFilter);
 
+            appendUsbDebug("onResume: USB receiver registered");
             refreshExportUsbRoot();
 
             isRegisterReceiver = true;
@@ -487,81 +499,222 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         File externalFilesDir = getExternalFilesDir(null);
         if (externalFilesDir == null) {
             Log.w(TAG, "initExporterConfig: external files dir is null");
+            appendUsbDebug("initExporterConfig: external files dir is null");
             return;
         }
 
         File datasetRoot = new File(externalFilesDir, "dataset");
         mDatasetRootPath = datasetRoot.getAbsolutePath();
+        appendUsbDebug("initExporterConfig: dataset root=" + mDatasetRootPath);
+    }
+
+    private void ensureManageExternalStoragePermission() {
+        boolean granted = Environment.isExternalStorageManager();
+        appendUsbDebug("ensureManageExternalStoragePermission: granted=" + granted);
+        if (granted) {
+            return;
+        }
+
+        Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+        intent.setData(Uri.parse("package:" + getPackageName()));
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            startActivity(intent);
+            appendUsbDebug("ensureManageExternalStoragePermission: opened app all files access settings");
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to open app all files access settings", e);
+            appendUsbDebug("ensureManageExternalStoragePermission: fallback settings " + e.getMessage());
+            Intent fallbackIntent = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+            fallbackIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(fallbackIntent);
+        }
+    }
+
+    private synchronized void appendUsbDebug(String message) {
+        String line = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+                .format(new Date()) + " " + message + "\n";
+        Log.i(TAG, line.trim());
+
+        File externalFilesDir = getExternalFilesDir(null);
+        if (externalFilesDir == null) {
+            return;
+        }
+
+        File logFile = new File(externalFilesDir, USB_DEBUG_LOG_NAME);
+        FileOutputStream fos = null;
+        try {
+            fos = new FileOutputStream(logFile, true);
+            fos.write(line.getBytes());
+            fos.flush();
+        } catch (IOException e) {
+            Log.e(TAG, "appendUsbDebug failed", e);
+        } finally {
+            if (fos != null) {
+                try {
+                    fos.close();
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
+    private String formatUsbDebugLine(String message) {
+        return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+                .format(new Date()) + " " + message + "\n";
+    }
+
+    private void appendUsbProbe(File targetDir, String message) {
+        if (targetDir == null) {
+            appendUsbDebug("appendUsbProbe: target dir is null for message=" + message);
+            return;
+        }
+
+        File probeFile = new File(targetDir, USB_PROBE_LOG_NAME);
+        FileOutputStream fos = null;
+        try {
+            fos = new FileOutputStream(probeFile, true);
+            fos.write(formatUsbDebugLine(message).getBytes());
+            fos.flush();
+            appendUsbDebug("appendUsbProbe: wrote " + probeFile.getAbsolutePath());
+        } catch (IOException e) {
+            Log.w(TAG, "appendUsbProbe failed: " + probeFile.getAbsolutePath(), e);
+            appendUsbDebug("appendUsbProbe failed: " + probeFile.getAbsolutePath() + " err=" + e.getMessage());
+        } finally {
+            if (fos != null) {
+                try {
+                    fos.close();
+                } catch (IOException ignored) {
+                }
+            }
+        }
     }
 
     private void refreshExportUsbRoot() {
         if (mDatasetRootPath == null || mDatasetRootPath.isEmpty()) {
             Log.w(TAG, "refreshExportUsbRoot: dataset root not ready");
+            appendUsbDebug("refreshExportUsbRoot: dataset root not ready");
             return;
         }
 
+        appendUsbDebug("refreshExportUsbRoot: begin");
         String usbRoot = findMountedUsbRoot();
         if (usbRoot == null) {
             Log.i(TAG, "refreshExportUsbRoot: no mounted removable storage");
+            appendUsbDebug("refreshExportUsbRoot: no mounted removable storage");
             if (mActiveExportRoot == null) {
                 return;
             }
             try {
                 nativeStopExporter();
                 mActiveExportRoot = null;
+                appendUsbDebug("refreshExportUsbRoot: nativeStopExporter called");
             } catch (UnsatisfiedLinkError e) {
                 Log.w(TAG, "nativeStopExporter not implemented yet", e);
+                appendUsbDebug("refreshExportUsbRoot: nativeStopExporter missing " + e.getMessage());
             }
             return;
         }
 
+        File usbRootDir = new File(usbRoot);
+        appendUsbProbe(usbRootDir, "mounted root=" + usbRoot
+                + " exists=" + usbRootDir.exists()
+                + " canRead=" + usbRootDir.canRead()
+                + " canWrite=" + usbRootDir.canWrite());
+
         File exportRoot = new File(usbRoot, EXPORT_DIR_NAME);
         String exportRootPath = exportRoot.getAbsolutePath();
+        boolean exportRootReady = exportRoot.exists() || exportRoot.mkdirs();
+        appendUsbDebug("refreshExportUsbRoot: usbRoot=" + usbRoot
+                + " exportRoot=" + exportRootPath
+                + " ready=" + exportRootReady
+                + " canWrite=" + exportRoot.canWrite());
+        appendUsbProbe(usbRootDir, "export_root path=" + exportRootPath
+                + " ready=" + exportRootReady
+                + " canWrite=" + exportRoot.canWrite());
+        if (!exportRootReady) {
+            Log.w(TAG, "refreshExportUsbRoot: export root is not ready " + exportRootPath);
+            appendUsbDebug("refreshExportUsbRoot: export root is not ready " + exportRootPath);
+            return;
+        }
+        appendUsbProbe(exportRoot, "export_root_ready path=" + exportRootPath
+                + " canWrite=" + exportRoot.canWrite());
         if (exportRootPath.equals(mActiveExportRoot)) {
+            appendUsbDebug("refreshExportUsbRoot: export root unchanged");
+            appendUsbProbe(exportRoot, "export_root_unchanged path=" + exportRootPath);
             return;
         }
 
         if (mActiveExportRoot != null) {
             try {
                 nativeStopExporter();
+                appendUsbDebug("refreshExportUsbRoot: switched exporter root, stopped previous exporter");
+                appendUsbProbe(exportRoot, "stopped_previous_exporter oldRoot=" + mActiveExportRoot);
             } catch (UnsatisfiedLinkError e) {
                 Log.w(TAG, "nativeStopExporter not implemented yet", e);
+                appendUsbDebug("refreshExportUsbRoot: nativeStopExporter missing while switching " + e.getMessage());
             }
         }
 
         Log.i(TAG, "refreshExportUsbRoot: start exporter with " + exportRootPath);
+        appendUsbDebug("refreshExportUsbRoot: preparing nativeStartExporter with " + exportRootPath);
+        appendUsbProbe(exportRoot, "before_nativeStartExporter exportRoot=" + exportRootPath);
         try {
-            nativeStartExporter(mDatasetRootPath, exportRootPath);
+            nativeStartExporter(exportRootPath);
             mActiveExportRoot = exportRootPath;
+            appendUsbDebug("refreshExportUsbRoot: nativeStartExporter called successfully");
+            appendUsbProbe(exportRoot, "after_nativeStartExporter exportRoot=" + exportRootPath);
         } catch (UnsatisfiedLinkError e) {
             Log.w(TAG, "nativeStartExporter not implemented yet", e);
+            appendUsbDebug("refreshExportUsbRoot: nativeStartExporter missing " + e.getMessage());
         }
     }
 
     private String findMountedUsbRoot() {
-        File[] externalDirs = getExternalFilesDirs(null);
-        if (externalDirs == null) {
+        StorageManager storageManager = (StorageManager) getSystemService(Context.STORAGE_SERVICE);
+        if (storageManager == null) {
+            appendUsbDebug("findMountedUsbRoot: storage manager is null");
             return null;
         }
 
-        for (File dir : externalDirs) {
-            if (dir == null) {
+        List<StorageVolume> storageVolumes = storageManager.getStorageVolumes();
+        appendUsbDebug("findMountedUsbRoot: volume count=" + storageVolumes.size());
+        for (StorageVolume volume : storageVolumes) {
+            if (volume == null) {
+                appendUsbDebug("findMountedUsbRoot: volume is null");
                 continue;
             }
-            if (!Environment.MEDIA_MOUNTED.equals(Environment.getExternalStorageState(dir))) {
+            File directory = volume.getDirectory();
+            String state = volume.getState();
+            boolean removable = volume.isRemovable();
+            boolean mounted = Environment.MEDIA_MOUNTED.equals(state);
+            String path = directory != null ? directory.getAbsolutePath() : "null";
+            appendUsbDebug("findMountedUsbRoot: candidate path=" + path
+                    + " state=" + state
+                    + " removable=" + removable
+                    + " mounted=" + mounted
+                    + " primary=" + volume.isPrimary()
+                    + " desc=" + volume.getDescription(this));
+            if (!mounted) {
                 continue;
             }
-            if (!Environment.isExternalStorageRemovable(dir)) {
+            if (!removable) {
                 continue;
             }
-
-            String path = dir.getAbsolutePath();
-            int androidDataIndex = path.indexOf("/Android/data/");
-            if (androidDataIndex <= 0) {
+            if (directory == null) {
+                appendUsbDebug("findMountedUsbRoot: mounted removable volume has null directory");
                 continue;
             }
-            return path.substring(0, androidDataIndex);
+            appendUsbDebug("findMountedUsbRoot: mounted removable volume readable=" + directory.canRead()
+                    + " writable=" + directory.canWrite()
+                    + " exists=" + directory.exists());
+            appendUsbProbe(directory, "selected_usb_root path=" + directory.getAbsolutePath()
+                    + " canRead=" + directory.canRead()
+                    + " canWrite=" + directory.canWrite());
+            String usbRoot = directory.getAbsolutePath();
+            appendUsbDebug("findMountedUsbRoot: selected usb root=" + usbRoot);
+            return usbRoot;
         }
+        appendUsbDebug("findMountedUsbRoot: no suitable removable dir found");
         return null;
     }
 
@@ -721,6 +874,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();
             Log.i(TAG, "USB storage broadcast: " + action);
+            appendUsbDebug("mUsbReceiver.onReceive action=" + action + " data=" + intent.getDataString());
             refreshExportUsbRoot();
         }
     };

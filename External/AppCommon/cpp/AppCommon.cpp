@@ -313,7 +313,7 @@ void app_wait_window(struct base_engine *engine)
 int events;
 struct android_poll_source *source;
 while (!engine->state.NativeWindow) {
-    ALooper_pollAll(-1, nullptr, &events, (void **)&source);
+    ALooper_pollOnce(-1, nullptr, &events, (void **)&source);
     if (source != nullptr) {
         source->process(engine->app, source);
     }

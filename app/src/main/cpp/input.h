@@ -8,6 +8,7 @@
 #include "AppCommon.h"
 #include "openxr_qcom.h"
 
+#include <functional>
 #include <string>
 struct HapticFeedbackInfo
 {

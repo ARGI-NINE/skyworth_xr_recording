@@ -128,7 +128,7 @@ void ImuPoseCollector::sensorThreadFunc() {
     }
 
     while (mRunning.load()) {
-        int ident = ALooper_pollAll(1, nullptr, nullptr, nullptr);
+        int ident = ALooper_pollOnce(1, nullptr, nullptr, nullptr);
         if (ident == ALOOPER_POLL_TIMEOUT || ident == ALOOPER_POLL_WAKE) continue;
 
         ASensorEvent event;
