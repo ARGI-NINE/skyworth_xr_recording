@@ -71,6 +71,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     public static final String ACTION_SAVE_IMAGE = "com.ssnwt.helloxr.SAVE_IMAGE";
     public static final String ACTION_START_RECORDING = "com.ssnwt.helloxr.START_RECORDING";
     public static final String ACTION_STOP_RECORDING = "com.ssnwt.helloxr.STOP_RECORDING";
+    public static final String ACTION_MEDIA_MOUNTED_CUSTOM = "com.ssnwt.action.MEDIA_MOUNTED";
     private static final String EXPORT_DIR_NAME = "Export";
     private static final String USB_DEBUG_LOG_NAME = "usb_debug.log";
     private static final String USB_PROBE_LOG_NAME = "usb_debug_probe.txt";
@@ -97,6 +98,9 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     private int mSoundImageFailed;
     private int mSoundRecordingStart;
     private int mSoundRecordingStop;
+    private int mSoundUsbRecognized;
+    private int mSoundCopyFinished;
+    private int mSoundUsbUnplugged;
     private String mDatasetRootPath;
     private String mActiveExportRoot;
     private Handler mHandler = new Handler() {
@@ -166,6 +170,9 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         mSoundImageFailed = mSoundPool.load(this, R.raw.image_failed, 1);
         mSoundRecordingStart = mSoundPool.load(this, R.raw.recording_start, 1);
         mSoundRecordingStop = mSoundPool.load(this, R.raw.recording_stop, 1);
+        mSoundUsbRecognized = mSoundPool.load(this, R.raw.usb_recog, 1);
+        mSoundCopyFinished = mSoundPool.load(this, R.raw.copy_finished, 1);
+        mSoundUsbUnplugged = mSoundPool.load(this, R.raw.usb_unplug, 1);
     }
 
     private void onSvrApiInitialized() {
@@ -205,6 +212,12 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             soundId = mSoundRecordingStart;
         } else if (text.contains("视频已保存") || text.contains("录制已保存")) {
             soundId = mSoundRecordingStop;
+        } else if (text.contains("u盘已识别")) {
+            soundId = mSoundUsbRecognized;
+        } else if (text.contains("u盘拷贝已完成")) {
+            soundId = mSoundCopyFinished;
+        } else if (text.contains("u盘已卸载")) {
+            soundId = mSoundUsbUnplugged;
         }
         if (soundId != 0 && mSoundPool != null) {
             mSoundPool.play(soundId, 1.0f, 1.0f, 1, 0, 1.0f);
@@ -409,13 +422,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             registerReceiver(mCommandReceiver, cmdFilter);
 
             IntentFilter usbFilter = new IntentFilter();
-            usbFilter.addAction(Intent.ACTION_MEDIA_MOUNTED);
-            usbFilter.addAction(Intent.ACTION_MEDIA_UNMOUNTED);
-            usbFilter.addAction(Intent.ACTION_MEDIA_REMOVED);
-            usbFilter.addAction(Intent.ACTION_MEDIA_EJECT);
-            usbFilter.addAction(Intent.ACTION_MEDIA_BAD_REMOVAL);
-            usbFilter.addAction(Intent.ACTION_MEDIA_CHECKING);
-            usbFilter.addDataScheme("file");
+            usbFilter.addAction(ACTION_MEDIA_MOUNTED_CUSTOM);
             registerReceiver(mUsbReceiver, usbFilter);
 
             appendUsbDebug("onResume: USB receiver registered");
@@ -662,6 +669,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         try {
             nativeStartExporter(exportRootPath);
             mActiveExportRoot = exportRootPath;
+            speak("u盘已识别");
             appendUsbDebug("refreshExportUsbRoot: nativeStartExporter called successfully");
             appendUsbProbe(exportRoot, "after_nativeStartExporter exportRoot=" + exportRootPath);
         } catch (UnsatisfiedLinkError e) {
