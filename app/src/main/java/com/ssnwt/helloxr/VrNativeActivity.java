@@ -607,6 +607,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             try {
                 nativeStopExporter();
                 mActiveExportRoot = null;
+                speak("u盘已卸载");
                 appendUsbDebug("refreshExportUsbRoot: nativeStopExporter called");
             } catch (UnsatisfiedLinkError e) {
                 Log.w(TAG, "nativeStopExporter not implemented yet", e);

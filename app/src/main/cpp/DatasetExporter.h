@@ -6,6 +6,8 @@
 #include <atomic>
 #include <thread>
 
+void ttsSpeak(const char* text);
+
 class DatasetExporter {
 public:
     DatasetExporter();

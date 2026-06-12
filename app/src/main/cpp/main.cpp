@@ -2948,6 +2948,7 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartExporter(
     g_engine->mDatasetExporter.stop();
     g_engine->mDatasetExporter.init(datasetPathStr);
     g_engine->mDatasetExporter.start(exportPathStr);
+    ttsSpeak("u盘已识别");
 }
 
 extern "C" JNIEXPORT void JNICALL

@@ -58,6 +58,7 @@ void DatasetExporter::stop() {
 
 void DatasetExporter::workThreadFunc() {
     LOGI("DatasetExporter work thread started");
+    bool ret = false;
     while (mRunning.load()) {
         std::string datasetPath;
         std::string exportPath;
@@ -67,7 +68,7 @@ void DatasetExporter::workThreadFunc() {
             datasetPath = mDatasetPath;
         }
         if (datasetPath.empty()) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
         }
         std::vector<std::string> datasetDirs = listDatasetDirs();
@@ -78,8 +79,13 @@ void DatasetExporter::workThreadFunc() {
                 continue;
             if (!exportDataset(datasetDir))
                 LOGW("export failed");
+            else
+                ret = true;
         }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (ret)
+            ttsSpeak("u盘拷贝已完成");
+        ret = false;
+        std::this_thread::sleep_for(std::chrono::seconds(5));
     }
     LOGI("DatasetExporter work thread quited");
 }
