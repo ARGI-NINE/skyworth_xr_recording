@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <condition_variable>
 #include <mutex>
 #include <atomic>
 #include <thread>
@@ -33,6 +34,7 @@ private:
     std::string joinPath(const std::string& dir1, const std::string& dir2) const;
 
     std::mutex mMutex;
+    std::condition_variable mCv;
     std::string mDatasetPath;
     std::string mExportPath;
     std::thread mWorkThread;

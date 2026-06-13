@@ -49,6 +49,7 @@ void DatasetExporter::stop() {
         if (!mRunning.load()) return;
         mRunning = false;
     }
+    mCv.notify_all();
 
     if (mWorkThread.joinable())
         mWorkThread.join();
@@ -59,6 +60,7 @@ void DatasetExporter::stop() {
 void DatasetExporter::workThreadFunc() {
     LOGI("DatasetExporter work thread started");
     bool ret = false;
+    bool exportFailed = false;
     while (mRunning.load()) {
         std::string datasetPath;
         std::string exportPath;
@@ -67,9 +69,10 @@ void DatasetExporter::workThreadFunc() {
             exportPath = mExportPath;
             datasetPath = mDatasetPath;
         }
-        if (datasetPath.empty()) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            continue;
+        if (datasetPath.empty() || exportPath.empty()) {
+            LOGE("DatasetExporter work thread exit: dataset/export path is empty");
+            mRunning = false;
+            break;
         }
         std::vector<std::string> datasetDirs = listDatasetDirs();
         for (const std::string& datasetDir : datasetDirs) {
@@ -77,15 +80,24 @@ void DatasetExporter::workThreadFunc() {
                 break;
             if (!isComplete(datasetDir))
                 continue;
-            if (!exportDataset(datasetDir))
+            if (!exportDataset(datasetDir)) {
                 LOGW("export failed");
-            else
+                exportFailed = true;
+            } else
                 ret = true;
         }
-        if (ret)
+        if (exportFailed)
+            ttsSpeak("本轮存在拷贝失败");
+        else if (ret)
             ttsSpeak("u盘拷贝已完成");
+        else
+            ttsSpeak("当前无数据需要拷贝");
         ret = false;
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        exportFailed = false;
+        std::unique_lock<std::mutex> lock(mMutex);
+        mCv.wait_for(lock, std::chrono::seconds(300), [this] {
+            return !mRunning.load();
+        });
     }
     LOGI("DatasetExporter work thread quited");
 }
