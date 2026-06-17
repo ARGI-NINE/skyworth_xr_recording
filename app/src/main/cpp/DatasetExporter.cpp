@@ -1,4 +1,5 @@
 #include "DatasetExporter.h"
+#include "NativeLogger.h"
 
 #include <android/log.h>
 #include <sys/stat.h>
@@ -13,9 +14,9 @@
 #include <fcntl.h>
 
 #define LOG_TAG "DatasetExporter"
-#define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__))
-#define LOGW(...) ((void)__android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__))
-#define LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__))
+#define LOGI(...) NATIVE_LOGI(LOG_TAG, __VA_ARGS__)
+#define LOGW(...) NATIVE_LOGW(LOG_TAG, __VA_ARGS__)
+#define LOGE(...) NATIVE_LOGE(LOG_TAG, __VA_ARGS__)
 
 #define DATASET_EXPORT_BUFFER 1024 * 1024
 

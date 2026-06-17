@@ -5,6 +5,14 @@ set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -Wno-unused-variable -Wno-unused-functi
 set(QXR_ROOT_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../../../../)
 set(QXR_EXTERNAL_DIR ${QXR_ROOT_PATH}/External/)
 
+set(SPDLOG_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_EXAMPLE_HO OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(${QXR_EXTERNAL_DIR}/spdlog ${CMAKE_BINARY_DIR}/spdlog)
+
 add_library(lib_xr_loader SHARED IMPORTED)
 set_target_properties(lib_xr_loader PROPERTIES IMPORTED_LOCATION
         ${QXR_EXTERNAL_DIR}/OpenXR-SDK/${ANDROID_ABI}/libopenxr_loader.so)
@@ -106,6 +114,7 @@ set(LINKED_LIBRARIES
         qxr-common-gl
         qxr-common-data-structures
         qxr-thirdparty-tinyobj
-        qxr-thirdparty-glm)
+        qxr-thirdparty-glm
+        spdlog::spdlog_header_only)
 
 target_link_libraries(${LINKED_LIBRARIES})

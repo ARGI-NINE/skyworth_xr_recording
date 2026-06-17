@@ -7,14 +7,16 @@
 
 #include <string>
 
+#include "NativeLogger.h"
+
 // EGL_ANDROID_presentation_time extension
 typedef EGLBoolean (EGLAPIENTRYP PFNEGLPRESENTATIONTIMEANDROID)(EGLDisplay dpy, EGLSurface surface, int64_t time);
 
 #define LOG_TAG "EncoderSurface"
 
-#define LOGI(...)  ((void)__android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__))
-#define LOGW(...)  ((void)__android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__))
-#define LOGE(...)  ((void)__android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__))
+#define LOGI(...)  NATIVE_LOGI(LOG_TAG, __VA_ARGS__)
+#define LOGW(...)  NATIVE_LOGW(LOG_TAG, __VA_ARGS__)
+#define LOGE(...)  NATIVE_LOGE(LOG_TAG, __VA_ARGS__)
 
 namespace SXR {
 

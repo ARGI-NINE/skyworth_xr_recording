@@ -13,10 +13,12 @@
 #include <string>
 #include <vector>
 
+#include "NativeLogger.h"
+
 #define AUDIO_ENCODER_TAG "AudioEncoder"
-#define AE_LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, AUDIO_ENCODER_TAG, __VA_ARGS__))
-#define AE_LOGW(...) ((void)__android_log_print(ANDROID_LOG_WARN, AUDIO_ENCODER_TAG, __VA_ARGS__))
-#define AE_LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, AUDIO_ENCODER_TAG, __VA_ARGS__))
+#define AE_LOGI(...) NATIVE_LOGI(AUDIO_ENCODER_TAG, __VA_ARGS__)
+#define AE_LOGW(...) NATIVE_LOGW(AUDIO_ENCODER_TAG, __VA_ARGS__)
+#define AE_LOGE(...) NATIVE_LOGE(AUDIO_ENCODER_TAG, __VA_ARGS__)
 
 class AudioEncoder {
 public:

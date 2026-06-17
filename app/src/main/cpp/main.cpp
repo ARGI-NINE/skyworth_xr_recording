@@ -71,14 +71,15 @@ namespace glext {
 #include "DatasetRecorder.h"
 #include "DatasetExporter.h"
 #include "ControllerPoseSaver.h"
+#include "NativeLogger.h"
 #include <sys/system_properties.h>
 
 #define LOGI(...)                                                              \
-    ((void)__android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__))
+    NATIVE_LOGI(LOG_TAG, __VA_ARGS__)
 #define LOGW(...)                                                              \
-    ((void)__android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__))
+    NATIVE_LOGW(LOG_TAG, __VA_ARGS__)
 #define LOGE(...)                                                              \
-    ((void)__android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__))
+    NATIVE_LOGE(LOG_TAG, __VA_ARGS__)
 
 #define EGL_SAMPLE_COUNT 4
 #define CUBE_COUNT 3 
@@ -513,7 +514,6 @@ struct HandTrackerLogic{
         }
         else
         {
-            LOGI("left LocateHandJointsEXT isActive %d time：%ld", LeftHandLocations.isActive, atTime);
             LeftHandIsActive = LeftHandLocations.isActive;
         }
 
@@ -900,6 +900,7 @@ struct CameraAccessExtension{
     OverlaySnapshot overlaySnap;  // snapshot at RGB frame time for overlay projection
     std::atomic<bool> encodingEnabled{false};//用户按键切换编码状态
     std::atomic<bool> snapshotRequested{false};//快照请求标志（intent或按键触发）
+    std::atomic<bool> ; // 发送控制命令到
 
     // Dataset recording: encoder output directory (set when recording starts)
     std::string encoderBaseDir;
@@ -3410,7 +3411,7 @@ static int engine_init_xr_swapchains(struct engine *engine) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glBindTexture(GL_TEXTURE_2D, 0);
     if (engine->depthBuffer == 0) {
-        LOGE(LOG_TAG, "Failed to init depth buffer");
+        LOGE("Failed to init depth buffer");
         assert(0);
     }
     GL();
@@ -4432,6 +4433,10 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                 e->dpadCenterPressed = true;
                 return 1;
             }
+            if (keyCode == AKEYCODE_VOLUME_DOWN) {
+
+                return 1;
+            }
         }
     }
     return 0;
@@ -4482,6 +4487,7 @@ void android_main(struct android_app *state)
     if (ttsEnv && activity) {
         g_activity = ttsEnv->NewGlobalRef(activity);
     }
+    NativeLoggerInit(storagePath);
 
     if (engine.mCameraAccessExtension.initCameras(vm, activity)) {
         LOGI("All cameras initialized successfully");
@@ -5004,6 +5010,7 @@ cleanup:
 
     // Stop image saver worker thread
     ImageSaver::Instance().shutdown();
+    NativeLoggerShutdown();
 
     // Release JNI global reference
     if (g_javaVm && g_activity) {

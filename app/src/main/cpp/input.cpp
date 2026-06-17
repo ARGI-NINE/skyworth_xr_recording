@@ -3,13 +3,14 @@
 //
 
 #include "input.h"
+#include "NativeLogger.h"
 #include "xr_logger.h"
 #include <android/log.h>
 
 #define LOG_TAG "Input"
-#define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__))
-#define LOGW(...) ((void)__android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__))
-#define LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__))
+#define LOGI(...) NATIVE_LOGI(LOG_TAG, __VA_ARGS__)
+#define LOGW(...) NATIVE_LOGW(LOG_TAG, __VA_ARGS__)
+#define LOGE(...) NATIVE_LOGE(LOG_TAG, __VA_ARGS__)
 
 void Input::UpdateInput(XrTime atTime) {
     //LOGI("UpdateInput ! ");

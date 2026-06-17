@@ -1,7 +1,7 @@
 #include "DatasetRecorder.h"
 #include "RawDateSave.h"
+#include "NativeLogger.h"
 
-#include <android/log.h>
 #include <sys/stat.h>
 #include <chrono>
 #include <ctime>
@@ -9,9 +9,9 @@
 #include <sstream>
 
 #define LOG_TAG "DatasetRecorder"
-#define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__))
-#define LOGW(...) ((void)__android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__))
-#define LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__))
+#define LOGI(...) NATIVE_LOGI(LOG_TAG, __VA_ARGS__)
+#define LOGW(...) NATIVE_LOGW(LOG_TAG, __VA_ARGS__)
+#define LOGE(...) NATIVE_LOGE(LOG_TAG, __VA_ARGS__)
 
 int64_t DatasetRecorder::currentUnixTimeMs() {
     auto now = std::chrono::system_clock::now();
@@ -69,6 +69,7 @@ bool DatasetRecorder::start() {
         return false;
     }
 
+    NativeLoggerStartDataset(mDatasetDir.c_str());
     LOGI("Dataset recording started: %s", mDatasetDir.c_str());
     mCaptureStartUnixMs = currentUnixTimeMs();
     mCaptureStopUnixMs = 0;
@@ -150,6 +151,7 @@ void DatasetRecorder::stop() {
 
     mRecording = false;
     LOGI("Dataset recording stopped. Poses: %lu", (unsigned long)mPoseCount.load());
+    NativeLoggerStopDataset();
 }
 
 std::string DatasetRecorder::getHandTrackingCsvPath() const {
