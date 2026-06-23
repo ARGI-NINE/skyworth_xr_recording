@@ -822,12 +822,13 @@ struct CameraAccessExtension{
     std::mutex callbackDrainMutex;
     std::condition_variable callbackDrainCV;
 
-    // ========== 独立EGL上下文（每个相机组一个，无锁竞争）==========
+    // ========== 独立EGL上下文（每个相机组一个，按上下文串行访问）==========
     struct CameraGLContext {
         EGLDisplay display = EGL_NO_DISPLAY;
         EGLContext context = EGL_NO_CONTEXT;
         EGLSurface surface = EGL_NO_SURFACE;  // Pbuffer for offscreen rendering
         std::atomic<bool> initialized{false};
+        std::mutex useMutex;
 
         bool init(const AppCommon::base_engine* engine) {
             if (initialized) return true;
@@ -874,16 +875,45 @@ struct CameraAccessExtension{
             initialized = false;
         }
 
-        bool makeCurrent() {
+        bool makeCurrentUnlocked() {
             if (!initialized) return false;
             return eglMakeCurrent(display, surface, surface, context);
         }
 
-        void releaseCurrent() {
+        void releaseCurrentUnlocked() {
             if (display != EGL_NO_DISPLAY) {
                 eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             }
         }
+
+        bool makeCurrent() {
+            std::lock_guard<std::mutex> lock(useMutex);
+            return makeCurrentUnlocked();
+        }
+
+        void releaseCurrent() {
+            std::lock_guard<std::mutex> lock(useMutex);
+            releaseCurrentUnlocked();
+        }
+    };
+
+    struct ScopedCameraGLContextCurrent {
+        CameraGLContext& ctx;
+        std::unique_lock<std::mutex> lock;
+        bool current{false};
+
+        explicit ScopedCameraGLContextCurrent(CameraGLContext& ctx)
+            : ctx(ctx), lock(ctx.useMutex) {
+            current = ctx.makeCurrentUnlocked();
+        }
+
+        ~ScopedCameraGLContextCurrent() {
+            if (current) {
+                ctx.releaseCurrentUnlocked();
+            }
+        }
+
+        bool isCurrent() const { return current; }
     };
     CameraGLContext rgbCtx;
     CameraGLContext trackingCtx;
@@ -1344,53 +1374,61 @@ struct CameraAccessExtension{
 
         // Cleanup RGB context resources
         if (rgbCtx.initialized) {
-            rgbCtx.makeCurrent();
-            for (int i = 0; i < 2; i++) {
-                if (rgbDisplayTextures[i] != 0) { glDeleteTextures(1, &rgbDisplayTextures[i]); rgbDisplayTextures[i] = 0; }
-                if (rgbDisplayFBOs[i] != 0) { glDeleteFramebuffers(1, &rgbDisplayFBOs[i]); rgbDisplayFBOs[i] = 0; }
+            {
+                ScopedCameraGLContextCurrent rgbCurrent(rgbCtx);
+                if (rgbCurrent.isCurrent()) {
+                    for (int i = 0; i < 2; i++) {
+                        if (rgbDisplayTextures[i] != 0) { glDeleteTextures(1, &rgbDisplayTextures[i]); rgbDisplayTextures[i] = 0; }
+                        if (rgbDisplayFBOs[i] != 0) { glDeleteFramebuffers(1, &rgbDisplayFBOs[i]); rgbDisplayFBOs[i] = 0; }
+                    }
+                    if (rgbEncoderSurface) { rgbEncoderSurface->release(); delete rgbEncoderSurface; rgbEncoderSurface = nullptr; }
+                    if (rgbEncoder) { rgbEncoder->stop(); delete rgbEncoder; rgbEncoder = nullptr; }
+                    if (rgbSbsFBO) { glDeleteFramebuffers(1, &rgbSbsFBO); rgbSbsFBO = 0; }
+                    if (rgbSbsTexture) { glDeleteTextures(1, &rgbSbsTexture); rgbSbsTexture = 0; }
+                    if (encoderShaderProgram != 0) { glDeleteProgram(encoderShaderProgram); encoderShaderProgram = 0; }
+                    if (sbsCopyShaderProgram != 0) { glDeleteProgram(sbsCopyShaderProgram); sbsCopyShaderProgram = 0; }
+                    if (encoderVBO != 0) { glDeleteBuffers(1, &encoderVBO); encoderVBO = 0; }
+                    if (encoderVAO != 0) { glDeleteVertexArrays(1, &encoderVAO); encoderVAO = 0; }
+                } else {
+                    LOGW("cleanupAllGLContexts: failed to make RGB context current: 0x%x", eglGetError());
+                }
             }
-            if (rgbEncoderSurface) { rgbEncoderSurface->release(); delete rgbEncoderSurface; rgbEncoderSurface = nullptr; }
-            if (rgbEncoder) { rgbEncoder->stop(); delete rgbEncoder; rgbEncoder = nullptr; }
-            if (rgbSbsFBO) { glDeleteFramebuffers(1, &rgbSbsFBO); rgbSbsFBO = 0; }
-            if (rgbSbsTexture) { glDeleteTextures(1, &rgbSbsTexture); rgbSbsTexture = 0; }
-            if (encoderShaderProgram != 0) { glDeleteProgram(encoderShaderProgram); encoderShaderProgram = 0; }
-            if (sbsCopyShaderProgram != 0) { glDeleteProgram(sbsCopyShaderProgram); sbsCopyShaderProgram = 0; }
-            if (encoderVBO != 0) { glDeleteBuffers(1, &encoderVBO); encoderVBO = 0; }
-            if (encoderVAO != 0) { glDeleteVertexArrays(1, &encoderVAO); encoderVAO = 0; }
-            rgbCtx.releaseCurrent();
             rgbCtx.cleanup();
         }
 
         // Cleanup Tracking/CTRL context resources
         if (trackingCtx.initialized || ctrlCtx.initialized) {
             // Use tracking context for CV cleanup (resources are shared)
-            trackingCtx.makeCurrent();
-            if (cvPersistentEGLImage[0] != EGL_NO_IMAGE_KHR) {
-                glext::eglDestroyImageKHR(trackingCtx.display, cvPersistentEGLImage[0]);
-                cvPersistentEGLImage[0] = EGL_NO_IMAGE_KHR;
+            ScopedCameraGLContextCurrent trackingCurrent(trackingCtx);
+            if (trackingCurrent.isCurrent()) {
+                if (cvPersistentEGLImage[0] != EGL_NO_IMAGE_KHR) {
+                    glext::eglDestroyImageKHR(trackingCtx.display, cvPersistentEGLImage[0]);
+                    cvPersistentEGLImage[0] = EGL_NO_IMAGE_KHR;
+                }
+                if (cvPersistentEGLImage[1] != EGL_NO_IMAGE_KHR) {
+                    glext::eglDestroyImageKHR(trackingCtx.display, cvPersistentEGLImage[1]);
+                    cvPersistentEGLImage[1] = EGL_NO_IMAGE_KHR;
+                }
+                if (cvPersistentExtTex[0] != 0) {
+                    glDeleteTextures(1, &cvPersistentExtTex[0]);
+                    cvPersistentExtTex[0] = 0;
+                }
+                if (cvPersistentExtTex[1] != 0) {
+                    glDeleteTextures(1, &cvPersistentExtTex[1]);
+                    cvPersistentExtTex[1] = 0;
+                }
+                for (int i = 0; i < 4; i++) {
+                    if (cvDisplayTextures[i] != 0) { glDeleteTextures(1, &cvDisplayTextures[i]); cvDisplayTextures[i] = 0; }
+                    if (cvDisplayFBOs[i] != 0) { glDeleteFramebuffers(1, &cvDisplayFBOs[i]); cvDisplayFBOs[i] = 0; }
+                }
+                if (cvDisplayVBOs[0] != 0) { glDeleteBuffers(1, &cvDisplayVBOs[0]); cvDisplayVBOs[0] = 0; }
+                if (cvDisplayVBOs[1] != 0) { glDeleteBuffers(1, &cvDisplayVBOs[1]); cvDisplayVBOs[1] = 0; }
+                if (grayscaleEncoderShaderProgram != 0) { glDeleteProgram(grayscaleEncoderShaderProgram); grayscaleEncoderShaderProgram = 0; }
+                if (grayscaleEncoderVBO != 0) { glDeleteBuffers(1, &grayscaleEncoderVBO); grayscaleEncoderVBO = 0; }
+                if (grayscaleEncoderVAO != 0) { glDeleteVertexArrays(1, &grayscaleEncoderVAO); grayscaleEncoderVAO = 0; }
+            } else {
+                LOGW("cleanupAllGLContexts: failed to make tracking context current: 0x%x", eglGetError());
             }
-            if (cvPersistentEGLImage[1] != EGL_NO_IMAGE_KHR) {
-                glext::eglDestroyImageKHR(trackingCtx.display, cvPersistentEGLImage[1]);
-                cvPersistentEGLImage[1] = EGL_NO_IMAGE_KHR;
-            }
-            if (cvPersistentExtTex[0] != 0) {
-                glDeleteTextures(1, &cvPersistentExtTex[0]);
-                cvPersistentExtTex[0] = 0;
-            }
-            if (cvPersistentExtTex[1] != 0) {
-                glDeleteTextures(1, &cvPersistentExtTex[1]);
-                cvPersistentExtTex[1] = 0;
-            }
-            for (int i = 0; i < 4; i++) {
-                if (cvDisplayTextures[i] != 0) { glDeleteTextures(1, &cvDisplayTextures[i]); cvDisplayTextures[i] = 0; }
-                if (cvDisplayFBOs[i] != 0) { glDeleteFramebuffers(1, &cvDisplayFBOs[i]); cvDisplayFBOs[i] = 0; }
-            }
-            if (cvDisplayVBOs[0] != 0) { glDeleteBuffers(1, &cvDisplayVBOs[0]); cvDisplayVBOs[0] = 0; }
-            if (cvDisplayVBOs[1] != 0) { glDeleteBuffers(1, &cvDisplayVBOs[1]); cvDisplayVBOs[1] = 0; }
-            if (grayscaleEncoderShaderProgram != 0) { glDeleteProgram(grayscaleEncoderShaderProgram); grayscaleEncoderShaderProgram = 0; }
-            if (grayscaleEncoderVBO != 0) { glDeleteBuffers(1, &grayscaleEncoderVBO); grayscaleEncoderVBO = 0; }
-            if (grayscaleEncoderVAO != 0) { glDeleteVertexArrays(1, &grayscaleEncoderVAO); grayscaleEncoderVAO = 0; }
-            trackingCtx.releaseCurrent();
         }
         trackingCtx.cleanup();
         ctrlCtx.cleanup();
@@ -1537,7 +1575,8 @@ struct CameraAccessExtension{
             return;
         }
 
-        if (!ext->rgbCtx.makeCurrent()) {
+        ScopedCameraGLContextCurrent rgbCurrent(ext->rgbCtx);
+        if (!rgbCurrent.isCurrent()) {
             LOGE("Failed to make RGB context current: 0x%x", eglGetError());
             ext->inFlightCallbacks.fetch_sub(1);
             ext->callbackDrainCV.notify_all();
@@ -1545,8 +1584,6 @@ struct CameraAccessExtension{
         }
 
         ext->handleRGBFrame(data);
-
-        ext->rgbCtx.releaseCurrent();
 
         ext->inFlightCallbacks.fetch_sub(1);
         ext->callbackDrainCV.notify_all();
@@ -1582,7 +1619,8 @@ struct CameraAccessExtension{
             return;
         }
 
-        if (!ext->trackingCtx.makeCurrent()) {
+        ScopedCameraGLContextCurrent trackingCurrent(ext->trackingCtx);
+        if (!trackingCurrent.isCurrent()) {
             LOGE("Failed to make tracking context current: 0x%x", eglGetError());
             ext->inFlightCallbacks.fetch_sub(1);
             ext->callbackDrainCV.notify_all();
@@ -1590,8 +1628,6 @@ struct CameraAccessExtension{
         }
 
         ext->handleTrackingFrame(data);
-
-        ext->trackingCtx.releaseCurrent();
 
         ext->inFlightCallbacks.fetch_sub(1);
         ext->callbackDrainCV.notify_all();
@@ -1627,7 +1663,8 @@ struct CameraAccessExtension{
             return;
         }
 
-        if (!ext->ctrlCtx.makeCurrent()) {
+        ScopedCameraGLContextCurrent ctrlCurrent(ext->ctrlCtx);
+        if (!ctrlCurrent.isCurrent()) {
             LOGE("Failed to make ctrl context current: 0x%x", eglGetError());
             ext->inFlightCallbacks.fetch_sub(1);
             ext->callbackDrainCV.notify_all();
@@ -1635,8 +1672,6 @@ struct CameraAccessExtension{
         }
 
         ext->handleCtrlFrame(data);
-
-        ext->ctrlCtx.releaseCurrent();
 
         ext->inFlightCallbacks.fetch_sub(1);
         ext->callbackDrainCV.notify_all();
@@ -2400,16 +2435,19 @@ struct CameraAccessExtension{
 
         // Delete RGB GL resources on the correct context (rgbCtx)
         if (rgbCtx.initialized && (rgbSbsFBO || rgbSbsTexture)) {
-            rgbCtx.makeCurrent();
-            if (rgbSbsFBO) {
-                glDeleteFramebuffers(1, &rgbSbsFBO);
-                rgbSbsFBO = 0;
+            ScopedCameraGLContextCurrent rgbCurrent(rgbCtx);
+            if (rgbCurrent.isCurrent()) {
+                if (rgbSbsFBO) {
+                    glDeleteFramebuffers(1, &rgbSbsFBO);
+                    rgbSbsFBO = 0;
+                }
+                if (rgbSbsTexture) {
+                    glDeleteTextures(1, &rgbSbsTexture);
+                    rgbSbsTexture = 0;
+                }
+            } else {
+                LOGW("stopEncoder: failed to make RGB context current for cleanup: 0x%x", eglGetError());
             }
-            if (rgbSbsTexture) {
-                glDeleteTextures(1, &rgbSbsTexture);
-                rgbSbsTexture = 0;
-            }
-            rgbCtx.releaseCurrent();
         }
 
         // Stop legacy grayscale encoders
