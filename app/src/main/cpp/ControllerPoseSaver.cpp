@@ -16,6 +16,7 @@ ControllerPoseSaver::~ControllerPoseSaver() {
 }
 
 void ControllerPoseSaver::Init(const std::string& savePath) {
+    if (m_running) return;
     m_savePath = savePath;
     m_running = true;
     m_paused = false;
@@ -127,7 +128,7 @@ std::string ControllerPoseSaver::RecordToCsv(const ControllerPoseRecord& rec) {
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(6);
     oss << rec.frameNumber << ","
-        << rec.timestamp << ","
+        << (rec.timestamp + m_timeOffsetNs) << ","
         << (rec.leftActive ? 1 : 0) << ","
         << rec.leftPos[0] << "," << rec.leftPos[1] << "," << rec.leftPos[2] << ","
         << rec.leftQuat[0] << "," << rec.leftQuat[1] << ","

@@ -103,6 +103,9 @@ public:
 
     bool IsFinished() const { return m_finished.load(); }
 
+    // Set BOOTTIME→REALTIME offset for timestamp conversion (called once per recording session)
+    void SetTimeOffset(int64_t offsetNs) { m_timeOffsetNs = offsetNs; }
+
     // 重置帧计数器
     void ResetFrameCounter() { m_frameCounter = 0; }
 
@@ -162,6 +165,9 @@ private:
     // Whether a recording session is active
     std::atomic<bool> m_sessionActive{false};
     std::atomic<bool> m_finished{false};
+
+    // BOOTTIME→REALTIME offset for timestamp conversion
+    int64_t m_timeOffsetNs{0};
 };
 
 #endif //HELLOXR_RAWDATESAVE_H

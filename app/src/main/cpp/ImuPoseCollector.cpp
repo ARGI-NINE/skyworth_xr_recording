@@ -22,6 +22,7 @@ bool ImuPoseCollector::start(const std::string& accelCsvPath, const std::string&
 
     mAccelCount = 0;
     mGyroCount = 0;
+    mFinished = false;
 
     mAccelFile.open(accelCsvPath, std::ios::out | std::ios::trunc);
     if (!mAccelFile.is_open()) {
@@ -52,7 +53,6 @@ bool ImuPoseCollector::start(const std::string& accelCsvPath, const std::string&
     mWriterThread = std::thread(&ImuPoseCollector::writerThreadFunc, this);
 
     mRunning = true;
-    mFinished = false;
     mSensorThread = std::thread(&ImuPoseCollector::sensorThreadFunc, this);
 
     LOGI("ImuPoseCollector started: %s, %s", accelCsvPath.c_str(), gyroCsvPath.c_str());
@@ -75,10 +75,11 @@ void ImuPoseCollector::stop() {
         std::lock_guard<std::mutex> lock(mQueueMutex);
         while (!mWriteQueue.empty()) {
             auto& e = mWriteQueue.front();
+            int64_t utcNs = e.timestamp + mTimeOffsetNs;
             if (e.isAccel) {
-                mAccelFile << e.timestamp << "," << e.x << "," << e.y << "," << e.z << "\n";
+                mAccelFile << utcNs << "," << e.x << "," << e.y << "," << e.z << "\n";
             } else {
-                mGyroFile << e.timestamp << "," << e.x << "," << e.y << "," << e.z << "\n";
+                mGyroFile << utcNs << "," << e.x << "," << e.y << "," << e.z << "\n";
             }
             mWriteQueue.pop();
         }
@@ -189,12 +190,13 @@ void ImuPoseCollector::writerThreadFunc() {
         }
 
         if (hasEvent) {
+            int64_t utcNs = event.timestamp + mTimeOffsetNs;
             if (event.isAccel) {
-                mAccelFile << event.timestamp << "," << event.x << "," << event.y << "," << event.z << "\n";
+                mAccelFile << utcNs << "," << event.x << "," << event.y << "," << event.z << "\n";
                 mAccelCount++;
                 if (mAccelCount % 200 == 0) mAccelFile.flush();
             } else {
-                mGyroFile << event.timestamp << "," << event.x << "," << event.y << "," << event.z << "\n";
+                mGyroFile << utcNs << "," << event.x << "," << event.y << "," << event.z << "\n";
                 mGyroCount++;
                 if (mGyroCount % 200 == 0) mGyroFile.flush();
             }

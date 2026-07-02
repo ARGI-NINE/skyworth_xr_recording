@@ -87,6 +87,31 @@ namespace SXR {
         // rgb: hwBuffer[0]=left, hwBuffer[1]=right
     };
 
+    // Per-camera <TimeAlignment delta> entry.
+    struct CameraTimeAlign { char name[32]; float deltaSec; };
+
+    // IMU calibration sidecar payload (crosses the dlopen ABI — keep POD, no std::string).
+    struct SxrImuCalibration {
+        bool   valid;              // true once parsed successfully
+        int    imuId;              // <Stateinit imuId>
+        bool   isPrimary;          // <Stateinit isPrimaryImu>
+        float  accelBias[3];       // aBias, m/s²
+        float  gyroBias[3];        // wBias, rad/s
+        float  accelScale[3];      // ka, dimensionless
+        float  gyroScale[3];       // kg, dimensionless
+        float  accelNonorth[3];    // na, dimensionless
+        float  gyroNonorth[3];     // ng, dimensionless
+        CameraTimeAlign cameraTimeAlign[8];  // per-camera <TimeAlignment delta>, seconds
+        int    cameraTimeAlignCount;
+        float  stateinitDelta;     // <Stateinit delta>, s (IMU↔tracking/pose time offset)
+        float  accelDelta;         // <Stateinit accelDelta>, s
+        float  accelNoiseStd[3];   // σ_a, m/s² (from <IMUNoise> stationary, or fallback)
+        float  gyroNoiseStd[3];    // σ_g, rad/s (from <IMUNoise> stationary, or fallback)
+        float  accelBiasStd[3];    // σ_ba, m/s² (hardcoded; not in XML)
+        float  gyroBiasStd[3];     // σ_bg, rad/s (hardcoded; not in XML)
+        char   deviceUid[64];      // <DeviceConfiguration deviceUID>
+    };
+
     typedef void (*FrameCallback)(void* userData, const FrameData* data);
 }
 #endif //SXR_COMMON_H

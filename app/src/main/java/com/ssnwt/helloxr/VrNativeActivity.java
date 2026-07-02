@@ -39,6 +39,7 @@ import android.view.View;
 import android.view.WindowManager;
 import androidx.annotation.NonNull;
 import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 import com.ssnwt.vr.androidmanager.AndroidInterface;
 import com.ssnwt.vr.androidmanager.SystemEventUtils;
 import java.io.File;
@@ -104,6 +105,8 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     private int mSoundUsbUnplugged;
     private int mSoundCopyFailed;
     private int mSoundNoDatasetRemains;
+    private int mSoundStorageFullStart;
+    private int mSoundStorageFullStop;
     private String mDatasetRootPath;
     private String mActiveExportRoot;
     private Handler mHandler = new Handler() {
@@ -178,6 +181,8 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         mSoundCopyFailed = mSoundPool.load(this, R.raw.copy_failed, 1);
         mSoundNoDatasetRemains = mSoundPool.load(this, R.raw.no_data_remains, 1);
         mSoundUsbUnplugged = mSoundPool.load(this, R.raw.usb_unplug, 1);
+        mSoundStorageFullStart = mSoundPool.load(this, R.raw.storage_full_start, 1);
+        mSoundStorageFullStop = mSoundPool.load(this, R.raw.storage_full_stop, 1);
     }
 
     private void onSvrApiInitialized() {
@@ -227,6 +232,10 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             soundId = mSoundCopyFailed;
         } else if (text.contains("当前无数据需要拷贝")) {
             soundId = mSoundNoDatasetRemains;
+        } else if (text.contains("无法继续保存")) {
+            soundId = mSoundStorageFullStop;
+        } else if (text.contains("无法录制")) {
+            soundId = mSoundStorageFullStart;
         }
         if (soundId != 0 && mSoundPool != null) {
             mSoundPool.play(soundId, 1.0f, 1.0f, 1, 0, 1.0f);
@@ -419,8 +428,8 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             registerReceiver(mBroadcastReceiver, filter);
 
             IntentFilter btfilter = new IntentFilter();
-            filter.addAction(BluetoothDevice.ACTION_FOUND);
-            filter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+            btfilter.addAction(BluetoothDevice.ACTION_FOUND);
+            btfilter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
             registerReceiver(bluetoothReceiver, btfilter);
 
             // Register command intent receiver
@@ -428,7 +437,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             cmdFilter.addAction(ACTION_SAVE_IMAGE);
             cmdFilter.addAction(ACTION_START_RECORDING);
             cmdFilter.addAction(ACTION_STOP_RECORDING);
-            registerReceiver(mCommandReceiver, cmdFilter);
+            ContextCompat.registerReceiver(this, mCommandReceiver, cmdFilter, ContextCompat.RECEIVER_EXPORTED);
 
             IntentFilter usbFilter = new IntentFilter();
             usbFilter.addAction(Intent.ACTION_MEDIA_MOUNTED);

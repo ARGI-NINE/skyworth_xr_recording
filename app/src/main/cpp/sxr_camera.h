@@ -38,6 +38,8 @@ typedef int (*SxrCameraGetGroupInfoFunc)(SxrCameraContext* ctx,
                                           uint32_t* maxHeight,
                                           uint32_t* format);
 
+typedef int (*SxrCameraGetImuCalibrationFunc)(SXR::SxrImuCalibration* out);
+
 /**********************************************************
  * API function table - holds dynamically loaded function pointers
  **********************************************************/
@@ -52,6 +54,7 @@ typedef struct SxrCameraApi {
     SxrCameraCloseGroupFunc close_group;
     SxrCameraIsGroupOpenFunc is_group_open;
     SxrCameraGetGroupInfoFunc get_group_info;
+    SxrCameraGetImuCalibrationFunc get_imu_calibration;
 } SxrCameraApi;
 
 /**********************************************************
@@ -131,6 +134,10 @@ static inline int sxr_camera_api_init(SxrCameraApi* api, const char* libPath) {
         return -1;
     }
 
+    api->get_imu_calibration = (SxrCameraGetImuCalibrationFunc)dlsym(api->libHandle, "sxr_camera_get_imu_calibration");
+    // Optional symbol: do NOT dlclose/fail init if absent (older .so without IMU support).
+    // The inline wrapper sxr_camera_get_imu_calibration null-checks and returns -1.
+
     return 0;
 }
 
@@ -197,6 +204,11 @@ static inline int sxr_camera_get_group_info(SxrCameraApi* api,
                                              uint32_t* maxHeight,
                                              uint32_t* format) {
     return api->get_group_info(ctx, group, maxWidth, maxHeight, format);
+}
+
+static inline int sxr_camera_get_imu_calibration(SxrCameraApi* api, SXR::SxrImuCalibration* out) {
+    if (!api || !api->get_imu_calibration) return -1;
+    return api->get_imu_calibration(out);
 }
 
 #ifdef __cplusplus

@@ -218,6 +218,7 @@ Key libraries linked in `app/src/main/cpp/CMakeLists.txt`:
 - Storage path defined in main.cpp:61
 - Application requires camera permission: `android.permission.CAMERA`
 - Requires OpenXR runtime: `com.qualcomm.qti.openxrruntime` or `com.qualcomm.qti.spaces.services`
+- Dataset media is fragmented MP4 via `FMP4Writer` (`app/src/main/cpp/FMP4Writer.{h,cpp}`), used by both `CameraEncoder` and `AudioEncoder`. HEVC encoder runs with `max-bframes=0` (I/P frames only), so decode order == presentation order.
 
 ## Device Operation & Debugging
 
@@ -284,45 +285,59 @@ adb logcat | grep "Encoder\|Recording\|DatasetRecorder"
 
 ```
 dataset/<YYYYMMDD_HHMMSS>/
-├── rgb.mp4              # RGB SBS video (2W×H, H.265, 30fps, 8Mbps)
-├── tracking.mp4         # Tracking grayscale (W×H, H.265, 60fps, 4Mbps)
-├── ctrl.mp4             # Ctrl grayscale (W×H, H.265, 60fps, 4Mbps)
-├── audio.m4a            # AAC audio (44.1kHz, mono, 96kbps)
+├── rgb.mp4              # RGB SBS video (2W×H, H.265, 30fps, 8Mbps) — fragmented MP4
+├── tracking.mp4         # Tracking grayscale (W×H, H.265, 60fps, 4Mbps) — fragmented MP4
+├── ctrl.mp4             # Ctrl grayscale (W×H, H.265, 60fps, 4Mbps) — fragmented MP4
+├── audio.m4a            # AAC audio (44.1kHz, mono, 96kbps) — fragmented MP4
+├── rgb_metainfo.csv        # Per RGB frame metadata
+├── tracking_metainfo.csv   # Per tracking frame metadata
+├── ctrl_metainfo.csv       # Per ctrl frame metadata
+├── audio_metainfo.csv      # Per AAC packet metadata
 ├── accel.csv            # Accelerometer (timestamp_ns, x, y, z) [m/s²]
 ├── gyro.csv             # Gyroscope (timestamp_ns, x, y, z) [rad/s]
 ├── head_pose.csv        # 6DOF head pose (timestamp_ns, pos_x/y/z, quat_x/y/z/w)
 ├── hand_tracking.csv    # Hand joints 26×2 (hand mode) / controller_poses.csv (controller mode)
 ├── camera_params_rgb.json
 ├── camera_params_tracking.json
-├── camera_params_ctrl.json
-└── time_offset.json      # BOOTTIME → REALTIME(UTC) offset samples
+└── camera_params_ctrl.json
 ```
 
-All timestamps are `CLOCK_BOOTTIME` nanoseconds. Video files embed ns timestamps in TimedText track (MIME `application/x-subrip`).
+Media files (`*.mp4`, `*.m4a`) are **fragmented MP4** written by the custom `FMP4Writer` module (`app/src/main/cpp/FMP4Writer.{h,cpp}`): `moov` is written up front and one `moof`/`mdat` pair per encoded sample, so a truncated or ungracefully-stopped recording still plays back to the last complete fragment. Video PTS is zero-based (first frame = 0). HEVC uses I/P frames only (`max-bframes=0`), so decode order == presentation order (PTS strictly monotonic).
 
-### Time Offset Conversion
+**`*_metainfo.csv` schemas** (header row + append-per-sample, crash-safe):
 
-`time_offset.json` contains 1 Hz samples of the offset between `CLOCK_BOOTTIME` and `CLOCK_REALTIME` (UTC):
+- Video (`rgb_metainfo.csv`, `tracking_metainfo.csv`, `ctrl_metainfo.csv`):
+  `frame_index,frame_id,pts_us,exposure_start_utc_ns,exposure_duration_ns,gain,mid_exposure_utc_ns`
+- Audio (`audio_metainfo.csv`):
+  `packet_index,pts_us,capture_utc_ns`
 
-```json
-{
-  "description": "CLOCK_BOOTTIME to CLOCK_REALTIME (UTC) offset samples",
-  "unit": "nanoseconds",
-  "formula": "utc_timestamp_ns = boottime_timestamp_ns + offset_ns",
-  "offsets": [
-    {"boottime_ns": ..., "realtime_ns": ..., "offset_ns": ...}
-  ]
-}
-```
+`pts_us` is zero-based microseconds (matches the mp4 video PTS exactly; audio uses a sample-rate timescale internally). The `*_utc_ns` columns are absolute UTC (CLOCK_BOOTTIME + a one-shot BOOTTIME→REALTIME offset captured once at recording start). Per-frame timestamps/exposure/gain live in `*_metainfo.csv`; the media files no longer carry any TimedText/metadata track.
+
+### Timestamps & UTC Conversion
+
+All dataset streams share **one absolute UTC timeline**. A single `BOOTTIME→REALTIME` offset (`mBoottimeToRealtimeOffsetNs = CLOCK_REALTIME - CLOCK_BOOTTIME`) is captured once at recording start and added to every stream's raw `CLOCK_BOOTTIME` timestamp, so no separate offset file is needed:
+
+- **Video** (`*_metainfo.csv` `exposure_start_utc_ns` / `mid_exposure_utc_ns`): raw source is the camera frame exposure timestamp (`start_of_exposure_ts`), which is **kernel `CLOCK_BOOTTIME`**.
+- **Audio** (`audio_metainfo.csv` `capture_utc_ns`): reconstructed from a `CLOCK_BOOTTIME` base + codec PTS, `+ offset → UTC`.
+- **IMU** (`accel.csv` / `gyro.csv` `timestamp_ns`): Android `ASensorEvent.timestamp` (`CLOCK_BOOTTIME`), `+ offset → UTC` — these are UTC, **not** raw boottime.
+- **head_pose.csv / controller_poses.csv / hand_tracking.csv `timestamp_ns`**: `CLOCK_BOOTTIME`, `+ offset → UTC`.
+
+Every `*_utc_ns` and `timestamp_ns` column is therefore absolute UTC and mutually consistent — IMU, video, audio, and poses are on the same timeline. (`pts_us` in `*_metainfo.csv` is separate: zero-based microseconds matching the mp4 video PTS; audio uses a sample-rate timescale internally.)
+
+> Verified empirically: an `accel.csv` `timestamp_ns` decodes to the recording instant in UTC, and `accel` vs `audio capture_utc_ns` differ only by real sample timing (sub-100 ms) — same domain.
 
 ### MP4 Timestamp Extraction
 
 ```bash
-# Extract TimedText ns timestamps
-ffmpeg -i rgb.mp4 -map 0:0 -f data - 2>/dev/null | strings | head -5
+# Per-frame timestamps/exposure/gain come from the *_metainfo.csv, not the mp4.
+# Video: read mid_exposure_utc_ns (or pts_us) from *_metainfo.csv.
+# Audio: read capture_utc_ns from audio_metainfo.csv.
 
-# Check frame count consistency
-ffprobe -v quiet -select_streams 1 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 rgb.mp4
+# Inspect the fragmented mp4 itself (one moof/mdat per sample; survives truncation)
+ffprobe -v quiet -show_format -show_streams rgb.mp4
+
+# Sample/packet counts for sanity-checking against the CSV row count
+ffprobe -v quiet -select_streams 0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 rgb.mp4
 ```
 
 ## Common Issues

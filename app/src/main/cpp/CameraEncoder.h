@@ -1,7 +1,6 @@
 #pragma once
 
 #include <media/NdkMediaCodec.h>
-#include <media/NdkMediaMuxer.h>
 #include <media/NdkImageReader.h>
 #include <android/hardware_buffer.h>
 #include <android/native_window.h>
@@ -12,7 +11,10 @@
 #include <queue>
 #include <mutex>
 #include <string>
+#include <vector>
+#include <cstdio>
 
+#include "FMP4Writer.h"
 #include "NativeLogger.h"
 
 #define LOG_TAG "CameraEncoder"
@@ -22,6 +24,32 @@
 #define LOGE(...)  NATIVE_LOGE(LOG_TAG, __VA_ARGS__)
 
 namespace SXR {
+
+    // Interface for receiving encoded frame output from all CameraEncoder instances.
+    // Register via CameraEncoder::setOutputListener(); called on each encoder's
+    // output thread for both codec-config (VPS/SPS/PPS) and data frames.
+    class IEncoderOutputListener {
+    public:
+        virtual ~IEncoderOutputListener() = default;
+        // group:  camera group name ("rgb" / "tracking" / "ctrl")
+        // data:   H.265 encoded sample data (AVCC format)
+        // size:   byte length of data
+        // ptsUs:  absolute presentation timestamp (CLOCK_BOOTTIME, microseconds)
+        // isConfig: true for VPS/SPS/PPS (codec config) frames
+        virtual void onEncodedFrame(const char* group,
+            const uint8_t* data, size_t size, int64_t ptsUs, bool isConfig) = 0;
+    };
+
+    // Per-frame metadata carried alongside each encoded sample.
+    // All BOOTTIME fields are converted to UTC at CSV-write time by adding
+    // mTimeOffsetNs (BOOTTIME→REALTIME offset).
+    struct FrameMeta {
+        int64_t midExposureBootNs;
+        int64_t exposureStartBootNs;
+        uint32_t exposure;
+        uint32_t gain;
+        uint32_t frameId;
+    };
 
     // Encoder type
     enum class EncoderType {
@@ -66,9 +94,9 @@ namespace SXR {
         // timestampNs is in nanoseconds
         bool feedFrame(const uint8_t* data, size_t size, int64_t timestampNs);
 
-        // Submit nanosecond timestamp for the current frame (Surface mode)
-        // The exact ns value is written to the text track in the MP4
-        void submitNsTimestamp(int64_t timestampNs);
+        // Submit per-frame metadata for the current frame (Surface + Buffer mode).
+        // Consumed in encoder output order to emit one CSV row per written sample.
+        void submitFrameMeta(const FrameMeta& m);
 
         // Get encoder dimensions
         int getWidth() const { return mWidth; }
@@ -76,9 +104,24 @@ namespace SXR {
         EncoderType getType() const { return mType; }
         EncoderMode getMode() const { return mMode; }
         const std::string& getGroupName() const { return mGroupName; }
+        void setGroupName(const std::string& g) { mGroupName = g; }
+        AMediaCodec* getCodec() const { return mCodec; }
 
         // Check if encoder uses Surface mode
         bool isSurfaceMode() const { return mMode == EncoderMode::SURFACE; }
+
+        // Set BOOTTIME→REALTIME offset for timestamp conversion (called once per recording session)
+        void setTimeOffset(int64_t offsetNs) { mTimeOffsetNs = offsetNs; }
+
+        // --- Global output listener (class-level, shared by all instances) ---
+
+        // Register the listener that receives every encoded frame from all
+        // CameraEncoder instances. Pass nullptr to unregister.
+        static void setOutputListener(IEncoderOutputListener* listener);
+
+        // Request an IDR keyframe (SPS/PPS + IDR) on the given codec. Used after
+        // switching camera groups so consumers get fresh codec config.
+        static void requestKeyFrame(AMediaCodec* codec, const std::string& group);
 
     private:
         void initEncoder();
@@ -103,19 +146,36 @@ namespace SXR {
         std::string mOutputPath;
 
         AMediaCodec *mCodec = nullptr;
-        AMediaMuxer *mMuxer = nullptr;
         ANativeWindow *mInputSurface = nullptr;  // Input surface for zero-copy
-        int mTrackIndex = -1;
-        int mTextTrackIndex = -1;
-        bool mMuxerStarted = false;
+
+        // Fragmented-MP4 writer (replaces AMediaMuxer + in-band text track).
+        SXR::FMP4Writer mFmp4;
+        bool mFmp4Started = false;
 
         std::thread mOutputThread;
         std::atomic<bool> mRunning{false};
 
-        // Queue of ns timestamps for text track (encoder output is ordered)
-        std::mutex mNsMutex;
-        std::queue<int64_t> mNsQueue;
+        // Per-frame metadata queue, consumed in encoder output order to write
+        // one CSV row per emitted sample. Bounded in practice by the 1:1 drain
+        // in the output thread (one pop per written sample; B-frames are
+        // disabled so output order == presentation order is preserved), so it
+        // does not grow unbounded under normal operation.
+        std::mutex mMetaMutex;
+        std::queue<FrameMeta> mMetaQueue;
+
+        // Per-stream CSV (one row per encoded sample).
+        FILE* mMetaFile = nullptr;
+        uint64_t mFrameIndex = 0;
 
         int64_t mLastPtsUs = 0;
+
+        // First sample's absolute PTS (MediaCodec Surface-mode PTS is absolute
+        // CLOCK_BOOTTIME). Each recording zero-bases its PTS from its own first
+        // frame so the fMP4 timeline starts at 0, matching AMediaMuxer's
+        // behaviour. Reset to -1 in initEncoder().
+        int64_t mFirstPtsUs = -1;
+
+        // BOOTTIME→REALTIME offset for timestamp conversion
+        int64_t mTimeOffsetNs = 0;
     };
 }

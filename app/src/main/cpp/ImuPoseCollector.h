@@ -24,6 +24,9 @@ public:
     bool isRunning() const { return mRunning.load(); }
     bool isFinished() const { return mFinished.load(); }
 
+    // Set BOOTTIME→REALTIME offset for timestamp conversion (called once per recording session)
+    void setTimeOffset(int64_t offsetNs) { mTimeOffsetNs = offsetNs; }
+
 private:
     void sensorThreadFunc();
     void writerThreadFunc();
@@ -55,4 +58,7 @@ private:
     std::ofstream mGyroFile;
     std::atomic<uint64_t> mAccelCount{0};
     std::atomic<uint64_t> mGyroCount{0};
+
+    // BOOTTIME→REALTIME offset for timestamp conversion
+    int64_t mTimeOffsetNs{0};
 };

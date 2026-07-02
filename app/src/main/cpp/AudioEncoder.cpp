@@ -52,37 +52,34 @@ void AudioEncoder::initEncoder(const std::string& outputPath) {
 
     mOutputPath = outputPath;
     unlink(mOutputPath.c_str());
-    int fd = open(mOutputPath.c_str(), O_CREAT | O_RDWR, 0666);
-    if (fd < 0) {
-        AE_LOGE("Failed to open output file: %s", mOutputPath.c_str());
+
+    // Fragmented-MP4 writer: ftyp+moov are written lazily from outputLoop()
+    // once the codec reports the audio output format (csd-0 / sample rate).
+    if (!mFmp4.open(mOutputPath)) {
+        AE_LOGE("FMP4Writer open failed for %s", mOutputPath.c_str());
         AMediaCodec_stop(mCodec);
         AMediaCodec_delete(mCodec);
         mCodec = nullptr;
         return;
     }
+    mFmp4Started = false;
 
-    mMuxer = AMediaMuxer_new(fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
-    close(fd);
-
-    if (!mMuxer) {
-        AE_LOGE("Failed to create muxer");
-        AMediaCodec_stop(mCodec);
-        AMediaCodec_delete(mCodec);
-        mCodec = nullptr;
-        return;
+    // Open the per-packet metainfo CSV next to the output m4a:
+    // audio.m4a -> audio_metainfo.csv
+    const std::string csvPath = mOutputPath.substr(0, mOutputPath.size() - 4) + "_metainfo.csv";
+    mAudioMetaFile = fopen(csvPath.c_str(), "w");
+    if (mAudioMetaFile) {
+        fprintf(mAudioMetaFile, "packet_index,pts_us,capture_utc_ns\n");
+        fflush(mAudioMetaFile);
+    } else {
+        AE_LOGE("Failed to open audio metainfo csv: %s", csvPath.c_str());
     }
+    mPacketIndex = 0;
+    mFirstPtsUs = -1;
+    mWarmupFramesRead = 0;
 
-    // Add TimedText track FIRST (before audio track)
-    AMediaFormat* textFormat = AMediaFormat_new();
-    AMediaFormat_setString(textFormat, AMEDIAFORMAT_KEY_MIME, "application/x-subrip");
-    AMediaFormat_setString(textFormat, AMEDIAFORMAT_KEY_LANGUAGE, "und");
-    AMediaFormat_setInt32(textFormat, AMEDIAFORMAT_KEY_IS_FORCED_SUBTITLE, 0);
-    AMediaFormat_setInt32(textFormat, AMEDIAFORMAT_KEY_IS_AUTOSELECT, 0);
-    mTextTrackIndex = AMediaMuxer_addTrack(mMuxer, textFormat);
-    AMediaFormat_delete(textFormat);
-
-    AE_LOGI("Encoder initialized: %s (sampleRate=%d, bitRate=%d, channels=%d)",
-            mOutputPath.c_str(), mSampleRate, mBitRate, mChannelCount);
+    AE_LOGI("Encoder initialized: %s (sampleRate=%d, bitRate=%d, channels=%d, gain=%.2f)",
+            mOutputPath.c_str(), mSampleRate, mBitRate, mChannelCount, mAudioGain);
 }
 
 bool AudioEncoder::start(const std::string& outputPath) {
@@ -97,19 +94,11 @@ bool AudioEncoder::start(const std::string& outputPath) {
     mRecordingDone = false;
     mTotalFramesRead = 0;
     mTotalFramesDropped = 0;
+    mFinished = false;
 
     initEncoder(outputPath);
-    if (!mCodec || !mMuxer) {
+    if (!mCodec) {
         AE_LOGE("Failed to initialize encoder");
-        if (mCodec) {
-            AMediaCodec_stop(mCodec);
-            AMediaCodec_delete(mCodec);
-            mCodec = nullptr;
-        }
-        if (mMuxer) {
-            AMediaMuxer_delete(mMuxer);
-            mMuxer = nullptr;
-        }
         return false;
     }
 
@@ -121,8 +110,6 @@ bool AudioEncoder::start(const std::string& outputPath) {
         AMediaCodec_stop(mCodec);
         AMediaCodec_delete(mCodec);
         mCodec = nullptr;
-        AMediaMuxer_delete(mMuxer);
-        mMuxer = nullptr;
         return false;
     }
 
@@ -141,8 +128,6 @@ bool AudioEncoder::start(const std::string& outputPath) {
         AMediaCodec_stop(mCodec);
         AMediaCodec_delete(mCodec);
         mCodec = nullptr;
-        AMediaMuxer_delete(mMuxer);
-        mMuxer = nullptr;
         return false;
     }
 
@@ -158,13 +143,10 @@ bool AudioEncoder::start(const std::string& outputPath) {
         AMediaCodec_stop(mCodec);
         AMediaCodec_delete(mCodec);
         mCodec = nullptr;
-        AMediaMuxer_delete(mMuxer);
-        mMuxer = nullptr;
         return false;
     }
 
     mRunning = true;
-    mFinished = false;
     mRecordingThread = std::thread(&AudioEncoder::recordingLoop, this);
     mInputThread = std::thread(&AudioEncoder::inputLoop, this);
     mOutputThread = std::thread(&AudioEncoder::outputLoop, this);
@@ -212,6 +194,43 @@ void AudioEncoder::recordingLoop() {
         mTotalFramesRead += numFrames;
 
         size_t dataBytes = (size_t)numFrames * mChannelCount * sizeof(int16_t);
+
+        // --- Warm-up gate: discard first ~200ms to avoid AAudio cold-start ---
+        // transient. The hardware DMA can emit a loud impulse (~8768 peak at
+        // ~71ms) on the first real burst after silence.  Skipping frames here
+        // (before queue push) keeps the encoder timeline clean.
+        if (mWarmupFramesRead < kWarmupFrames) {
+            mWarmupFramesRead += numFrames;
+            if (mWarmupFramesRead < kWarmupFrames) {
+                continue;  // still in warm-up, drop this chunk silently
+            }
+            // Warm-up just completed; trim this chunk to only the post-warm-up tail.
+            int64_t excess = mWarmupFramesRead - kWarmupFrames;
+            int64_t trimFrames = numFrames - excess;
+            if (trimFrames > 0 && excess > 0) {
+                size_t trimBytes = (size_t)trimFrames * mChannelCount * sizeof(int16_t);
+                buffer.erase(buffer.begin(), buffer.begin() + trimBytes);
+                dataBytes -= trimBytes;
+                numFrames = excess;
+                // Adjust ptsUs forward by the trimmed duration.
+                ptsUs += trimFrames * 1000000LL / mSampleRate;
+            }
+        }
+
+        // --- Software gain: compensate for missing AGC in LOW_LATENCY mode ---
+        // MediaRecorder's MIC source applies AGC; AAudio LOW_LATENCY bypasses
+        // it, resulting in ~3-8 dB lower volume in the output AAC.
+        if (mAudioGain != 1.0f) {
+            int16_t* samples = reinterpret_cast<int16_t*>(buffer.data());
+            size_t numSamples = dataBytes / sizeof(int16_t);
+            for (size_t i = 0; i < numSamples; ++i) {
+                int32_t amplified = static_cast<int32_t>(samples[i] * mAudioGain);
+                // Clamp to int16 range
+                if (amplified > 32767) amplified = 32767;
+                if (amplified < -32768) amplified = -32768;
+                samples[i] = static_cast<int16_t>(amplified);
+            }
+        }
 
         // Push to queue (drop oldest if full to keep latency bounded)
         {
@@ -314,31 +333,44 @@ void AudioEncoder::outputLoop() {
             size_t outSize;
             uint8_t* outBuf = AMediaCodec_getOutputBuffer(mCodec, outIndex, &outSize);
 
-            if (!mMuxerStarted && outBuf) {
-                AMediaFormat* outputFormat = AMediaCodec_getOutputFormat(mCodec);
-                mAudioTrackIndex = AMediaMuxer_addTrack(mMuxer, outputFormat);
-                AMediaMuxer_start(mMuxer);
-                mMuxerStarted = true;
-                AE_LOGI("Muxer started, audio track index: %d", mAudioTrackIndex);
+            // Lazily start the FMP4Writer on the first usable output: pull the
+            // codec's csd-0 (AAC AudioSpecificConfig) so the moov/stsd is complete.
+            if (!mFmp4Started && outBuf) {
+                startFmp4FromFormat();
             }
 
             bool isConfig = (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) != 0;
 
-            if (mMuxerStarted && outBuf) {
-                AMediaMuxer_writeSampleData(mMuxer, mAudioTrackIndex, outBuf, &info);
-                mLastPtsUs = info.presentationTimeUs;
+            // csd is already embedded in moov via esds; skip codec-config
+            // buffers and the empty EOS trailer (info.size == 0). For audio
+            // every packet is a sync sample. info.offset is honored: some
+            // codecs place sample data at a non-zero offset. ptsTs uses the
+            // audio track's sample-rate timescale.
+            if (mFmp4Started && outBuf && !isConfig && info.size > 0) {
+                // Zero-base the muxer PTS + CSV pts_us from this recording's
+                // first AAC sample so the fMP4 audio timeline starts at 0,
+                // matching CameraEncoder/video. capture_utc_ns keeps using the
+                // ABSOLUTE info.presentationTimeUs (mBoottimeBaseNs is absolute).
+                if (mFirstPtsUs < 0) mFirstPtsUs = info.presentationTimeUs;
+                const int64_t ptsRel = info.presentationTimeUs - mFirstPtsUs;
 
-                if (!isConfig) {
-                    int64_t absoluteNs = mBoottimeBaseNs + info.presentationTimeUs * 1000;
-                    std::string text = std::to_string(absoluteNs);
-                    AMediaCodecBufferInfo textInfo;
-                    memset(&textInfo, 0, sizeof(textInfo));
-                    textInfo.offset = 0;
-                    textInfo.size = text.size();
-                    textInfo.presentationTimeUs = info.presentationTimeUs;
-                    textInfo.flags = 0;
-                    AMediaMuxer_writeSampleData(mMuxer, mTextTrackIndex,
-                                                 (const uint8_t*)text.c_str(), &textInfo);
+                const int64_t ptsTs =
+                        ptsRel * (int64_t)mAudioSampleRate / 1000000LL;
+                mFmp4.writeSample(outBuf + info.offset, info.size, ptsTs, /*isSync=*/true);
+                mLastPtsUs = ptsRel;
+
+                // One CSV row per AAC output sample. capture_utc_ns reuses the
+                // same BOOTTIME derivation as the old text track:
+                //   mBoottimeBaseNs + absPtsUs*1000  (+ BOOTTIME->REALTIME offset).
+                if (mAudioMetaFile) {
+                    const int64_t captureUtcNs =
+                            mBoottimeBaseNs + info.presentationTimeUs * 1000 + mTimeOffsetNs;
+                    fprintf(mAudioMetaFile, "%llu,%lld,%lld\n",
+                            (unsigned long long)mPacketIndex,
+                            (long long)ptsRel,
+                            (long long)captureUtcNs);
+                    fflush(mAudioMetaFile);
+                    ++mPacketIndex;
                 }
             }
 
@@ -352,12 +384,8 @@ void AudioEncoder::outputLoop() {
                 eosReceived = true;
             }
         } else if (outIndex == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-            if (!mMuxerStarted) {
-                AMediaFormat* newFormat = AMediaCodec_getOutputFormat(mCodec);
-                mAudioTrackIndex = AMediaMuxer_addTrack(mMuxer, newFormat);
-                AMediaMuxer_start(mMuxer);
-                mMuxerStarted = true;
-                AE_LOGI("Muxer started (format change), audio track index: %d", mAudioTrackIndex);
+            if (!mFmp4Started) {
+                startFmp4FromFormat();
             }
         }
     }
@@ -373,30 +401,30 @@ void AudioEncoder::outputLoop() {
             size_t outSize;
             uint8_t* outBuf = AMediaCodec_getOutputBuffer(mCodec, outIndex, &outSize);
 
-            if (!mMuxerStarted && outBuf) {
-                AMediaFormat* outputFormat = AMediaCodec_getOutputFormat(mCodec);
-                mAudioTrackIndex = AMediaMuxer_addTrack(mMuxer, outputFormat);
-                AMediaMuxer_start(mMuxer);
-                mMuxerStarted = true;
+            if (!mFmp4Started && outBuf) {
+                startFmp4FromFormat();
             }
 
             bool isConfig = (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) != 0;
 
-            if (mMuxerStarted && outBuf) {
-                AMediaMuxer_writeSampleData(mMuxer, mAudioTrackIndex, outBuf, &info);
-                mLastPtsUs = info.presentationTimeUs;
+            if (mFmp4Started && outBuf && !isConfig && info.size > 0) {
+                if (mFirstPtsUs < 0) mFirstPtsUs = info.presentationTimeUs;
+                const int64_t ptsRel = info.presentationTimeUs - mFirstPtsUs;
 
-                if (!isConfig) {
-                    int64_t absoluteNs = mBoottimeBaseNs + info.presentationTimeUs * 1000;
-                    std::string text = std::to_string(absoluteNs);
-                    AMediaCodecBufferInfo textInfo;
-                    memset(&textInfo, 0, sizeof(textInfo));
-                    textInfo.offset = 0;
-                    textInfo.size = text.size();
-                    textInfo.presentationTimeUs = info.presentationTimeUs;
-                    textInfo.flags = 0;
-                    AMediaMuxer_writeSampleData(mMuxer, mTextTrackIndex,
-                                                 (const uint8_t*)text.c_str(), &textInfo);
+                const int64_t ptsTs =
+                        ptsRel * (int64_t)mAudioSampleRate / 1000000LL;
+                mFmp4.writeSample(outBuf + info.offset, info.size, ptsTs, /*isSync=*/true);
+                mLastPtsUs = ptsRel;
+
+                if (mAudioMetaFile) {
+                    const int64_t captureUtcNs =
+                            mBoottimeBaseNs + info.presentationTimeUs * 1000 + mTimeOffsetNs;
+                    fprintf(mAudioMetaFile, "%llu,%lld,%lld\n",
+                            (unsigned long long)mPacketIndex,
+                            (long long)ptsRel,
+                            (long long)captureUtcNs);
+                    fflush(mAudioMetaFile);
+                    ++mPacketIndex;
                 }
             }
 
@@ -406,11 +434,8 @@ void AudioEncoder::outputLoop() {
                 eosReceived = true;
             }
         } else if (outIndex == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-            if (!mMuxerStarted) {
-                AMediaFormat* newFormat = AMediaCodec_getOutputFormat(mCodec);
-                mAudioTrackIndex = AMediaMuxer_addTrack(mMuxer, newFormat);
-                AMediaMuxer_start(mMuxer);
-                mMuxerStarted = true;
+            if (!mFmp4Started) {
+                startFmp4FromFormat();
             }
         } else {
             break;
@@ -418,6 +443,44 @@ void AudioEncoder::outputLoop() {
     }
 
     AE_LOGI("Output loop exited (EOS=%s)", eosReceived ? "true" : "false");
+}
+
+bool AudioEncoder::startFmp4FromFormat() {
+    if (mFmp4Started) return true;
+
+    AMediaFormat* fmt = AMediaCodec_getOutputFormat(mCodec);
+    if (!fmt) {
+        AE_LOGE("getOutputFormat returned null; cannot start FMP4Writer");
+        return false;
+    }
+
+    int32_t sampleRate = mSampleRate;
+    int32_t channelCount = mChannelCount;
+    AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_SAMPLE_RATE, &sampleRate);
+    AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_CHANNEL_COUNT, &channelCount);
+
+    // csd-0 for AAC = AudioSpecificConfig (raw bytes, not length-prefixed).
+    void* csd0Void = nullptr;
+    size_t csd0Len = 0;
+    AMediaFormat_getBuffer(fmt, "csd-0", &csd0Void, &csd0Len);
+
+    mAudioSampleRate = sampleRate;
+    mAudioChannels = channelCount;
+
+    mFmp4.setAudioTrack(sampleRate, channelCount,
+                        static_cast<const uint8_t*>(csd0Void), csd0Len);
+    const bool ok = mFmp4.start();
+    AMediaFormat_delete(fmt);
+
+    if (ok) {
+        mFmp4Started = true;
+        AE_LOGI("FMP4Writer started for %s (sampleRate=%d, channels=%d, csd-0 %zu bytes)",
+                mOutputPath.c_str(), sampleRate, channelCount, csd0Len);
+    } else {
+        AE_LOGE("FMP4Writer start() FAILED for %s — samples will be dropped",
+                mOutputPath.c_str());
+    }
+    return ok;
 }
 
 void AudioEncoder::stop() {
@@ -461,17 +524,22 @@ void AudioEncoder::stop() {
         mCodec = nullptr;
     }
 
-    // Stop and delete muxer
-    if (mMuxer) {
-        AMediaMuxer_stop(mMuxer);
-        AMediaMuxer_delete(mMuxer);
-        AE_LOGI("Muxer stopped and deleted for %s", mOutputPath.c_str());
-        mMuxer = nullptr;
+    // Finalize the fragmented mp4. close() is safe even if start() was never
+    // reached (no frames emitted) — it just closes the fd.
+    if (mFmp4Started) {
+        mFmp4.close();
+        AE_LOGI("FMP4Writer closed for %s", mOutputPath.c_str());
+    } else {
+        mFmp4.close();
     }
+    mFmp4Started = false;
 
-    mMuxerStarted = false;
-    mAudioTrackIndex = -1;
-    mTextTrackIndex = -1;
+    // Close the per-packet metainfo CSV.
+    if (mAudioMetaFile) {
+        fflush(mAudioMetaFile);
+        fclose(mAudioMetaFile);
+        mAudioMetaFile = nullptr;
+    }
 
     // Clear any remaining queue
     {
@@ -479,10 +547,10 @@ void AudioEncoder::stop() {
         while (!mPcmQueue.empty()) mPcmQueue.pop();
     }
 
-    mFinished = true;
-
-    AE_LOGI("AudioEncoder stopped: %s (read=%lu, dropped=%lu)",
+    AE_LOGI("AudioEncoder stopped: %s (read=%lu, dropped=%lu, packets=%llu)",
             mOutputPath.c_str(),
             (unsigned long)mTotalFramesRead,
-            (unsigned long)mTotalFramesDropped);
+            (unsigned long)mTotalFramesDropped,
+            (unsigned long long)mPacketIndex);
+    mFinished = true;
 }

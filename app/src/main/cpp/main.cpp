@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <mutex>
 #include <condition_variable>
 
@@ -98,10 +99,30 @@ static bool readProjectHandProperty() {
     return strcmp(value, "1") == 0 || strcmp(value, "true") == 0;
 }
 
+static bool readProjectControllerProperty() {
+    char value[PROP_VALUE_MAX] = {0};
+    __system_property_get("persist.xr.project_controller", value);
+    return strcmp(value, "1") == 0 || strcmp(value, "true") == 0;
+}
+
 glm::vec3 CUBE_COLORS[CUBE_COUNT] = {{0.16f, 0.32f, 0.85f},
                                      {1.0f, 0.8f, 0.5f},
                                      {0.80f, 0.57f, 0.84f}};
 const char* storagePath = "/storage/emulated/0/Android/data/com.ssnwt.helloxr/files";
+
+// Minimum free space required to start or continue a dataset recording (1 GiB).
+// Below this the recorder refuses to start and auto-stops an active recording.
+static constexpr int64_t MIN_FREE_BYTES = 1024LL * 1024LL * 1024LL;
+
+// Returns available bytes on the filesystem holding `path`, or -1 on error.
+static int64_t getAvailableBytes(const char* path) {
+    struct statvfs stat;
+    if (statvfs(path, &stat) != 0) {
+        LOGW("statvfs failed for %s", path);
+        return -1;
+    }
+    return (int64_t)stat.f_bavail * (int64_t)stat.f_frsize;
+}
 
 // TTS JNI bridge
 static JavaVM* g_javaVm = nullptr;
@@ -109,7 +130,6 @@ static jobject g_activity = nullptr;
 
 // Time conversion function pointers (set by CameraAccessExtension::initTimeConversion)
 static XrTime (*g_boottimeToXrTimeFn)(uint64_t) = nullptr;
-static int64_t (*g_xrtimeToboottimeFn)(XrTime) = nullptr;
 
 void ttsSpeak(const char* text) {
     if (!g_javaVm || !g_activity) {
@@ -377,7 +397,15 @@ struct CameraInfoPanel {
 
     void render(QtiGL::Shader* shader) {
         if (!texture || !geometry) return;
-        glm::mat4 mat = glm::translate(glm::vec3(0.0f, -1.9f, -5.0f));
+        // Head-locked HUD: render in eye/view space. Setting viewMatrix to the
+        // identity decouples the panel from head pose, so it stays fixed in
+        // front of the eyes. engine_draw_frame resets viewMatrix to the eye
+        // matrix at the start of each eye draw, so this is self-contained.
+        // Tunables: z = distance, y = vertical offset, scale = size.
+        glm::mat4 identityView(1.0f);  // SetUniformMat4 takes an lvalue reference
+        shader->SetUniformMat4("viewMatrix", identityView);
+        glm::mat4 mat = glm::translate(glm::vec3(0.0f, -0.25f, -1.8f))  // 1.8m ahead, slightly below center
+                      * glm::scale(glm::vec3(0.35f));                    // tunable size
         shader->SetUniformMat4("modelMatrix", mat);
         shader->SetUniformSampler("srcTex", texture, GL_TEXTURE_2D, 0);
         geometry->Submit();
@@ -415,6 +443,33 @@ struct HandTrackerLogic{
     RawDateSave* rawDateSave;
     u_int64_t FrameCounter = 0;
     bool isResumed = false;
+
+    ~HandTrackerLogic() {
+        Release();
+        delete rawDateSave;
+        rawDateSave = nullptr;
+    }
+
+    // Release hand tracking resources. Call when switching to controller mode
+    // to prevent OpenXR from wasting CPU/GPU cycles on tracking unused hands.
+    void Release() {
+        if (LeftHandTrackerHandle != XR_NULL_HANDLE && pfnDestroyHandTrackerEXT) {
+            pfnDestroyHandTrackerEXT(LeftHandTrackerHandle);
+            LeftHandTrackerHandle = XR_NULL_HANDLE;
+            LOGI("Left hand tracker destroyed");
+        }
+        if (RightHandTrackerHandle != XR_NULL_HANDLE && pfnDestroyHandTrackerEXT) {
+            pfnDestroyHandTrackerEXT(RightHandTrackerHandle);
+            RightHandTrackerHandle = XR_NULL_HANDLE;
+            LOGI("Right hand tracker destroyed");
+        }
+        LeftHandIsActive = false;
+        RightHandIsActive = false;
+        if (rawDateSave) {
+            rawDateSave->StopSession();
+        }
+    }
+
     void Init(){
         XrResult res;
         res = xrGetInstanceProcAddr(engine->state.xrInstance,"xrCreateHandTrackerEXT",
@@ -590,6 +645,15 @@ struct OverlaySnapshot {
         memcpy(leftJoints, snap.leftHand.joints, sizeof(leftJoints));
         memcpy(rightJoints, snap.rightHand.joints, sizeof(rightJoints));
     }
+
+    // Controller pose for coordinate-axis projection (RootSpace).
+    // Populated by saveAlignedSensorData in controller mode.
+    bool ctrlLeftActive = false;
+    float ctrlLeftPos[3] = {};
+    float ctrlLeftQuat[4] = {0, 0, 0, 1};
+    bool ctrlRightActive = false;
+    float ctrlRightPos[3] = {};
+    float ctrlRightQuat[4] = {0, 0, 0, 1};
 };
 
 // Ring buffer of timestamped {head pose, hand joints} samples.
@@ -660,6 +724,66 @@ struct PoseHandSampleRing {
         }
 
         if (count == 1 || t <= buffer[oldestIdx].bootTimeNs) {
+            if (count >= 2) {
+                // Extrapolate backward using the two oldest samples.
+                // At ~60 fps, samples are ~16.7 ms apart; clamp
+                // extrapolation to at most half a frame interval backward
+                // to limit error growth.
+                int secondIdx = (oldestIdx + 1) % CAPACITY;
+                const Sample& s0 = buffer[oldestIdx];
+                const Sample& s1 = buffer[secondIdx];
+                double dt = (double)(s1.bootTimeNs - s0.bootTimeNs);
+                double alpha = dt > 0.0 ? (double)(t - s0.bootTimeNs) / dt : 0.0;
+                // alpha is negative (extrapolating backward into the past);
+                // clamp to prevent unbounded extrapolation error.
+                if (alpha < -0.5) alpha = -0.5;
+                if (info) { info->clampedLow = true; info->alpha = alpha; }
+
+                out.bootTimeNs = t;
+                out.poseValid = s0.poseValid && s1.poseValid;
+
+                // Position: linear extrapolation (same LERP formula, alpha < 0)
+                for (int i = 0; i < 3; i++) {
+                    out.headPos[i] = (float)(s0.headPos[i] + alpha * (s1.headPos[i] - s0.headPos[i]));
+                }
+
+                // Orientation: slerp (same as below, tolerates alpha < 0)
+                float q0[4] = { s0.headQuat[0], s0.headQuat[1], s0.headQuat[2], s0.headQuat[3] };
+                float q1[4] = { s1.headQuat[0], s1.headQuat[1], s1.headQuat[2], s1.headQuat[3] };
+                float dot = q0[0]*q1[0] + q0[1]*q1[1] + q0[2]*q1[2] + q0[3]*q1[3];
+                if (dot < 0.0f) {
+                    for (int i = 0; i < 4; i++) q1[i] = -q1[i];
+                    dot = -dot;
+                }
+                float qr[4];
+                if (dot > 0.9995f) {
+                    for (int i = 0; i < 4; i++) qr[i] = q0[i] + (float)alpha * (q1[i] - q0[i]);
+                } else {
+                    float theta0 = acosf(dot);
+                    float sinTheta0 = sinf(theta0);
+                    float theta = theta0 * (float)alpha;
+                    float s0c = cosf(theta) - dot * sinf(theta) / sinTheta0;
+                    float s1c = sinf(theta) / sinTheta0;
+                    for (int i = 0; i < 4; i++) qr[i] = s0c * q0[i] + s1c * q1[i];
+                }
+                float n = sqrtf(qr[0]*qr[0] + qr[1]*qr[1] + qr[2]*qr[2] + qr[3]*qr[3]);
+                if (n > 0.0f) {
+                    for (int i = 0; i < 4; i++) qr[i] /= n;
+                }
+                memcpy(out.headQuat, qr, sizeof(qr));
+
+                // Hand joints: nearest-neighbor to the oldest sample (avoid
+                // extrapolating joint positions where linear model is poor).
+                out.leftActive = s0.leftActive;
+                out.rightActive = s0.rightActive;
+                memcpy(out.leftJoints, s0.leftJoints, sizeof(float) * 26 * 3);
+                memcpy(out.leftRadii, s0.leftRadii, sizeof(float) * 26);
+                memcpy(out.leftQuats, s0.leftQuats, sizeof(float) * 26 * 4);
+                memcpy(out.rightJoints, s0.rightJoints, sizeof(float) * 26 * 3);
+                memcpy(out.rightRadii, s0.rightRadii, sizeof(float) * 26);
+                memcpy(out.rightQuats, s0.rightQuats, sizeof(float) * 26 * 4);
+                return true;
+            }
             out = buffer[oldestIdx];
             if (info) { info->clampedLow = true; info->alpha = 0.0; }
             return true;
@@ -778,19 +902,102 @@ struct PoseHandSampleRing {
     }
 };
 
+// Ring buffer of controller poses for time alignment with camera frames.
+// Render thread pushes one sample per frame at current CLOCK_BOOTTIME.
+// The RGB camera callback samples this ring at the frame's mid-exposure
+// timestamp to align controller pose CSV rows with head_pose CSV rows.
+struct ControllerPoseRing {
+    struct Sample {
+        int64_t bootTimeNs = 0;
+        int frameNumber = 0;
+        bool leftActive = false;
+        float leftPos[3] = {0, 0, 0};
+        float leftQuat[4] = {0, 0, 0, 1};
+        bool rightActive = false;
+        float rightPos[3] = {0, 0, 0};
+        float rightQuat[4] = {0, 0, 0, 1};
+    };
+
+    static constexpr int CAPACITY = 64;
+
+    mutable std::mutex mutex;
+    Sample buffer[CAPACITY];
+    int writeIdx = 0;
+    int count = 0;
+
+    void push(const Sample& s) {
+        std::lock_guard<std::mutex> lock(mutex);
+        buffer[writeIdx] = s;
+        writeIdx = (writeIdx + 1) % CAPACITY;
+        if (count < CAPACITY) count++;
+    }
+
+    // Nearest-neighbor sample at boottime t. Returns false if empty.
+    bool sample(int64_t t, Sample& out) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (count == 0) return false;
+
+        int oldestIdx = (writeIdx - count + CAPACITY) % CAPACITY;
+        int newestIdx = (writeIdx - 1 + CAPACITY) % CAPACITY;
+
+        if (count == 1 || t <= buffer[oldestIdx].bootTimeNs) {
+            out = buffer[oldestIdx];
+            return true;
+        }
+        if (t >= buffer[newestIdx].bootTimeNs) {
+            out = buffer[newestIdx];
+            return true;
+        }
+
+        // Find nearest sample
+        int bestIdx = oldestIdx;
+        int64_t bestDiff = std::abs(buffer[oldestIdx].bootTimeNs - t);
+        for (int i = 1; i < count; i++) {
+            int idx = (oldestIdx + i) % CAPACITY;
+            int64_t diff = std::abs(buffer[idx].bootTimeNs - t);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestIdx = idx;
+            }
+        }
+        out = buffer[bestIdx];
+        return true;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex);
+        writeIdx = 0;
+        count = 0;
+    }
+};
+
 struct engine;  // forward declaration for g_engine
 static struct engine* g_engine = nullptr;  // global engine pointer (set in android_main)
+
+// --- Sensor align worker thread (offloads OpenXR queries + KB projection from camera callback) ---
+static std::atomic<int64_t>     s_alignTs{-1};
+static std::mutex               s_alignMutex;
+static std::condition_variable  s_alignCv;
+static std::thread              s_alignThread;
+static std::atomic<bool>        s_alignRun{false};
+static std::atomic<int>         s_alignInFlight{0};
+static std::mutex               s_alignDrainMutex;
+static std::condition_variable  s_alignDrainCv;
+
+static void sensorAlignWorker();  // forward decl (defined after engine struct)
+// --- end worker globals ---
 
 // Forward declarations: defined after engine struct (which has full type info).
 static void saveAlignedSensorData(int64_t rgbTimestampNs);
 static void feedOverlayCameraParams(const SXR::FrameData* data);
+static void renderHandOverlayToEncoder(int texWidth, int texHeight);
+static void renderControllerAxesToEncoder(int texWidth, int texHeight);
 
 struct CameraAccessExtension{
     const AppCommon::base_engine* engine;
     JavaVM* vm;
     jobject activityObject;
     PFN_xrConvertTimespecTimeToTimeKHR xrConvertTimespecTimeToTimeKHR;
-    PFN_xrConvertTimeToTimespecTimeKHR xrConvertTimeToTimespecTimeKHR;
 
     // Static instance pointer for C-style callback
     static CameraAccessExtension* sInstance;
@@ -799,10 +1006,6 @@ struct CameraAccessExtension{
     static XrTime staticBoottimeToXrTime(uint64_t boottime_ns) {
         if (sInstance) return sInstance->boottimeToXrTime(boottime_ns);
         return static_cast<XrTime>(boottime_ns);
-    }
-    static int64_t staticXrtimeToboottime(XrTime xrtime) {
-        if (sInstance) return sInstance->xrtimeToboottime(xrtime);
-        return static_cast<int64_t>(xrtime);
     }
 
     // ========== New callback-based camera API (dynamic loading) ==========
@@ -821,14 +1024,14 @@ struct CameraAccessExtension{
     std::atomic<int> inFlightCallbacks{0};
     std::mutex callbackDrainMutex;
     std::condition_variable callbackDrainCV;
+    bool callbackAdmissionClosed{false};
 
-    // ========== 独立EGL上下文（每个相机组一个，按上下文串行访问）==========
+    // ========== 独立EGL上下文（每个相机组一个，无锁竞争）==========
     struct CameraGLContext {
         EGLDisplay display = EGL_NO_DISPLAY;
         EGLContext context = EGL_NO_CONTEXT;
         EGLSurface surface = EGL_NO_SURFACE;  // Pbuffer for offscreen rendering
         std::atomic<bool> initialized{false};
-        std::mutex useMutex;
 
         bool init(const AppCommon::base_engine* engine) {
             if (initialized) return true;
@@ -875,45 +1078,16 @@ struct CameraAccessExtension{
             initialized = false;
         }
 
-        bool makeCurrentUnlocked() {
+        bool makeCurrent() {
             if (!initialized) return false;
             return eglMakeCurrent(display, surface, surface, context);
         }
 
-        void releaseCurrentUnlocked() {
+        void releaseCurrent() {
             if (display != EGL_NO_DISPLAY) {
                 eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             }
         }
-
-        bool makeCurrent() {
-            std::lock_guard<std::mutex> lock(useMutex);
-            return makeCurrentUnlocked();
-        }
-
-        void releaseCurrent() {
-            std::lock_guard<std::mutex> lock(useMutex);
-            releaseCurrentUnlocked();
-        }
-    };
-
-    struct ScopedCameraGLContextCurrent {
-        CameraGLContext& ctx;
-        std::unique_lock<std::mutex> lock;
-        bool current{false};
-
-        explicit ScopedCameraGLContextCurrent(CameraGLContext& ctx)
-            : ctx(ctx), lock(ctx.useMutex) {
-            current = ctx.makeCurrentUnlocked();
-        }
-
-        ~ScopedCameraGLContextCurrent() {
-            if (current) {
-                ctx.releaseCurrentUnlocked();
-            }
-        }
-
-        bool isCurrent() const { return current; }
     };
     CameraGLContext rgbCtx;
     CameraGLContext trackingCtx;
@@ -926,14 +1100,15 @@ struct CameraAccessExtension{
     // 编码器停止标志（防止停止后立即重新初始化）
     std::atomic<bool> encodersStopped{true};//default do not encode
     std::atomic<bool> stopInProgress{false};//true while async stopEncoder() is running
-    std::atomic<uint64_t> pendingEncodeTimestamp{0};
-    OverlaySnapshot overlaySnap;  // snapshot at RGB frame time for overlay projection
+    // Hand-overlay snapshot at RGB frame time (populated by saveAlignedSensorData
+    // in camera callback, used by renderHandOverlayToEncoder direct encode path).
+    OverlaySnapshot overlaySnap;
     std::atomic<bool> encodingEnabled{false};//用户按键切换编码状态
     std::atomic<bool> snapshotRequested{false};//快照请求标志（intent或按键触发）
-    std::atomic<bool> ; // 发送控制命令到
 
     // Dataset recording: encoder output directory (set when recording starts)
     std::string encoderBaseDir;
+    int64_t mCameraTimeOffsetNs{0};  // BOOTTIME→REALTIME offset for lazy-init encoders
 
     // Camera params saved flags (reset on each new recording session)
     std::atomic<bool> cameraParamsSavedRgb{false};
@@ -957,6 +1132,7 @@ struct CameraAccessExtension{
         std::vector<uint8_t> rgbaData;  // pre-expanded RGBA for display
     };
     std::mutex trackingFrameMutex;
+    std::mutex shaderInitMutex;  // protects encoder/grayscale shader init from concurrent threads
     TrackingFrameData trackingFrames[2];  // [0]=left, [1]=right (from TRACKING group)
     TrackingFrameData ctrlFrames[2];      // [0]=left, [1]=right (from CTRL group)
     std::atomic<bool> trackingFrameReady{false};
@@ -1007,9 +1183,6 @@ struct CameraAccessExtension{
     SXR::EncoderSurface* rgbEncoderSurface{nullptr};
 
     // FBO and texture for side-by-side stitching
-    GLuint rgbSbsFBO{0};
-    GLuint rgbSbsTexture{0};
-
     // Grayscale encoder surfaces for zero-copy rendering (Surface mode)
     SXR::EncoderSurface* trackingEncoderSurface{nullptr};
     SXR::EncoderSurface* ctrlEncoderSurface{nullptr};
@@ -1037,8 +1210,14 @@ struct CameraAccessExtension{
     GLuint encoderVBO{0};
     GLuint encoderVAO{0};
 
-    // Simple blit shader for FBO→encoder surface (uses sampler2D, not samplerExternalOES)
-    GLuint sbsCopyShaderProgram{0};
+    // Cached uniform/attrib locations for encoder shader (avoid per-frame string lookups)
+    GLint encShader_uTexture{0};
+    GLint encShader_aPosition{0};
+    GLint encShader_aTexCoord{0};
+
+    // Persistent GL_TEXTURE_EXTERNAL_OES for RGB eyes — created once, re-bound
+    // via eglImageTargetTexture2DOES each frame (avoids per-frame Gen/Delete).
+    GLuint rgbPersistentEyeTex[2]{0, 0};
 
     // Initialize encoder shader (YUV to RGB color space conversion)
     void initEncoderShader() {
@@ -1074,16 +1253,48 @@ struct CameraAccessExtension{
         glShaderSource(vertexShader, 1, &vertexShaderSource, nullptr);
         glCompileShader(vertexShader);
 
+        GLint success;
+        glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
+        if (!success) {
+            char infoLog[512];
+            glGetShaderInfoLog(vertexShader, 512, nullptr, infoLog);
+            LOGE("Encoder vertex shader compilation failed: %s", infoLog);
+            glDeleteShader(vertexShader);
+            return;
+        }
+
         // Compile fragment shader
         GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
         glShaderSource(fragmentShader, 1, &fragmentShaderSource, nullptr);
         glCompileShader(fragmentShader);
+
+        glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
+        if (!success) {
+            char infoLog[512];
+            glGetShaderInfoLog(fragmentShader, 512, nullptr, infoLog);
+            LOGE("Encoder fragment shader compilation failed: %s", infoLog);
+            glDeleteShader(vertexShader);
+            glDeleteShader(fragmentShader);
+            return;
+        }
 
         // Link program
         encoderShaderProgram = glCreateProgram();
         glAttachShader(encoderShaderProgram, vertexShader);
         glAttachShader(encoderShaderProgram, fragmentShader);
         glLinkProgram(encoderShaderProgram);
+
+        glGetProgramiv(encoderShaderProgram, GL_LINK_STATUS, &success);
+        if (!success) {
+            char infoLog[512];
+            glGetProgramInfoLog(encoderShaderProgram, 512, nullptr, infoLog);
+            LOGE("Encoder shader program link failed: %s", infoLog);
+            glDeleteShader(vertexShader);
+            glDeleteShader(fragmentShader);
+            glDeleteProgram(encoderShaderProgram);
+            encoderShaderProgram = 0;
+            return;
+        }
 
         glDeleteShader(vertexShader);
         glDeleteShader(fragmentShader);
@@ -1112,50 +1323,12 @@ struct CameraAccessExtension{
         glVertexAttribPointer(texLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
         glBindVertexArray(0);
 
+        // Cache uniform/attrib locations to avoid per-frame string lookups
+        encShader_uTexture = glGetUniformLocation(encoderShaderProgram, "uTexture");
+        encShader_aPosition = glGetAttribLocation(encoderShaderProgram, "aPosition");
+        encShader_aTexCoord = glGetAttribLocation(encoderShaderProgram, "aTexCoord");
+
         LOGI("Encoder shader initialized");
-    }
-
-    // Initialize SBS copy shader (simple sampler2D blit for FBO→encoder surface)
-    void initSbsCopyShader() {
-        if (sbsCopyShaderProgram != 0) return;
-
-        const char* vs = R"(
-            #version 300 es
-            in vec2 aPosition;
-            in vec2 aTexCoord;
-            out vec2 vTexCoord;
-            void main() {
-                gl_Position = vec4(aPosition, 0.0, 1.0);
-                vTexCoord = aTexCoord;
-            }
-        )";
-
-        const char* fs = R"(
-            #version 300 es
-            precision highp float;
-            in vec2 vTexCoord;
-            uniform sampler2D uTexture;
-            out vec4 fragColor;
-            void main() {
-                fragColor = texture(uTexture, vTexCoord);
-            }
-        )";
-
-        GLuint v = glCreateShader(GL_VERTEX_SHADER);
-        glShaderSource(v, 1, &vs, nullptr);
-        glCompileShader(v);
-        GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(f, 1, &fs, nullptr);
-        glCompileShader(f);
-
-        sbsCopyShaderProgram = glCreateProgram();
-        glAttachShader(sbsCopyShaderProgram, v);
-        glAttachShader(sbsCopyShaderProgram, f);
-        glLinkProgram(sbsCopyShaderProgram);
-        glDeleteShader(v);
-        glDeleteShader(f);
-
-        LOGI("SBS copy shader initialized");
     }
 
     // Initialize grayscale encoder shader (Y8 to YUV conversion)
@@ -1353,15 +1526,7 @@ struct CameraAccessExtension{
             LOGE("get xrConvertTimespecTimeToTimeKHR function failed!");
         }
 
-        res = xrGetInstanceProcAddr(engine->state.xrInstance, "xrConvertTimeToTimespecTimeKHR",
-                                    reinterpret_cast<PFN_xrVoidFunction*>(&xrConvertTimeToTimespecTimeKHR));
-        if (res != XR_SUCCESS)
-        {
-            LOGE("get xrConvertTimeToTimespecTimeKHR function failed!");
-        }
-
         g_boottimeToXrTimeFn = &CameraAccessExtension::staticBoottimeToXrTime;
-        g_xrtimeToboottimeFn = &CameraAccessExtension::staticXrtimeToboottime;
     }
 
     // Cleanup all camera GL contexts and related resources
@@ -1374,61 +1539,53 @@ struct CameraAccessExtension{
 
         // Cleanup RGB context resources
         if (rgbCtx.initialized) {
-            {
-                ScopedCameraGLContextCurrent rgbCurrent(rgbCtx);
-                if (rgbCurrent.isCurrent()) {
-                    for (int i = 0; i < 2; i++) {
-                        if (rgbDisplayTextures[i] != 0) { glDeleteTextures(1, &rgbDisplayTextures[i]); rgbDisplayTextures[i] = 0; }
-                        if (rgbDisplayFBOs[i] != 0) { glDeleteFramebuffers(1, &rgbDisplayFBOs[i]); rgbDisplayFBOs[i] = 0; }
-                    }
-                    if (rgbEncoderSurface) { rgbEncoderSurface->release(); delete rgbEncoderSurface; rgbEncoderSurface = nullptr; }
-                    if (rgbEncoder) { rgbEncoder->stop(); delete rgbEncoder; rgbEncoder = nullptr; }
-                    if (rgbSbsFBO) { glDeleteFramebuffers(1, &rgbSbsFBO); rgbSbsFBO = 0; }
-                    if (rgbSbsTexture) { glDeleteTextures(1, &rgbSbsTexture); rgbSbsTexture = 0; }
-                    if (encoderShaderProgram != 0) { glDeleteProgram(encoderShaderProgram); encoderShaderProgram = 0; }
-                    if (sbsCopyShaderProgram != 0) { glDeleteProgram(sbsCopyShaderProgram); sbsCopyShaderProgram = 0; }
-                    if (encoderVBO != 0) { glDeleteBuffers(1, &encoderVBO); encoderVBO = 0; }
-                    if (encoderVAO != 0) { glDeleteVertexArrays(1, &encoderVAO); encoderVAO = 0; }
-                } else {
-                    LOGW("cleanupAllGLContexts: failed to make RGB context current: 0x%x", eglGetError());
-                }
+            rgbCtx.makeCurrent();
+            for (int i = 0; i < 2; i++) {
+                if (rgbDisplayTextures[i] != 0) { glDeleteTextures(1, &rgbDisplayTextures[i]); rgbDisplayTextures[i] = 0; }
+                if (rgbDisplayFBOs[i] != 0) { glDeleteFramebuffers(1, &rgbDisplayFBOs[i]); rgbDisplayFBOs[i] = 0; }
+                if (rgbPersistentEyeTex[i] != 0) { glDeleteTextures(1, &rgbPersistentEyeTex[i]); rgbPersistentEyeTex[i] = 0; }
             }
+            if (rgbEncoderSurface) { rgbEncoderSurface->release(); delete rgbEncoderSurface; rgbEncoderSurface = nullptr; }
+            if (rgbEncoder) { rgbEncoder->stop(); delete rgbEncoder; rgbEncoder = nullptr; }
+            if (encoderShaderProgram != 0) { glDeleteProgram(encoderShaderProgram); encoderShaderProgram = 0; }
+            if (encoderVBO != 0) { glDeleteBuffers(1, &encoderVBO); encoderVBO = 0; }
+            if (encoderVAO != 0) { glDeleteVertexArrays(1, &encoderVAO); encoderVAO = 0; }
+            if (trackingY8Texture) { glDeleteTextures(1, &trackingY8Texture); trackingY8Texture = 0; }
+            if (ctrlY8Texture) { glDeleteTextures(1, &ctrlY8Texture); ctrlY8Texture = 0; }
+            rgbCtx.releaseCurrent();
             rgbCtx.cleanup();
         }
 
         // Cleanup Tracking/CTRL context resources
         if (trackingCtx.initialized || ctrlCtx.initialized) {
             // Use tracking context for CV cleanup (resources are shared)
-            ScopedCameraGLContextCurrent trackingCurrent(trackingCtx);
-            if (trackingCurrent.isCurrent()) {
-                if (cvPersistentEGLImage[0] != EGL_NO_IMAGE_KHR) {
-                    glext::eglDestroyImageKHR(trackingCtx.display, cvPersistentEGLImage[0]);
-                    cvPersistentEGLImage[0] = EGL_NO_IMAGE_KHR;
-                }
-                if (cvPersistentEGLImage[1] != EGL_NO_IMAGE_KHR) {
-                    glext::eglDestroyImageKHR(trackingCtx.display, cvPersistentEGLImage[1]);
-                    cvPersistentEGLImage[1] = EGL_NO_IMAGE_KHR;
-                }
-                if (cvPersistentExtTex[0] != 0) {
-                    glDeleteTextures(1, &cvPersistentExtTex[0]);
-                    cvPersistentExtTex[0] = 0;
-                }
-                if (cvPersistentExtTex[1] != 0) {
-                    glDeleteTextures(1, &cvPersistentExtTex[1]);
-                    cvPersistentExtTex[1] = 0;
-                }
-                for (int i = 0; i < 4; i++) {
-                    if (cvDisplayTextures[i] != 0) { glDeleteTextures(1, &cvDisplayTextures[i]); cvDisplayTextures[i] = 0; }
-                    if (cvDisplayFBOs[i] != 0) { glDeleteFramebuffers(1, &cvDisplayFBOs[i]); cvDisplayFBOs[i] = 0; }
-                }
-                if (cvDisplayVBOs[0] != 0) { glDeleteBuffers(1, &cvDisplayVBOs[0]); cvDisplayVBOs[0] = 0; }
-                if (cvDisplayVBOs[1] != 0) { glDeleteBuffers(1, &cvDisplayVBOs[1]); cvDisplayVBOs[1] = 0; }
-                if (grayscaleEncoderShaderProgram != 0) { glDeleteProgram(grayscaleEncoderShaderProgram); grayscaleEncoderShaderProgram = 0; }
-                if (grayscaleEncoderVBO != 0) { glDeleteBuffers(1, &grayscaleEncoderVBO); grayscaleEncoderVBO = 0; }
-                if (grayscaleEncoderVAO != 0) { glDeleteVertexArrays(1, &grayscaleEncoderVAO); grayscaleEncoderVAO = 0; }
-            } else {
-                LOGW("cleanupAllGLContexts: failed to make tracking context current: 0x%x", eglGetError());
+            trackingCtx.makeCurrent();
+            if (cvPersistentEGLImage[0] != EGL_NO_IMAGE_KHR) {
+                glext::eglDestroyImageKHR(trackingCtx.display, cvPersistentEGLImage[0]);
+                cvPersistentEGLImage[0] = EGL_NO_IMAGE_KHR;
             }
+            if (cvPersistentEGLImage[1] != EGL_NO_IMAGE_KHR) {
+                glext::eglDestroyImageKHR(trackingCtx.display, cvPersistentEGLImage[1]);
+                cvPersistentEGLImage[1] = EGL_NO_IMAGE_KHR;
+            }
+            if (cvPersistentExtTex[0] != 0) {
+                glDeleteTextures(1, &cvPersistentExtTex[0]);
+                cvPersistentExtTex[0] = 0;
+            }
+            if (cvPersistentExtTex[1] != 0) {
+                glDeleteTextures(1, &cvPersistentExtTex[1]);
+                cvPersistentExtTex[1] = 0;
+            }
+            for (int i = 0; i < 4; i++) {
+                if (cvDisplayTextures[i] != 0) { glDeleteTextures(1, &cvDisplayTextures[i]); cvDisplayTextures[i] = 0; }
+                if (cvDisplayFBOs[i] != 0) { glDeleteFramebuffers(1, &cvDisplayFBOs[i]); cvDisplayFBOs[i] = 0; }
+            }
+            if (cvDisplayVBOs[0] != 0) { glDeleteBuffers(1, &cvDisplayVBOs[0]); cvDisplayVBOs[0] = 0; }
+            if (cvDisplayVBOs[1] != 0) { glDeleteBuffers(1, &cvDisplayVBOs[1]); cvDisplayVBOs[1] = 0; }
+            if (grayscaleEncoderShaderProgram != 0) { glDeleteProgram(grayscaleEncoderShaderProgram); grayscaleEncoderShaderProgram = 0; }
+            if (grayscaleEncoderVBO != 0) { glDeleteBuffers(1, &grayscaleEncoderVBO); grayscaleEncoderVBO = 0; }
+            if (grayscaleEncoderVAO != 0) { glDeleteVertexArrays(1, &grayscaleEncoderVAO); grayscaleEncoderVAO = 0; }
+            trackingCtx.releaseCurrent();
         }
         trackingCtx.cleanup();
         ctrlCtx.cleanup();
@@ -1495,6 +1652,69 @@ struct CameraAccessExtension{
         }
     }
 
+    // Write IMU calibration sidecar (strict JSON, no comments; documented in Readme.md)
+    void saveImuCalibration(const std::string& path, const SXR::SxrImuCalibration& c) {
+        auto arr3 = [&](const float* v) {
+            std::ostringstream o; o << std::fixed << std::setprecision(9);
+            o << "[" << v[0] << ", " << v[1] << ", " << v[2] << "]";
+            return o.str();
+        };
+        std::ostringstream o;
+        o << std::fixed << std::setprecision(9);
+        o << "{\n"
+          << "  \"device_uid\": \"" << c.deviceUid << "\",\n"
+          << "  \"imu\": {\n"
+          << "    \"imu_id\": " << c.imuId << ",\n"
+          << "    \"is_primary\": " << (c.isPrimary ? "true" : "false") << ",\n"
+          << "    \"bias\": {\n"
+          << "      \"accelerometer_mps2\": " << arr3(c.accelBias) << ",\n"
+          << "      \"gyroscope_rads\": " << arr3(c.gyroBias) << "\n"
+          << "    },\n"
+          << "    \"scale_factor\": {\n"
+          << "      \"accelerometer\": " << arr3(c.accelScale) << ",\n"
+          << "      \"gyroscope\": " << arr3(c.gyroScale) << "\n"
+          << "    },\n"
+          << "    \"nonorthogonality\": {\n"
+          << "      \"accelerometer\": " << arr3(c.accelNonorth) << ",\n"
+          << "      \"gyroscope\": " << arr3(c.gyroNonorth) << "\n"
+          << "    },\n"
+          << "    \"time_alignment_s\": {\n"
+          << "      \"imu_to_pose\": " << c.stateinitDelta << ",\n"
+          << "      \"cameras\": {\n";
+    for (int i = 0; i < c.cameraTimeAlignCount; ++i) {
+        o << "        \"" << c.cameraTimeAlign[i].name << "\": "
+          << c.cameraTimeAlign[i].deltaSec
+          << (i + 1 < c.cameraTimeAlignCount ? ",\n" : "\n");
+    }
+    o << "      },\n"
+          << "      \"accel\": " << c.accelDelta << "\n"
+          << "    }\n"
+          << "  },\n"
+          << "  \"noise\": {\n"
+          << "    \"accel_noise_std_mps2\": " << arr3(c.accelNoiseStd) << ",\n"
+          << "    \"gyro_noise_std_rads\": " << arr3(c.gyroNoiseStd) << ",\n"
+          << "    \"accel_bias_std_mps2\": " << arr3(c.accelBiasStd) << ",\n"
+          << "    \"gyro_bias_std_rads\": " << arr3(c.gyroBiasStd) << "\n"
+          << "  }\n"
+          << "}\n";
+        std::ofstream ofs(path);
+        if (ofs.is_open()) {
+            ofs << o.str();
+            ofs.close();
+            LOGI("IMU calibration saved: %s", path.c_str());
+        } else {
+            LOGE("Failed to save IMU calibration: %s", path.c_str());
+        }
+    }
+
+    void restartGrayscaleEncoders() {
+        encodersStopped = true;
+        if (trackingEncoder) { trackingEncoder->stop(); delete trackingEncoder; trackingEncoder = nullptr; }
+        if (trackingEncoderSurface) { trackingEncoderSurface->release(); delete trackingEncoderSurface; trackingEncoderSurface = nullptr; }
+        if (ctrlEncoder) { ctrlEncoder->stop(); delete ctrlEncoder; ctrlEncoder = nullptr; }
+        if (ctrlEncoderSurface) { ctrlEncoderSurface->release(); delete ctrlEncoderSurface; ctrlEncoderSurface = nullptr; }
+    }
+
     // Initialize encoders and surfaces (called in RGB callback with rgbCtx current)
     void initEncodersAndSurfaces(int width, int height) {
         if (rgbEncoder) {
@@ -1508,12 +1728,10 @@ struct CameraAccessExtension{
         if (encoderShaderProgram == 0) {
             initEncoderShader();
         }
-        if (sbsCopyShaderProgram == 0) {
-            initSbsCopyShader();
-        }
 
         // Create single SBS encoder (2W x H, 8Mbps, rgb.mp4)
         rgbEncoder = new SXR::CameraEncoder(sbsWidth, height, 30, 8000000, "rgb.mp4", encoderBaseDir);
+        rgbEncoder->setTimeOffset(mCameraTimeOffsetNs);
         if (!rgbEncoder->start()) {
             LOGE("RGB encoder start failed");
             delete rgbEncoder;
@@ -1534,23 +1752,6 @@ struct CameraAccessExtension{
             return;
         }
         LOGI("RGB SBS encoder initialized: %dx%d", sbsWidth, height);
-
-        // Create stitch FBO and texture (2W x H)
-        glGenFramebuffers(1, &rgbSbsFBO);
-        glGenTextures(1, &rgbSbsTexture);
-        glBindTexture(GL_TEXTURE_2D, rgbSbsTexture);
-        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, sbsWidth, height);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glBindFramebuffer(GL_FRAMEBUFFER, rgbSbsFBO);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rgbSbsTexture, 0);
-        GLenum fboStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (fboStatus != GL_FRAMEBUFFER_COMPLETE) {
-            LOGE("RGB SBS FBO not complete: 0x%x", fboStatus);
-        }
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
     // Static callback for RGB camera frames
@@ -1558,35 +1759,64 @@ struct CameraAccessExtension{
         auto* ext = static_cast<CameraAccessExtension*>(userData);
         if (!data || !ext) return;
 
-        ext->inFlightCallbacks.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+            if (ext->isPaused.load() ||
+                ext->stopInProgress.load() ||
+                ext->callbackAdmissionClosed) {
+                return;
+            }
+            ext->inFlightCallbacks.fetch_add(1);
+        }
         if (ext->isPaused.load()) {
-            ext->inFlightCallbacks.fetch_sub(1);
-            ext->callbackDrainCV.notify_all();
+            std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+            int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+            if (remaining == 0) {
+                ext->callbackDrainCV.notify_all();
+            }
             return;
         }
+        const bool recordThisFrame =
+            ext->encodingEnabled.load() && !ext->encodersStopped.load();
 
         auto t0 = std::chrono::steady_clock::now();
 
         // Init RGB-specific GL context
         if (!ext->rgbCtx.init(ext->engine)) {
             LOGE("Failed to init RGB GL context");
-            ext->inFlightCallbacks.fetch_sub(1);
-            ext->callbackDrainCV.notify_all();
+            {
+                std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+                int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+                if (remaining == 0) {
+                    ext->callbackDrainCV.notify_all();
+                }
+            }
             return;
         }
 
-        ScopedCameraGLContextCurrent rgbCurrent(ext->rgbCtx);
-        if (!rgbCurrent.isCurrent()) {
+        if (!ext->rgbCtx.makeCurrent()) {
             LOGE("Failed to make RGB context current: 0x%x", eglGetError());
-            ext->inFlightCallbacks.fetch_sub(1);
-            ext->callbackDrainCV.notify_all();
+            {
+                std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+                int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+                if (remaining == 0) {
+                    ext->callbackDrainCV.notify_all();
+                }
+            }
             return;
         }
 
-        ext->handleRGBFrame(data);
+        ext->handleRGBFrame(data, recordThisFrame);
 
-        ext->inFlightCallbacks.fetch_sub(1);
-        ext->callbackDrainCV.notify_all();
+        ext->rgbCtx.releaseCurrent();
+
+        {
+            std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+            int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+            if (remaining == 0) {
+                ext->callbackDrainCV.notify_all();
+            }
+        }
 
         auto t1 = std::chrono::steady_clock::now();
         auto durUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
@@ -1602,35 +1832,64 @@ struct CameraAccessExtension{
         auto* ext = static_cast<CameraAccessExtension*>(userData);
         if (!data || !ext) return;
 
-        ext->inFlightCallbacks.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+            if (ext->isPaused.load() ||
+                ext->stopInProgress.load() ||
+                ext->callbackAdmissionClosed) {
+                return;
+            }
+            ext->inFlightCallbacks.fetch_add(1);
+        }
         if (ext->isPaused.load()) {
-            ext->inFlightCallbacks.fetch_sub(1);
-            ext->callbackDrainCV.notify_all();
+            std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+            int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+            if (remaining == 0) {
+                ext->callbackDrainCV.notify_all();
+            }
             return;
         }
+        const bool recordThisFrame =
+            ext->encodingEnabled.load() && !ext->encodersStopped.load();
 
         auto t0 = std::chrono::steady_clock::now();
 
         // Init tracking-specific GL context
         if (!ext->trackingCtx.init(ext->engine)) {
             LOGE("Failed to init tracking GL context");
-            ext->inFlightCallbacks.fetch_sub(1);
-            ext->callbackDrainCV.notify_all();
+            {
+                std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+                int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+                if (remaining == 0) {
+                    ext->callbackDrainCV.notify_all();
+                }
+            }
             return;
         }
 
-        ScopedCameraGLContextCurrent trackingCurrent(ext->trackingCtx);
-        if (!trackingCurrent.isCurrent()) {
+        if (!ext->trackingCtx.makeCurrent()) {
             LOGE("Failed to make tracking context current: 0x%x", eglGetError());
-            ext->inFlightCallbacks.fetch_sub(1);
-            ext->callbackDrainCV.notify_all();
+            {
+                std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+                int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+                if (remaining == 0) {
+                    ext->callbackDrainCV.notify_all();
+                }
+            }
             return;
         }
 
-        ext->handleTrackingFrame(data);
+        ext->handleTrackingFrame(data, recordThisFrame);
 
-        ext->inFlightCallbacks.fetch_sub(1);
-        ext->callbackDrainCV.notify_all();
+        ext->trackingCtx.releaseCurrent();
+
+        {
+            std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+            int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+            if (remaining == 0) {
+                ext->callbackDrainCV.notify_all();
+            }
+        }
 
         auto t1 = std::chrono::steady_clock::now();
         auto durUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
@@ -1646,35 +1905,64 @@ struct CameraAccessExtension{
         auto* ext = static_cast<CameraAccessExtension*>(userData);
         if (!data || !ext) return;
 
-        ext->inFlightCallbacks.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+            if (ext->isPaused.load() ||
+                ext->stopInProgress.load() ||
+                ext->callbackAdmissionClosed) {
+                return;
+            }
+            ext->inFlightCallbacks.fetch_add(1);
+        }
         if (ext->isPaused.load()) {
-            ext->inFlightCallbacks.fetch_sub(1);
-            ext->callbackDrainCV.notify_all();
+            std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+            int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+            if (remaining == 0) {
+                ext->callbackDrainCV.notify_all();
+            }
             return;
         }
+        const bool recordThisFrame =
+            ext->encodingEnabled.load() && !ext->encodersStopped.load();
 
         auto t0 = std::chrono::steady_clock::now();
 
         // Init ctrl-specific GL context
         if (!ext->ctrlCtx.init(ext->engine)) {
             LOGE("Failed to init ctrl GL context");
-            ext->inFlightCallbacks.fetch_sub(1);
-            ext->callbackDrainCV.notify_all();
+            {
+                std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+                int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+                if (remaining == 0) {
+                    ext->callbackDrainCV.notify_all();
+                }
+            }
             return;
         }
 
-        ScopedCameraGLContextCurrent ctrlCurrent(ext->ctrlCtx);
-        if (!ctrlCurrent.isCurrent()) {
+        if (!ext->ctrlCtx.makeCurrent()) {
             LOGE("Failed to make ctrl context current: 0x%x", eglGetError());
-            ext->inFlightCallbacks.fetch_sub(1);
-            ext->callbackDrainCV.notify_all();
+            {
+                std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+                int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+                if (remaining == 0) {
+                    ext->callbackDrainCV.notify_all();
+                }
+            }
             return;
         }
 
-        ext->handleCtrlFrame(data);
+        ext->handleCtrlFrame(data, recordThisFrame);
 
-        ext->inFlightCallbacks.fetch_sub(1);
-        ext->callbackDrainCV.notify_all();
+        ext->ctrlCtx.releaseCurrent();
+
+        {
+            std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
+            int remaining = ext->inFlightCallbacks.fetch_sub(1) - 1;
+            if (remaining == 0) {
+                ext->callbackDrainCV.notify_all();
+            }
+        }
 
         auto t1 = std::chrono::steady_clock::now();
         auto durUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
@@ -1687,7 +1975,7 @@ struct CameraAccessExtension{
 
     // Handle RGB camera frame (render directly in callback, release hwBuffer immediately)
     // Caller ensures rgbCtx is current, no mutex needed
-    void handleRGBFrame(const SXR::FrameData* data) {
+    void handleRGBFrame(const SXR::FrameData* data, bool recordThisFrame) {
         // Save camera params on first frame of recording session
         saveCameraParams(data, "rgb", cameraParamsSavedRgb);
 
@@ -1709,8 +1997,10 @@ struct CameraAccessExtension{
                 initEncoderShader();
             }
 
-            // Lazy init encoders (must be done in GL context)
-            if (!rgbEncoder && !encodersStopped.load()) {
+            // Lazy init recording encoder (only when dataset recording is active)
+            if (!rgbEncoder &&
+                recordThisFrame &&
+                !encoderBaseDir.empty()) {
                 initEncodersAndSurfaces(frameWidth, frameHeight);
             }
         }
@@ -1722,8 +2012,8 @@ struct CameraAccessExtension{
         GLint prevFBO;
         glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
 
-        // Temporary textures and EGLImages for each eye (need to keep alive until SBS render)
-        GLuint eyeTex[2] = {0, 0};
+        // Per-frame EGLImages for each eye (buffer handles change each frame).
+        // GL textures are persistent (rgbPersistentEyeTex) — created once, re-bound.
         EGLImageKHR eyeEglImage[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
         int texWidth = 0, texHeight = 0;
 
@@ -1738,18 +2028,22 @@ struct CameraAccessExtension{
             rgbFrameWidths[i] = data->frames[i].width;
             rgbFrameHeights[i] = data->frames[i].height;
 
-            glGenTextures(1, &eyeTex[i]);
-            glBindTexture(GL_TEXTURE_EXTERNAL_OES, eyeTex[i]);
-            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            // Persistent GL_TEXTURE_EXTERNAL_OES: create once, re-bind via
+            // eglImageTargetTexture2DOES each frame (avoids per-frame Gen/Delete).
+            if (rgbPersistentEyeTex[i] == 0) {
+                glGenTextures(1, &rgbPersistentEyeTex[i]);
+                glBindTexture(GL_TEXTURE_EXTERNAL_OES, rgbPersistentEyeTex[i]);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            } else {
+                glBindTexture(GL_TEXTURE_EXTERNAL_OES, rgbPersistentEyeTex[i]);
+            }
 
             EGLClientBuffer clientBuffer = glext::eglGetNativeClientBufferANDROID(data->hwBuffer[i]);
             if (!clientBuffer) {
                 LOGE("Failed to get EGL client buffer for camera %d", i);
-                glDeleteTextures(1, &eyeTex[i]);
-                eyeTex[i] = 0;
                 continue;
             }
 
@@ -1763,8 +2057,6 @@ struct CameraAccessExtension{
                                                      clientBuffer, eglImageAttributes);
             if (eyeEglImage[i] == EGL_NO_IMAGE_KHR) {
                 LOGE("Failed to create EGLImage for camera %d: 0x%x", i, eglGetError());
-                glDeleteTextures(1, &eyeTex[i]);
-                eyeTex[i] = 0;
                 continue;
             }
 
@@ -1781,47 +2073,83 @@ struct CameraAccessExtension{
             return;
         }
 
-        // Setup shader state (shared across all draw calls)
+        // Setup shader state (shared across all draw calls, cached locations)
         glUseProgram(encoderShaderProgram);
         glActiveTexture(GL_TEXTURE0);
-        glUniform1i(glGetUniformLocation(encoderShaderProgram, "uTexture"), 0);
+        glUniform1i(encShader_uTexture, 0);
         glBindBuffer(GL_ARRAY_BUFFER, encoderVBO);
-        GLint posLoc = glGetAttribLocation(encoderShaderProgram, "aPosition");
-        GLint texLoc = glGetAttribLocation(encoderShaderProgram, "aTexCoord");
-        glEnableVertexAttribArray(posLoc);
-        glVertexAttribPointer(posLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-        glEnableVertexAttribArray(texLoc);
-        glVertexAttribPointer(texLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(encShader_aPosition);
+        glVertexAttribPointer(encShader_aPosition, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(encShader_aTexCoord);
+        glVertexAttribPointer(encShader_aTexCoord, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
 
-        // --- SBS encoding: render left+right to stitch FBO ---
-        if (rgbSbsFBO != 0 && rgbEncoderSurface != nullptr && !encodersStopped.load()) {
-            glBindFramebuffer(GL_FRAMEBUFFER, rgbSbsFBO);
-            glViewport(0, 0, texWidth * 2, texHeight);
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
+        // Determine effective mid-exposure timestamp once (used by both encoding paths).
+        int64_t midExposureNs = (int64_t)(data->frames[0].timestamp + data->frames[0].exposure / 2);
+
+        // Post timestamp to sensor-align worker (async OpenXR queries + projection).
+        if (recordThisFrame) {
+            s_alignTs.store(midExposureNs, std::memory_order_release);
+            s_alignCv.notify_one();
+        }
+
+        // --- Encoding path: render SBS directly to encoder surface ---
+        // Single render pass (like tracking/ctrl). Saves ~24.4M pixels/frame
+        // of GPU bandwidth vs the old 2-pass pipeline (~1.5G px/s at 60fps).
+        bool encodedDirect = false;
+        if (recordThisFrame &&
+            rgbEncoderSurface != nullptr) {
+            rgbEncoderSurface->makeCurrent();
+            // NOTE: makeCurrent() switches to the encoder surface's EGLContext,
+            // which shares objects (shaders, textures, VBO) with rgbCtx but
+            // NOT state — must re-bind all GL state here.
+
+            int sbsW = texWidth * 2;
+            int sbsH = texHeight;
+
+            glUseProgram(encoderShaderProgram);
+            glActiveTexture(GL_TEXTURE0);
+            glUniform1i(encShader_uTexture, 0);
+            glBindBuffer(GL_ARRAY_BUFFER, encoderVBO);
+            glEnableVertexAttribArray(encShader_aPosition);
+            glVertexAttribPointer(encShader_aPosition, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+            glEnableVertexAttribArray(encShader_aTexCoord);
+            glVertexAttribPointer(encShader_aTexCoord, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+
+            // Both eyes cover the full surface — skip clear.
             for (int i = 0; i < 2; i++) {
-                if (eyeTex[i] == 0) continue;
+                if (rgbPersistentEyeTex[i] == 0) continue;
                 glViewport(i * texWidth, 0, texWidth, texHeight);
-                glBindTexture(GL_TEXTURE_EXTERNAL_OES, eyeTex[i]);
+                glBindTexture(GL_TEXTURE_EXTERNAL_OES, rgbPersistentEyeTex[i]);
                 glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             }
-            // Use mid-exposure time (start_of_exposure + exposure/2) as the
-            // authoritative timestamp for both encoder PTS and CSV rows.
-            // Mid-exposure is the best temporal representation of the image content.
-            if (!encodersStopped.load()) {
-                uint64_t midExposureNs = data->frames[0].timestamp + data->frames[0].exposure / 2;
-                pendingEncodeTimestamp.store(midExposureNs);
-                // Save aligned sensor data (head pose + hand tracking) here in the
-                // camera callback to minimize pipeline delay between frame arrival
-                // and CSV write. This function does no GL work — only ring buffer
-                // sampling and async queue writes — so it is thread-safe.
-                saveAlignedSensorData((int64_t)midExposureNs);
+
+            // Hand overlay projection (checked inside helper)
+            renderHandOverlayToEncoder(texWidth, texHeight);
+            renderControllerAxesToEncoder(texWidth, texHeight);
+
+            rgbEncoderSurface->setPresentationTime((uint64_t)midExposureNs);
+            if (rgbEncoder) {
+                SXR::FrameMeta fm;
+                fm.exposureStartBootNs = (int64_t)data->frames[0].timestamp;
+                fm.exposure            = data->frames[0].exposure;
+                fm.gain                = data->frames[0].gain;
+                fm.frameId             = data->frames[0].frameId;
+                fm.midExposureBootNs   = midExposureNs;
+                rgbEncoder->submitFrameMeta(fm);
             }
+            rgbEncoderSurface->swapBuffers();
+
+            // Restore camera GL context
+            rgbCtx.makeCurrent();
+            encodedDirect = true;
         }
 
         // --- Display preview: render each eye to its own display texture ---
+        // Skip during direct encode — the headset preview update adds ~16.4M
+        // pixels/frame of GPU work (2 × 2328×1748 clear+draw), enough to steal
+        // bandwidth and drop frames below 60fps.
+        if (!encodedDirect) {
         for (int i = 0; i < 2; i++) {
-            if (eyeTex[i] == 0) continue;
 
             if (rgbDisplayTextures[i] == 0) {
                 glGenTextures(1, &rgbDisplayTextures[i]);
@@ -1847,7 +2175,7 @@ struct CameraAccessExtension{
             glViewport(0, 0, texWidth, texHeight);
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT);
-            glBindTexture(GL_TEXTURE_EXTERNAL_OES, eyeTex[i]);
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, rgbPersistentEyeTex[i]);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
             // Cache pixels for snapshot
@@ -1868,14 +2196,16 @@ struct CameraAccessExtension{
                 buf.ready = true;
             }
         }
+        } // !encodedDirect (display preview skip)
 
         // Restore previous FBO and cleanup
-        glDisableVertexAttribArray(posLoc);
-        glDisableVertexAttribArray(texLoc);
+        glDisableVertexAttribArray(encShader_aPosition);
+        glDisableVertexAttribArray(encShader_aTexCoord);
         glBindFramebuffer(GL_FRAMEBUFFER, prevFBO);
 
+        // GL textures are persistent — don't delete.
+        // Only destroy per-frame EGLImages.
         for (int i = 0; i < 2; i++) {
-            if (eyeTex[i]) glDeleteTextures(1, &eyeTex[i]);
             if (eyeEglImage[i] != EGL_NO_IMAGE_KHR) glext::eglDestroyImageKHR(rgbCtx.display, eyeEglImage[i]);
         }
 
@@ -1895,6 +2225,7 @@ struct CameraAccessExtension{
         // Create Surface mode encoder
         auto* encoder = new SXR::CameraEncoder(groupName, combinedWidth, height,
                                                 60, SXR::EncoderMode::SURFACE, encoderBaseDir);
+        encoder->setTimeOffset(mCameraTimeOffsetNs);
         if (!encoder->start()) {
             LOGE("Failed to start grayscale encoder for %s", groupName);
             delete encoder;
@@ -2033,20 +2364,22 @@ struct CameraAccessExtension{
     }
 
     // Handle TRACKING camera frame — called from onTrackingFrame with trackingCtx current
-    void handleTrackingFrame(const SXR::FrameData* data) {
+    void handleTrackingFrame(const SXR::FrameData* data, bool recordThisFrame) {
         saveCameraParams(data, "tracking", cameraParamsSavedTracking);
         handleCVFrame(data, SXR::CameraGroup::TRACKING, trackingCtx, 0,
-                      &trackingEncoder, trackingEncoderSurface, trackingY8Texture);
+                      &trackingEncoder, trackingEncoderSurface, trackingY8Texture,
+                      recordThisFrame);
         trackingFrameReady = true;
         cvFpsTrackers[0].update(data->frames[0].timestamp);
         cvFpsTrackers[1].update(data->frames[1].timestamp);
     }
 
     // Handle CTRL camera frame — called from onCtrlFrame with ctrlCtx current
-    void handleCtrlFrame(const SXR::FrameData* data) {
+    void handleCtrlFrame(const SXR::FrameData* data, bool recordThisFrame) {
         saveCameraParams(data, "ctrl", cameraParamsSavedCtrl);
         handleCVFrame(data, SXR::CameraGroup::CTRL, ctrlCtx, 2,
-                      &ctrlEncoder, ctrlEncoderSurface, ctrlY8Texture);
+                      &ctrlEncoder, ctrlEncoderSurface, ctrlY8Texture,
+                      recordThisFrame);
         ctrlFrameReady = true;
         cvFpsTrackers[2].update(data->frames[0].timestamp);
         cvFpsTrackers[3].update(data->frames[1].timestamp);
@@ -2057,20 +2390,26 @@ struct CameraAccessExtension{
                        CameraGLContext& ctx, int baseIdx,
                        SXR::CameraEncoder** targetEncoder,
                        SXR::EncoderSurface* targetSurface,
-                       GLuint targetY8Texture) {
+                       GLuint targetY8Texture,
+                       bool recordThisFrame) {
         // Group-local index: 0=tracking, 1=ctrl — used to isolate per-group EGL resources
         const int gi = baseIdx / 2;
 
-        // Initialize encoder shader if needed
+        // Initialize encoder shader if needed (mutex-protected: called from tracking + ctrl threads)
         if (encoderShaderProgram == 0) {
-            initEncoderShader();
+            std::lock_guard<std::mutex> lock(shaderInitMutex);
+            if (encoderShaderProgram == 0) {
+                initEncoderShader();
+            }
         }
+        if (encoderShaderProgram == 0) return;  // shader init failed
 
         uint32_t width = data->frames[0].width;
         uint32_t height = data->frames[0].height;
 
         // Lazy initialize encoder on first frame
-        if (!*targetEncoder && !encodersStopped.load()) {
+        if (!*targetEncoder &&
+            recordThisFrame) {
             initGrayscaleEncoder(group, width, height, ctx);
         }
 
@@ -2090,10 +2429,14 @@ struct CameraAccessExtension{
             glBindBuffer(GL_ARRAY_BUFFER, 0);
         }
 
-        // Initialize grayscale display shader if needed
+        // Initialize grayscale display shader if needed (mutex-protected: called from tracking + ctrl threads)
         if (grayscaleEncoderShaderProgram == 0) {
-            initGrayscaleEncoderShader();
+            std::lock_guard<std::mutex> lock(shaderInitMutex);
+            if (grayscaleEncoderShaderProgram == 0) {
+                initGrayscaleEncoderShader();
+            }
         }
+        if (grayscaleEncoderShaderProgram == 0) return;  // shader init failed
 
         // Reuse persistent external OES texture — create once per group, rebind per frame
         if (cvPersistentExtTex[gi] == 0) {
@@ -2209,9 +2552,18 @@ struct CameraAccessExtension{
 
         // Render to encoder surface (for recording)
         // NOTE: This does context switch to encoder surface and back — main overhead
-        if (targetSurface && *targetEncoder && targetY8Texture && !stopInProgress.load()) {
+        if (recordThisFrame &&
+            targetSurface &&
+            *targetEncoder &&
+            targetY8Texture) {
             int64_t frameTimestampNs = data->frames[0].timestamp;
-            (*targetEncoder)->submitNsTimestamp(frameTimestampNs);
+            SXR::FrameMeta fm;
+            fm.exposureStartBootNs = (int64_t)data->frames[0].timestamp;
+            fm.exposure            = data->frames[0].exposure;
+            fm.gain                = data->frames[0].gain;
+            fm.frameId             = data->frames[0].frameId;
+            fm.midExposureBootNs   = (int64_t)(data->frames[0].timestamp + data->frames[0].exposure / 2);
+            (*targetEncoder)->submitFrameMeta(fm);
             renderGrayscaleToEncoder(targetSurface, targetY8Texture,
                                      data->hwBuffer[0],
                                      width * 2, height, ctx.display,
@@ -2348,12 +2700,20 @@ struct CameraAccessExtension{
         sxr_camera_close_group(&api, cameraContext, SXR::CameraGroup::CTRL);
         cameraGroupsOpen = false;
         LOGI("Camera groups closed");
+        // Stop sensor-align worker (no more timestamps posted after camera close)
+        s_alignRun.store(false, std::memory_order_release);
+        s_alignCv.notify_all();
+        if (s_alignThread.joinable()) s_alignThread.join();
     }
 
     // Re-open all camera groups (resume camera streaming)
     void openCameraGroups() {
         if (!camerasInitialized || !cameraContext || cameraGroupsOpen) return;
         LOGI("Re-opening camera groups...");
+        {
+            std::lock_guard<std::mutex> lk(callbackDrainMutex);
+            callbackAdmissionClosed = false;
+        }
         int ret = sxr_camera_open_group(&api, cameraContext, SXR::CameraGroup::RGB,
                                         onRGBFrame, this);
         if (ret != 0) {
@@ -2374,6 +2734,12 @@ struct CameraAccessExtension{
 
         cameraGroupsOpen = true;
         LOGI("Camera groups re-opened");
+        // Start sensor-align worker (async OpenXR queries + projection off camera callback)
+        if (!s_alignRun.load(std::memory_order_acquire)) {
+            s_alignRun.store(true, std::memory_order_release);
+            s_alignTs.store(-1, std::memory_order_release);
+            s_alignThread = std::thread(sensorAlignWorker);
+        }
     }
 
     // Stop encoders (can be called from pause or cleanup)
@@ -2400,6 +2766,8 @@ struct CameraAccessExtension{
             }
         }
 
+        encodersStopped = true;
+
         LOGI("All encoders stopped");
     }
 
@@ -2421,6 +2789,12 @@ struct CameraAccessExtension{
         encodersStopped = true;
         LOGI("stopEncoder: setting encodersStopped=true");
 
+        {
+            std::unique_lock<std::mutex> lk(callbackDrainMutex);
+            callbackAdmissionClosed = true;
+            callbackDrainCV.wait(lk, [this] { return inFlightCallbacks.load() == 0; });
+        }
+
         // Stop RGB encoder first (signal EOS + join output thread), then release surface
         if (rgbEncoder) {
             rgbEncoder->stop();
@@ -2431,23 +2805,6 @@ struct CameraAccessExtension{
             rgbEncoderSurface->release();
             delete rgbEncoderSurface;
             rgbEncoderSurface = nullptr;
-        }
-
-        // Delete RGB GL resources on the correct context (rgbCtx)
-        if (rgbCtx.initialized && (rgbSbsFBO || rgbSbsTexture)) {
-            ScopedCameraGLContextCurrent rgbCurrent(rgbCtx);
-            if (rgbCurrent.isCurrent()) {
-                if (rgbSbsFBO) {
-                    glDeleteFramebuffers(1, &rgbSbsFBO);
-                    rgbSbsFBO = 0;
-                }
-                if (rgbSbsTexture) {
-                    glDeleteTextures(1, &rgbSbsTexture);
-                    rgbSbsTexture = 0;
-                }
-            } else {
-                LOGW("stopEncoder: failed to make RGB context current for cleanup: 0x%x", eglGetError());
-            }
         }
 
         // Stop legacy grayscale encoders
@@ -2485,18 +2842,24 @@ struct CameraAccessExtension{
             ctrlEncoderSurface = nullptr;
         }
 
-        // Delete per-encoder Y8 textures
-        if (trackingY8Texture) {
-            glDeleteTextures(1, &trackingY8Texture);
-            trackingY8Texture = 0;
-        }
-        if (ctrlY8Texture) {
-            glDeleteTextures(1, &ctrlY8Texture);
-            ctrlY8Texture = 0;
+        // Clean up per-encoder Y8 textures (GL). They live in the share group
+        // and were created by initGrayscaleEncoder() on the encoder surface's
+        // EGL context. Must delete here because stopEncoder() (called on
+        // pause→resume) only stops encoders, never deletes textures.
+        // Must make rgbCtx current first — encoder surfaces (and their EGL
+        // contexts) have already been released above.
+        if (rgbCtx.initialized && (trackingY8Texture || ctrlY8Texture)) {
+            if (rgbCtx.makeCurrent()) {
+                if (trackingY8Texture) { glDeleteTextures(1, &trackingY8Texture); trackingY8Texture = 0; }
+                if (ctrlY8Texture) { glDeleteTextures(1, &ctrlY8Texture); ctrlY8Texture = 0; }
+                rgbCtx.releaseCurrent();
+            } else {
+                LOGW("stopEncoder: failed to make RGB context current for Y8 cleanup: 0x%x",
+                     eglGetError());
+            }
         }
 
-        stopInProgress = false;
-        LOGI("stopEncoder: completed, stopInProgress=false");
+        LOGI("stopEncoder: completed");
     }
 
     void cleanupCameras() {
@@ -2530,6 +2893,7 @@ struct CameraAccessExtension{
 
         // Cleanup encoders
         stopEncoder();
+        stopInProgress = false;
 
         // Cleanup shared EGL context (including displayTextures and encoder surfaces)
         cleanupAllGLContexts();
@@ -2538,46 +2902,9 @@ struct CameraAccessExtension{
         LOGI("Cameras cleaned up");
     }
 
-    // Convert XrTime to boottime nanoseconds
-    // XrTime → monotonic (via xrConvertTimeToTimespecTimeKHR) → boottime (+ offset)
-    int64_t xrtimeToboottime(XrTime xrtime) {
-        static int64_t boottime_to_mono_offset = 0;
-        static bool offset_calculated = false;
-
-        if (!offset_calculated) {
-            struct timespec boot_ts, mono_ts;
-            clock_gettime(CLOCK_BOOTTIME, &boot_ts);
-            clock_gettime(CLOCK_MONOTONIC, &mono_ts);
-            int64_t boottime_ns_now = (int64_t)boot_ts.tv_sec * 1000000000LL + boot_ts.tv_nsec;
-            int64_t mono_ns_now = (int64_t)mono_ts.tv_sec * 1000000000LL + mono_ts.tv_nsec;
-            boottime_to_mono_offset = boottime_ns_now - mono_ns_now;
-            offset_calculated = true;
-            LOGI("xrtimeToboottime: boottime-mono offset = %ld ns", (long)boottime_to_mono_offset);
-        }
-
-        // Step 1: XrTime → monotonic timespec
-        int64_t mono_ns;
-        if (xrConvertTimeToTimespecTimeKHR) {
-            struct timespec ts;
-            XrResult res = xrConvertTimeToTimespecTimeKHR(engine->state.xrInstance, xrtime, &ts);
-            if (XR_SUCCEEDED(res)) {
-                mono_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
-            } else {
-                LOGE("xrConvertTimeToTimespecTimeKHR failed: %d", res);
-                mono_ns = (int64_t)xrtime;
-            }
-        } else {
-            mono_ns = (int64_t)xrtime;
-        }
-
-        // Step 2: monotonic → boottime
-        return mono_ns + boottime_to_mono_offset;
-    }
-
     // Convert boottime nanoseconds to XrTime
     // boottime → monotonic (- offset) → XrTime (via xrConvertTimespecTimeToTimeKHR)
     XrTime boottimeToXrTime(uint64_t boottime_ns) {
-        // Reuse the same offset calculated by xrtimeToboottime
         static int64_t boottime_to_mono_offset = 0;
         static bool offset_calculated = false;
 
@@ -2660,6 +2987,7 @@ struct engine : public AppCommon::base_engine {
 
     bool useControllerMode = false;
     bool useProjectHand = false;
+    bool projectController = false;
 
     CameraAccessExtension mCameraAccessExtension{this};
     HandTrackerLogic mHandTrackerLogic{this};
@@ -2671,8 +2999,36 @@ struct engine : public AppCommon::base_engine {
     std::unique_ptr<Input> inputPtr;
     bool dpadCenterPressed = false;
     bool prevRecordingToggle = false;
+
+    // Wall-clock time when recording started; checked by the 12h auto-stop
+    // guard (AAudio int32 frame counter overflows at ~13.5h @ 44100Hz). Set
+    // right before start() in both recording entry points (intent + controller)
+    // so it's always valid once isRecording() is true.
+    std::chrono::steady_clock::time_point recordingStartTime{};
+
+    // Latch: once the auto-stop guard has fired for this recording session,
+    // suppress further triggers until the next recording starts. Without this
+    // the level-triggered check fires every frame (isRecording() stays true
+    // until the async stop completes), spawning concurrent stop threads that
+    // race on MediaCodec → SIGSEGV.
+    std::atomic<bool> autoStopRequested{false};
+
+    // Propagate BOOTTIME→REALTIME offset to all components.
+    // CameraEncoders are lazy-initialized and read the offset from
+    // CameraAccessExtension::mCameraTimeOffsetNs during init.
+    void propagateTimeOffset() {
+        int64_t timeOffset = mDatasetRecorder.getTimeOffset();
+        mCameraAccessExtension.mCameraTimeOffsetNs = timeOffset;
+        if (useControllerMode) {
+            mControllerPoseSaver.SetTimeOffset(timeOffset);
+        } else {
+            mHandTrackerLogic.rawDateSave->SetTimeOffset(timeOffset);
+        }
+    }
+
     AlignedSensorSnapshot alignedSnapshot;
     PoseHandSampleRing poseHandRing;
+    ControllerPoseRing controllerPoseRing;
     engine()
             : width(0), height(0), cubeShader(nullptr), cubeTexture(0),
               maxSampleCount(4), currentSampleCount(1)
@@ -2689,7 +3045,7 @@ struct engine : public AppCommon::base_engine {
 // overlay) and CSV output use the same time-aligned data so that recorded
 // timestamps match the actual sensor data.
 static void saveAlignedSensorData(int64_t rgbTimestampNs) {
-    if (!g_engine || !g_engine->mDatasetRecorder.isRecording() || g_engine->useControllerMode) {
+    if (!g_engine || !g_engine->mDatasetRecorder.isRecording()) {
         return;
     }
 
@@ -2700,16 +3056,133 @@ static void saveAlignedSensorData(int64_t rgbTimestampNs) {
         snap.copyFrom(g_engine->alignedSnapshot);
     }
 
-    // Sample the ring buffer at the camera frame's start_of_exposure timestamp
-    // (CLOCK_BOOTTIME). This corrects the lag between predictedDisplayTime (where
-    // pose+hand data was captured) and the actual camera frame time.
+    // --- DIRECT OPENXR QUERY AT CAMERA FRAME TIME ---
+    // Query xrLocateSpace and xrLocateHandJointsEXT directly with the camera
+    // frame's mid-exposure XrTime. This avoids prediction/extrapolation error
+    // from sampling render-thread "now" poses and interpolating to the past.
+    // OpenXR runtime will return the historical pose at the exact frame time.
     PoseHandSampleRing::Sample rs;
     PoseHandSampleRing::SampleInfo info;
-    bool ringOk = g_engine->poseHandRing.sample(rgbTimestampNs, rs, &info);
+    bool ringOk = false;
+    bool directOk = false;
+    bool isControllerMode = g_engine->useControllerMode;
+    if (g_boottimeToXrTimeFn) {
+        XrTime camXrTime = g_boottimeToXrTimeFn((uint64_t)rgbTimestampNs);
 
-    // Diagnostic: throttle to ~1 Hz at 30 fps
+        // Head pose (always queried — both controller and hand tracking modes)
+        XrSpace refSpace = g_engine->useRootSpace ? g_engine->state.xrRootSpace
+                                                  : g_engine->state.xrLocalSpace;
+        XrSpaceLocation devLoc{XR_TYPE_SPACE_LOCATION};
+        XrResult r1 = xrLocateSpace(g_engine->state.xrViewSpace, refSpace,
+                                     camXrTime, &devLoc);
+        bool headOk = XR_SUCCEEDED(r1) &&
+            (devLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+            (devLoc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+
+        if (isControllerMode) {
+            // Controller mode: query head pose only (no hand trackers).
+            if (headOk) {
+                rs.poseValid = true;
+                rs.headPos[0] = devLoc.pose.position.x;
+                rs.headPos[1] = devLoc.pose.position.y;
+                rs.headPos[2] = devLoc.pose.position.z;
+                rs.headQuat[0] = devLoc.pose.orientation.x;
+                rs.headQuat[1] = devLoc.pose.orientation.y;
+                rs.headQuat[2] = devLoc.pose.orientation.z;
+                rs.headQuat[3] = devLoc.pose.orientation.w;
+                directOk = true;
+                static int s_directLogCtrlCnt = 0;
+                if ((s_directLogCtrlCnt++ % 30) == 0) {
+                    LOGI("direct-query controller OK: rgbTs=%lld camXrTime=%lld pos=(%.3f,%.3f,%.3f)",
+                         (long long)rgbTimestampNs, (long long)camXrTime,
+                         devLoc.pose.position.x, devLoc.pose.position.y, devLoc.pose.position.z);
+                }
+            }
+        } else {
+            // Hand tracking mode: query hand joints in addition to head pose.
+            // Head pose is decoupled from hand tracking — headOk alone is
+            // sufficient for head pose; hand data is populated independently.
+
+            // --- Head pose (always populated when valid) ---
+            if (headOk) {
+                rs.poseValid = true;
+                rs.headPos[0] = devLoc.pose.position.x;
+                rs.headPos[1] = devLoc.pose.position.y;
+                rs.headPos[2] = devLoc.pose.position.z;
+                rs.headQuat[0] = devLoc.pose.orientation.x;
+                rs.headQuat[1] = devLoc.pose.orientation.y;
+                rs.headQuat[2] = devLoc.pose.orientation.z;
+                rs.headQuat[3] = devLoc.pose.orientation.w;
+                directOk = true;
+            }
+
+            // --- Hand joints (independent of head pose, best-effort) ---
+            XrHandJointLocationEXT leftJL[XR_HAND_JOINT_COUNT_EXT] = {};
+            XrHandJointLocationEXT rightJL[XR_HAND_JOINT_COUNT_EXT] = {};
+            XrHandJointLocationsEXT leftLocs{XR_TYPE_HAND_JOINT_LOCATIONS_EXT, nullptr,
+                                              false, XR_HAND_JOINT_COUNT_EXT, leftJL};
+            XrHandJointLocationsEXT rightLocs{XR_TYPE_HAND_JOINT_LOCATIONS_EXT, nullptr,
+                                               false, XR_HAND_JOINT_COUNT_EXT, rightJL};
+            XrHandJointsLocateInfoEXT locInfo{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+            locInfo.time = camXrTime;
+            locInfo.baseSpace = refSpace;
+            auto& ht = g_engine->mHandTrackerLogic;
+            bool leftHandOk = false, rightHandOk = false;
+            if (ht.pfnLocateHandJointsEXT && ht.LeftHandTrackerHandle) {
+                XrResult r2 = ht.pfnLocateHandJointsEXT(ht.LeftHandTrackerHandle,
+                                                        &locInfo, &leftLocs);
+                leftHandOk = XR_SUCCEEDED(r2);
+            }
+            if (ht.pfnLocateHandJointsEXT && ht.RightHandTrackerHandle) {
+                XrResult r3 = ht.pfnLocateHandJointsEXT(ht.RightHandTrackerHandle,
+                                                        &locInfo, &rightLocs);
+                rightHandOk = XR_SUCCEEDED(r3);
+            }
+
+            if (leftHandOk && rightHandOk) {
+                rs.leftActive = leftLocs.isActive;
+                rs.rightActive = rightLocs.isActive;
+                for (int j = 0; j < XR_HAND_JOINT_COUNT_EXT; j++) {
+                    rs.leftJoints[j][0] = leftJL[j].pose.position.x;
+                    rs.leftJoints[j][1] = leftJL[j].pose.position.y;
+                    rs.leftJoints[j][2] = leftJL[j].pose.position.z;
+                    rs.leftQuats[j][0] = leftJL[j].pose.orientation.x;
+                    rs.leftQuats[j][1] = leftJL[j].pose.orientation.y;
+                    rs.leftQuats[j][2] = leftJL[j].pose.orientation.z;
+                    rs.leftQuats[j][3] = leftJL[j].pose.orientation.w;
+                    rs.leftRadii[j] = leftJL[j].radius;
+                    rs.rightJoints[j][0] = rightJL[j].pose.position.x;
+                    rs.rightJoints[j][1] = rightJL[j].pose.position.y;
+                    rs.rightJoints[j][2] = rightJL[j].pose.position.z;
+                    rs.rightQuats[j][0] = rightJL[j].pose.orientation.x;
+                    rs.rightQuats[j][1] = rightJL[j].pose.orientation.y;
+                    rs.rightQuats[j][2] = rightJL[j].pose.orientation.z;
+                    rs.rightQuats[j][3] = rightJL[j].pose.orientation.w;
+                    rs.rightRadii[j] = rightJL[j].radius;
+                }
+            }
+            if (headOk || (leftHandOk && rightHandOk)) {
+                static int s_directLogCnt = 0;
+                if ((s_directLogCnt++ % 30) == 0) {
+                    LOGI("direct-query OK: rgbTs=%lld camXrTime=%lld head=%d L_act=%d R_act=%d",
+                         (long long)rgbTimestampNs, (long long)camXrTime,
+                         (int)headOk, (int)leftLocs.isActive, (int)rightLocs.isActive);
+                }
+            }
+        } // end hand tracking mode
+    }
+
+    // Fallback: sample the ring buffer at the camera frame's mid-exposure
+    // timestamp (CLOCK_BOOTTIME) if direct query failed.
+    // Ring buffer now has head pose samples in both controller and hand
+    // tracking modes, so it serves as fallback in all modes.
+    if (!directOk) {
+        ringOk = g_engine->poseHandRing.sample(rgbTimestampNs, rs, &info);
+    }
+
+    // Diagnostic: throttle to ~1 Hz at 30 fps (only log when ring was actually sampled)
     static int s_logCnt = 0;
-    if ((s_logCnt++ % 30) == 0) {
+    if (!directOk && (s_logCnt++ % 30) == 0) {
         LOGI("ring sample: rgbTs=%lld count=%d window=[%lld..%lld] dtOld=%.1fms dtNew=%.1fms alpha=%.3f clamp=%c%c ok=%d",
              (long long)rgbTimestampNs, info.curCount,
              (long long)info.oldestNs, (long long)info.newestNs,
@@ -2721,7 +3194,39 @@ static void saveAlignedSensorData(int64_t rgbTimestampNs) {
              (int)ringOk);
     }
 
-    bool useRing = ringOk && rs.poseValid;
+    bool useRing = (directOk || ringOk) && rs.poseValid;
+
+    // --- Diagnostic: compare direct query vs ring buffer interpolation ---
+    // Logs position/orientation delta when both paths succeed, to verify
+    // whether xrLocateSpace with historical XrTime returns true historical
+    // poses or just the latest. Throttled to ~0.1 Hz (every 300th frame).
+    if (directOk) {
+        PoseHandSampleRing::Sample ringCmp;
+        PoseHandSampleRing::SampleInfo cmpInfo;
+        bool cmpOk = g_engine->poseHandRing.sample(rgbTimestampNs, ringCmp, &cmpInfo);
+        if (cmpOk) {
+            static int s_cmpCnt = 0;
+            if ((s_cmpCnt++ % 300) == 0) {
+                float dx = rs.headPos[0] - ringCmp.headPos[0];
+                float dy = rs.headPos[1] - ringCmp.headPos[1];
+                float dz = rs.headPos[2] - ringCmp.headPos[2];
+                float posDeltaMm = sqrtf(dx*dx + dy*dy + dz*dz) * 1000.0f;
+                // Orientation delta: angular distance between quaternions
+                float qd = rs.headQuat[0]*ringCmp.headQuat[0]
+                         + rs.headQuat[1]*ringCmp.headQuat[1]
+                         + rs.headQuat[2]*ringCmp.headQuat[2]
+                         + rs.headQuat[3]*ringCmp.headQuat[3];
+                if (qd < -1.0f) qd = -1.0f;
+                if (qd >  1.0f) qd =  1.0f;
+                float orientDeltaDeg = 2.0f * acosf(fabsf(qd)) * 57.29578f;
+                LOGI("direct-vs-ring: rgbTs=%lld posDelta=%.2fmm orientDelta=%.3fdeg alpha=%.3f clamp=%c%c",
+                     (long long)rgbTimestampNs, (double)posDeltaMm, (double)orientDeltaDeg,
+                     cmpInfo.alpha,
+                     cmpInfo.clampedLow ? 'L' : '-',
+                     cmpInfo.clampedHigh ? 'H' : '-');
+            }
+        }
+    }
 
     // --- Overlay snapshot for encoder hand projection ---
     {
@@ -2741,7 +3246,7 @@ static void saveAlignedSensorData(int64_t rgbTimestampNs) {
         }
     }
 
-    // --- Save head pose (time-aligned via ring buffer) ---
+    // --- Save head pose (time-aligned via ring buffer or direct query) ---
     {
         XrPosef pose{};
         if (useRing) {
@@ -2753,7 +3258,7 @@ static void saveAlignedSensorData(int64_t rgbTimestampNs) {
             pose.orientation.z = rs.headQuat[2];
             pose.orientation.w = rs.headQuat[3];
         } else if (snap.headPose.valid) {
-            // Ring not warmed up — fall back to most recent snapshot.
+            // Fall back to most recent render-thread snapshot (controller mode or ring not warmed up).
             pose.position.x = snap.headPose.pos[0];
             pose.position.y = snap.headPose.pos[1];
             pose.position.z = snap.headPose.pos[2];
@@ -2765,12 +3270,62 @@ static void saveAlignedSensorData(int64_t rgbTimestampNs) {
         g_engine->mDatasetRecorder.saveHeadPose(rgbTimestampNs, pose);
     }
 
-    // --- Save hand tracking (time-aligned via ring buffer) ---
-    FrameData fd{};
-    fd.frameNumber = snap.rgbFrameCount;
-    fd.timestamp = rgbTimestampNs;
+    // --- Save controller pose (time-aligned via controller ring buffer) ---
+    if (isControllerMode) {
+        ControllerPoseRing::Sample ctrlSample;
+        if (g_engine->controllerPoseRing.sample(rgbTimestampNs, ctrlSample)) {
+            ControllerPoseRecord rec{};
+            rec.frameNumber = ctrlSample.frameNumber;
+            rec.timestamp = rgbTimestampNs;  // use camera mid-exposure time, not render time
+            rec.leftActive = ctrlSample.leftActive;
+            if (rec.leftActive) {
+                rec.leftPos[0] = ctrlSample.leftPos[0];
+                rec.leftPos[1] = ctrlSample.leftPos[1];
+                rec.leftPos[2] = ctrlSample.leftPos[2];
+                rec.leftQuat[0] = ctrlSample.leftQuat[0];
+                rec.leftQuat[1] = ctrlSample.leftQuat[1];
+                rec.leftQuat[2] = ctrlSample.leftQuat[2];
+                rec.leftQuat[3] = ctrlSample.leftQuat[3];
+            }
+            rec.rightActive = ctrlSample.rightActive;
+            if (rec.rightActive) {
+                rec.rightPos[0] = ctrlSample.rightPos[0];
+                rec.rightPos[1] = ctrlSample.rightPos[1];
+                rec.rightPos[2] = ctrlSample.rightPos[2];
+                rec.rightQuat[0] = ctrlSample.rightQuat[0];
+                rec.rightQuat[1] = ctrlSample.rightQuat[1];
+                rec.rightQuat[2] = ctrlSample.rightQuat[2];
+                rec.rightQuat[3] = ctrlSample.rightQuat[3];
+            }
+            g_engine->mControllerPoseSaver.SaveFrame(rec);
 
-    if (useRing) {
+            // Stash controller poses into overlaySnap for coordinate-axis
+            // projection onto encoded RGB frames.
+            if (g_engine->projectController) {
+                auto& os = g_engine->mCameraAccessExtension.overlaySnap;
+                std::lock_guard<std::mutex> lock(os.mutex);
+                os.ctrlLeftActive = ctrlSample.leftActive;
+                if (ctrlSample.leftActive) {
+                    memcpy(os.ctrlLeftPos, ctrlSample.leftPos, sizeof(os.ctrlLeftPos));
+                    memcpy(os.ctrlLeftQuat, ctrlSample.leftQuat, sizeof(os.ctrlLeftQuat));
+                }
+                os.ctrlRightActive = ctrlSample.rightActive;
+                if (ctrlSample.rightActive) {
+                    memcpy(os.ctrlRightPos, ctrlSample.rightPos, sizeof(os.ctrlRightPos));
+                    memcpy(os.ctrlRightQuat, ctrlSample.rightQuat, sizeof(os.ctrlRightQuat));
+                }
+            }
+        }
+    }
+
+    // --- Save hand tracking (time-aligned via ring buffer) ---
+    // Skip in controller mode — rs only has head data, no hand joints.
+    if (!isControllerMode) {
+        FrameData fd{};
+        fd.frameNumber = snap.rgbFrameCount;
+        fd.timestamp = rgbTimestampNs;
+
+        if (useRing) {
         fd.hasLeftHand = rs.leftActive;
         fd.hasRightHand = rs.rightActive;
         if (rs.leftActive) {
@@ -2833,12 +3388,50 @@ static void saveAlignedSensorData(int64_t rgbTimestampNs) {
                 fd.rightHand.joints[j].orientation[3] = snap.rightHand.quats[j][3];
             }
         }
-    }
-    g_engine->mHandTrackerLogic.rawDateSave->SaveFrame(fd);
+    }  // end else (ring fallback)
+        g_engine->mHandTrackerLogic.rawDateSave->SaveFrame(fd);
 
-    {
-        std::lock_guard<std::mutex> lock(g_engine->alignedSnapshot.mutex);
-        g_engine->alignedSnapshot.rgbFrameCount++;
+        {
+            std::lock_guard<std::mutex> lock(g_engine->alignedSnapshot.mutex);
+            g_engine->alignedSnapshot.rgbFrameCount++;
+        }
+    }  // end hand tracking mode block
+}
+
+// --- Sensor-align worker thread ---
+// Runs OpenXR queries + KB projection off the camera callback thread so
+// the HAL buffer pipeline is never blocked (>2ms → provider crash risk).
+static void sensorAlignWorker() {
+    while (s_alignRun.load(std::memory_order_acquire)) {
+        int64_t ts = -1;
+        {
+            std::unique_lock<std::mutex> lk(s_alignMutex);
+            s_alignCv.wait(lk, [] {
+                return s_alignTs.load(std::memory_order_acquire) >= 0 ||
+                       !s_alignRun.load(std::memory_order_acquire);
+            });
+            if (!s_alignRun.load(std::memory_order_acquire)) break;
+            // atomic read-and-reset: avoids race where camera callback
+            // writes a new timestamp between load and store(-1).
+            ts = s_alignTs.exchange(-1, std::memory_order_acq_rel);
+        }
+        if (ts <= 0) continue;
+
+        s_alignInFlight.fetch_add(1, std::memory_order_acq_rel);
+        // (1) OpenXR queries + dataset recording
+        saveAlignedSensorData(ts);
+        s_alignInFlight.fetch_sub(1, std::memory_order_acq_rel);
+        s_alignDrainCv.notify_all();
+
+        // (2) KB fisheye projection (was in renderHandOverlayToEncoder)
+        if (!g_engine || !g_engine->useProjectHand) continue;
+        auto& os = g_engine->mCameraAccessExtension.overlaySnap;
+        std::lock_guard<std::mutex> lock(os.mutex);
+        if (!os.headValid) continue;
+        g_engine->handOverlay.computeProjection(
+            os.leftActive, os.leftJoints,
+            os.rightActive, os.rightJoints,
+            os.headPos, os.headQuat);
     }
 }
 
@@ -2875,6 +3468,39 @@ static void feedOverlayCameraParams(const SXR::FrameData* data) {
     }
 }
 
+// Render hand skeleton overlay to encoder surface (called from RGB camera
+// callback in the direct-encode path).  Avoids the render-thread copy pass
+// by compositing overlay + SBS in a single GPU submit.
+// Requires g_engine->useProjectHand and overlaySnap.headValid.
+static void renderHandOverlayToEncoder(int texWidth, int texHeight) {
+    if (!g_engine || !g_engine->useProjectHand) return;
+    auto& os = g_engine->mCameraAccessExtension.overlaySnap;
+    std::lock_guard<std::mutex> lock(os.mutex);
+    if (!os.headValid) return;
+    // computeProjection is pre-computed by sensorAlignWorker thread.
+    g_engine->handOverlay.render(0, 0, texWidth, texHeight);          // left eye
+    g_engine->handOverlay.render(1, texWidth, texWidth, texHeight);   // right eye
+}
+
+// Render controller coordinate axes to encoder surface. Requires
+// persist.xr.project_controller=1 in controller mode.
+static void renderControllerAxesToEncoder(int texWidth, int texHeight) {
+    if (!g_engine || !g_engine->projectController) return;
+    auto& os = g_engine->mCameraAccessExtension.overlaySnap;
+    std::lock_guard<std::mutex> lock(os.mutex);
+    if (!os.headValid) return;
+    // Compute projection for both eyes at once
+    g_engine->handOverlay.computeControllerAxes(
+        os.ctrlLeftActive,  os.ctrlLeftPos,  os.ctrlLeftQuat,
+        os.ctrlRightActive, os.ctrlRightPos, os.ctrlRightQuat,
+        os.headPos, os.headQuat);
+    // Render: each eye's viewport matches the SBS layout.
+    g_engine->handOverlay.renderControllerAxes(
+        0, 0, 0, texWidth, texHeight, texWidth, texHeight);           // left eye
+    g_engine->handOverlay.renderControllerAxes(
+        1, texWidth, 0, texWidth, texHeight, texWidth, texHeight);    // right eye
+}
+
 // JNI native methods for intent control (needs complete engine type)
 // g_engine is declared near top of file (before CameraAccessExtension)
 
@@ -2889,9 +3515,66 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeRequestSnapshot(JNIEnv *env, jobje
     }
 }
 
+// Unified async recording-stop path. Shared by intent, controller button,
+// and the 12h auto-stop guard. Tears down encoder → recorder → hand/controller
+// session off the render thread, then TTS + log. Ordering (encoder before
+// recorder) keeps head_pose/hand_tracking CSV rows 1:1 with metainfo.
+static void stopRecordingAsync(struct engine* e, const char* reason, const char* ttsMsg) {
+    LOGI("Stopping dataset recording (%s, async)...", reason);
+    if (e->mCameraAccessExtension.stopInProgress.exchange(true)) {
+        LOGW("stopRecordingAsync: stop already in progress (%s)", reason);
+        return;
+    }
+    e->autoStopRequested = true;
+    e->mCameraAccessExtension.encodingEnabled = false;
+    {
+        std::lock_guard<std::mutex> lk(e->mCameraAccessExtension.callbackDrainMutex);
+        e->mCameraAccessExtension.callbackAdmissionClosed = true;
+    }
+    if (!e->useControllerMode) {
+        e->mDatasetRecorder.writeCaptureStatusJson(
+            "finalizing", e->mHandTrackerLogic.rawDateSave);
+    }
+    std::thread([e, ttsMsg, reason]() {
+        e->mCameraAccessExtension.stopEncoder();
+        {
+            std::unique_lock<std::mutex> lk(s_alignDrainMutex);
+            s_alignDrainCv.wait(lk, [] {
+                return s_alignTs.load(std::memory_order_acquire) < 0 &&
+                       s_alignInFlight.load(std::memory_order_acquire) == 0;
+            });
+        }
+        e->mCameraAccessExtension.encodingEnabled = false;
+        e->mCameraAccessExtension.encoderBaseDir.clear();
+
+        e->mDatasetRecorder.stop();
+        if (e->useControllerMode) {
+            e->mControllerPoseSaver.StopSession();
+        } else {
+            e->mHandTrackerLogic.rawDateSave->StopSession();
+            e->mDatasetRecorder.writeCaptureStatusJson(
+                "complete", e->mHandTrackerLogic.rawDateSave);
+        }
+        e->mCameraAccessExtension.stopInProgress = false;
+        {
+            std::lock_guard<std::mutex> lk(e->mCameraAccessExtension.callbackDrainMutex);
+            e->mCameraAccessExtension.callbackAdmissionClosed = false;
+        }
+        ttsSpeak(ttsMsg);
+        LOGI("%s: async encoder + recorder stop completed", reason);
+    }).detach();
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartRecording(JNIEnv *env, jobject thiz) {
     if (g_engine && !g_engine->mDatasetRecorder.isRecording()) {
+        // Storage guard: refuse to start below 1 GiB free.
+        int64_t avail = getAvailableBytes(storagePath);
+        if (avail >= 0 && avail < MIN_FREE_BYTES) {
+            LOGW("nativeStartRecording: insufficient storage (%lld bytes free)", (long long)avail);
+            ttsSpeak("存储空间已满，无法录制");
+            return;
+        }
         // Wait for any async stop (encoder + recorder) to complete before starting
         int waitCount = 0;
         while (g_engine->mCameraAccessExtension.stopInProgress.load() ||
@@ -2906,8 +3589,22 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartRecording(JNIEnv *env, jobjec
             }
         }
         LOGI("Start recording via intent");
+        g_engine->recordingStartTime = std::chrono::steady_clock::now();
+        g_engine->autoStopRequested = false;
         g_engine->mDatasetRecorder.start();
         g_engine->mCameraAccessExtension.encoderBaseDir = g_engine->mDatasetRecorder.getDatasetDir();
+        // IMU calibration sidecar (device-global; no camera context needed)
+        {
+            auto& ext = g_engine->mCameraAccessExtension;
+            if (sxr_camera_api_is_valid(&ext.api) && ext.api.get_imu_calibration) {
+                SXR::SxrImuCalibration calib{};
+                if (sxr_camera_get_imu_calibration(&ext.api, &calib) == 0 && calib.valid) {
+                    ext.saveImuCalibration(ext.encoderBaseDir + "/imu_calibration.json", calib);
+                } else {
+                    LOGW("IMU calibration unavailable; imu_calibration.json not written");
+                }
+            }
+        }
         g_engine->mCameraAccessExtension.encodingEnabled = true;
         g_engine->mCameraAccessExtension.encodersStopped = false;
         g_engine->mCameraAccessExtension.cameraParamsSavedRgb = false;
@@ -2920,6 +3617,9 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartRecording(JNIEnv *env, jobjec
             g_engine->alignedSnapshot.rightHand.active = false;
             g_engine->alignedSnapshot.rgbFrameCount = 0;
         }
+        g_engine->controllerPoseRing.clear();
+        // Propagate BOOTTIME→REALTIME offset to non-lazy-init components
+        g_engine->propagateTimeOffset();
         if (g_engine->useControllerMode) {
             g_engine->mControllerPoseSaver.StartSession(
                 g_engine->mDatasetRecorder.getControllerPoseCsvPath());
@@ -2936,31 +3636,11 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartRecording(JNIEnv *env, jobjec
 extern "C" JNIEXPORT void JNICALL
 Java_com_ssnwt_helloxr_VrNativeActivity_nativeStopRecording(JNIEnv *env, jobject thiz) {
     if (g_engine && g_engine->mDatasetRecorder.isRecording()) {
-        LOGI("Stop recording via intent (async)");
-        g_engine->mCameraAccessExtension.encodingEnabled = false;
-        if (!g_engine->useControllerMode) {
-            g_engine->mDatasetRecorder.writeCaptureStatusJson(
-                "finalizing", g_engine->mHandTrackerLogic.rawDateSave);
-        }
         // Stop encoder first, then stop recorder in the same async thread.
         // This ordering guarantees that saveAlignedSensorData (called from the
         // render thread during encoder submission) completes before the recorder
         // is torn down, so head_pose / hand_tracking CSV rows stay 1:1 with mett.
-        std::thread([]() {
-            g_engine->mCameraAccessExtension.stopEncoder();
-            g_engine->mCameraAccessExtension.encoderBaseDir.clear();
-
-            g_engine->mDatasetRecorder.stop();
-            if (g_engine->useControllerMode) {
-                g_engine->mControllerPoseSaver.StopSession();
-            } else {
-                g_engine->mHandTrackerLogic.rawDateSave->StopSession();
-                g_engine->mDatasetRecorder.writeCaptureStatusJson(
-                    "complete", g_engine->mHandTrackerLogic.rawDateSave);
-            }
-            ttsSpeak("录制已保存");
-            LOGI("Intent: Async encoder + recorder stop completed");
-        }).detach();
+        stopRecordingAsync(g_engine, "intent", "录制已保存");
     }
 }
 
@@ -3449,7 +4129,7 @@ static int engine_init_xr_swapchains(struct engine *engine) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glBindTexture(GL_TEXTURE_2D, 0);
     if (engine->depthBuffer == 0) {
-        LOGE("Failed to init depth buffer");
+        LOGE(LOG_TAG, "Failed to init depth buffer");
         assert(0);
     }
     GL();
@@ -3826,106 +4506,7 @@ static void engine_draw_frame(struct engine *engine,
     glm::vec3 color = glm::vec3(1.0f,1.0f,1.0f);
     engine->cubeShader->SetUniformVec3("modelColor", color);
 
-    // Controller model rendering (simple cube)
-    if (engine->useControllerMode && engine->inputPtr) {
-        glm::vec3 leftColor = glm::vec3(0.0f, 0.0f, 1.0f);
-        glm::vec3 rightColor = glm::vec3(1.0f, 0.0f, 0.0f);
-        if (engine->inputPtr->IsControllerActive(0)) {
-            auto& p = engine->inputPtr->mControllerPose[0];
-            glm::mat4 rotMat = glm::mat4_cast(glm::fquat(
-                p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z));
-            glm::mat4 transMat = glm::translate(glm::vec3(
-                p.position.x, p.position.y, p.position.z));
-            glm::mat4 modelMat = transMat * rotMat * glm::scale(glm::vec3(0.05f));
-            engine->cubeShader->SetUniformVec3("modelColor", leftColor);
-            engine->cubeShader->SetUniformMat4("modelMatrix", modelMat);
-            engine->cube.Submit();
-        }
-        if (engine->inputPtr->IsControllerActive(1)) {
-            auto& p = engine->inputPtr->mControllerPose[1];
-            glm::mat4 rotMat = glm::mat4_cast(glm::fquat(
-                p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z));
-            glm::mat4 transMat = glm::translate(glm::vec3(
-                p.position.x, p.position.y, p.position.z));
-            glm::mat4 modelMat = transMat * rotMat * glm::scale(glm::vec3(0.05f));
-            engine->cubeShader->SetUniformVec3("modelColor", rightColor);
-            engine->cubeShader->SetUniformMat4("modelMatrix", modelMat);
-            engine->cube.Submit();
-        }
-    }
-
-    // Render RGB camera frames (use display textures updated by callback thread)
-    engine->cubeShader->SetUniform1i("useTexture", 1);
-    engine->cubeShader->SetUniformVec3("modelColor", color);
-    if(engine->mCameraAccessExtension.rgbFrameReady &&
-       engine->mCameraAccessExtension.rgbDisplayTextures[0] != 0 &&
-       engine->mCameraAccessExtension.rgbDisplayTextures[1] != 0){
-        //left
-        {
-            glm::mat4 matleft = glm::translate(glm::vec3(-1.0f, .0f, -5))
-                                * glm::scale(glm::vec3(2.f));
-            engine->cubeShader->SetUniformMat4("modelMatrix", matleft);
-            engine->cubeShader->SetUniformSampler("srcTex",
-                                                  engine->mCameraAccessExtension.rgbDisplayTextures[0],
-                                                  GL_TEXTURE_2D, 0);
-            mNotificationMesh.Submit();
-        }
-        //right
-        {
-            glm::mat4 matright = glm::translate(glm::vec3(1.0f, .0f, -5))
-                                 * glm::scale(glm::vec3(2.f));
-            engine->cubeShader->SetUniformMat4("modelMatrix", matright);
-            engine->cubeShader->SetUniformSampler("srcTex",
-                                                  engine->mCameraAccessExtension.rgbDisplayTextures[1],
-                                                  GL_TEXTURE_2D, 0);
-            mNotificationMesh.Submit();
-        }
-    }
-
-
-    // Render CV camera frames in 4 corners at same depth as RGB
-    // Update CV display textures from pixel data
-    ensureCvTextures(engine);
-    engine->cubeShader->SetUniform1i("useTexture", 1);  // RGB texture mode (grayscale expanded to RGBA)
-    {
-        // Corner positions for CV cameras (z=-5, same as RGB)
-        // CV-TL: top-left, CV-TR: top-right, CV-BL: bottom-left, CV-BR: bottom-right
-        struct CvCamPos {
-            glm::vec3 pos;
-            float scale;
-            const char* name;
-        };
-        // CV cameras on left/right of RGB, stacked vertically, aligned with RGB height
-        // CV scale_y=1.0, scale_x=1.33 (4:3 ratio), two stacked = height 2.0 = RGB height
-        CvCamPos cvCams[4] = {
-            {glm::vec3(-2.67f, -0.5f, -5), 1.0f, "CV-TL"},  // left-bottom
-            {glm::vec3( 2.67f, -0.5f, -5), 1.0f, "CV-TR"},  // right-bottom
-            {glm::vec3(-2.67f,  0.5f, -5), 1.0f, "CV-BL"},  // left-top
-            {glm::vec3( 2.67f,  0.5f, -5), 1.0f, "CV-BR"},  // right-top
-        };
-        // Texture index: direct mapping [TL, TR, BL, BR]
-        static const int texMap[4] = {0, 1, 2, 3};
-        for (int i = 0; i < 4; i++) {
-            int ti = texMap[i];
-            if (engine->mCameraAccessExtension.cvDisplayTextures[ti] == 0) continue;
-            // Use actual aspect ratio (640x480 = 4:3) for non-uniform scaling
-            uint32_t cw = engine->mCameraAccessExtension.cvFrameWidths[ti];
-            uint32_t ch = engine->mCameraAccessExtension.cvFrameHeights[ti];
-            float aspect = (cw > 0 && ch > 0) ? (float)cw / (float)ch : 1.0f;
-            float sx = cvCams[i].scale * aspect;  // wider for 4:3
-            float sy = cvCams[i].scale;
-            glm::mat4 mat = glm::translate(cvCams[i].pos)
-                          * glm::scale(glm::vec3(sx, sy, 1.0f));
-            engine->cubeShader->SetUniformMat4("modelMatrix", mat);
-            engine->cubeShader->SetUniformSampler("srcTex",
-                                                  engine->mCameraAccessExtension.cvDisplayTextures[ti],
-                                                  GL_TEXTURE_2D, 0);
-            mNotificationMesh.Submit();
-        }
-    }
-//    mNotificationMesh.Submit()
-
-    // Render camera info panel below cameras
+    // Render head-locked info panel (follows gaze, stays in front)
     engine->cubeShader->SetUniform1i("useTexture", 1);
     gInfoPanel.update(engine);
     gInfoPanel.render(engine->cubeShader);
@@ -4471,10 +5052,6 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                 e->dpadCenterPressed = true;
                 return 1;
             }
-            if (keyCode == AKEYCODE_VOLUME_DOWN) {
-
-                return 1;
-            }
         }
     }
     return 0;
@@ -4539,9 +5116,11 @@ void android_main(struct android_app *state)
     // Initialize hand tracking
     engine.useControllerMode = readUseControllerProperty();
     engine.useProjectHand = readProjectHandProperty();
-    LOGI("Input mode: %s, project_hand: %s",
+    engine.projectController = readProjectControllerProperty();
+    LOGI("Input mode: %s, project_hand: %s, project_controller: %s",
          engine.useControllerMode ? "controller" : "hand tracking",
-         engine.useProjectHand ? "on" : "off");
+         engine.useProjectHand ? "on" : "off",
+         engine.projectController ? "on" : "off");
     if (!engine.useControllerMode) {
         engine.mHandTrackerLogic.Init();
     } else {
@@ -4639,36 +5218,35 @@ void android_main(struct android_app *state)
 
         if (!engine.useControllerMode) {
             engine.mHandTrackerLogic.Update(sensorXrTime);
-        } else if (engine.mControllerPoseSaver.IsSessionActive()) {
-            ControllerPoseRecord rec{};
-            rec.frameNumber = engine.controllerFrameCounter;
-            rec.timestamp = sensorBoottimeNs;
-
-            rec.leftActive = engine.inputPtr->IsControllerActive(0);
-            if (rec.leftActive) {
+        } else {
+            // Push controller pose to ring buffer for time-aligned CSV write in camera callback.
+            // (Previously: direct mControllerPoseSaver.SaveFrame() here with sensorBoottimeNs)
+            ControllerPoseRing::Sample ctrlSample{};
+            ctrlSample.bootTimeNs = sensorBoottimeNs;
+            ctrlSample.frameNumber = engine.controllerFrameCounter;
+            ctrlSample.leftActive = engine.inputPtr->IsControllerActive(0);
+            if (ctrlSample.leftActive) {
                 auto& p = engine.inputPtr->mControllerPose[0];
-                rec.leftPos[0] = p.position.x;
-                rec.leftPos[1] = p.position.y;
-                rec.leftPos[2] = p.position.z;
-                rec.leftQuat[0] = p.orientation.x;
-                rec.leftQuat[1] = p.orientation.y;
-                rec.leftQuat[2] = p.orientation.z;
-                rec.leftQuat[3] = p.orientation.w;
+                ctrlSample.leftPos[0] = p.position.x;
+                ctrlSample.leftPos[1] = p.position.y;
+                ctrlSample.leftPos[2] = p.position.z;
+                ctrlSample.leftQuat[0] = p.orientation.x;
+                ctrlSample.leftQuat[1] = p.orientation.y;
+                ctrlSample.leftQuat[2] = p.orientation.z;
+                ctrlSample.leftQuat[3] = p.orientation.w;
             }
-
-            rec.rightActive = engine.inputPtr->IsControllerActive(1);
-            if (rec.rightActive) {
+            ctrlSample.rightActive = engine.inputPtr->IsControllerActive(1);
+            if (ctrlSample.rightActive) {
                 auto& p = engine.inputPtr->mControllerPose[1];
-                rec.rightPos[0] = p.position.x;
-                rec.rightPos[1] = p.position.y;
-                rec.rightPos[2] = p.position.z;
-                rec.rightQuat[0] = p.orientation.x;
-                rec.rightQuat[1] = p.orientation.y;
-                rec.rightQuat[2] = p.orientation.z;
-                rec.rightQuat[3] = p.orientation.w;
+                ctrlSample.rightPos[0] = p.position.x;
+                ctrlSample.rightPos[1] = p.position.y;
+                ctrlSample.rightPos[2] = p.position.z;
+                ctrlSample.rightQuat[0] = p.orientation.x;
+                ctrlSample.rightQuat[1] = p.orientation.y;
+                ctrlSample.rightQuat[2] = p.orientation.z;
+                ctrlSample.rightQuat[3] = p.orientation.w;
             }
-
-            engine.mControllerPoseSaver.SaveFrame(rec);
+            engine.controllerPoseRing.push(ctrlSample);
             engine.controllerFrameCounter++;
         }
 
@@ -4730,8 +5308,9 @@ void android_main(struct android_app *state)
         }
 
         // Push timestamped sample to ring buffer so the camera callback can
-        // recover time-aligned head pose + hand joints at start_of_exposure.
-        if (!engine.useControllerMode && devicePoseValid) {
+        // recover time-aligned head pose (+ hand joints in hand tracking mode)
+        // at start_of_exposure. Head pose always pushed (both modes).
+        if (devicePoseValid) {
             PoseHandSampleRing::Sample rs;
             rs.bootTimeNs = sensorBoottimeNs;
             rs.poseValid = true;
@@ -4744,32 +5323,34 @@ void android_main(struct android_app *state)
             rs.headQuat[1] = dp.orientation.y;
             rs.headQuat[2] = dp.orientation.z;
             rs.headQuat[3] = dp.orientation.w;
-            rs.leftActive = engine.mHandTrackerLogic.LeftHandIsActive;
-            rs.rightActive = engine.mHandTrackerLogic.RightHandIsActive;
-            if (rs.leftActive) {
-                for (int j = 0; j < XR_HAND_JOINT_COUNT_EXT; ++j) {
-                    const auto& loc = engine.mHandTrackerLogic.LeftHandJointLocations[j];
-                    rs.leftJoints[j][0] = loc.pose.position.x;
-                    rs.leftJoints[j][1] = loc.pose.position.y;
-                    rs.leftJoints[j][2] = loc.pose.position.z;
-                    rs.leftRadii[j] = loc.radius;
-                    rs.leftQuats[j][0] = loc.pose.orientation.x;
-                    rs.leftQuats[j][1] = loc.pose.orientation.y;
-                    rs.leftQuats[j][2] = loc.pose.orientation.z;
-                    rs.leftQuats[j][3] = loc.pose.orientation.w;
+            if (!engine.useControllerMode) {
+                rs.leftActive = engine.mHandTrackerLogic.LeftHandIsActive;
+                rs.rightActive = engine.mHandTrackerLogic.RightHandIsActive;
+                if (rs.leftActive) {
+                    for (int j = 0; j < XR_HAND_JOINT_COUNT_EXT; ++j) {
+                        const auto& loc = engine.mHandTrackerLogic.LeftHandJointLocations[j];
+                        rs.leftJoints[j][0] = loc.pose.position.x;
+                        rs.leftJoints[j][1] = loc.pose.position.y;
+                        rs.leftJoints[j][2] = loc.pose.position.z;
+                        rs.leftRadii[j] = loc.radius;
+                        rs.leftQuats[j][0] = loc.pose.orientation.x;
+                        rs.leftQuats[j][1] = loc.pose.orientation.y;
+                        rs.leftQuats[j][2] = loc.pose.orientation.z;
+                        rs.leftQuats[j][3] = loc.pose.orientation.w;
+                    }
                 }
-            }
-            if (rs.rightActive) {
-                for (int j = 0; j < XR_HAND_JOINT_COUNT_EXT; ++j) {
-                    const auto& loc = engine.mHandTrackerLogic.RightHandJointLocations[j];
-                    rs.rightJoints[j][0] = loc.pose.position.x;
-                    rs.rightJoints[j][1] = loc.pose.position.y;
-                    rs.rightJoints[j][2] = loc.pose.position.z;
-                    rs.rightRadii[j] = loc.radius;
-                    rs.rightQuats[j][0] = loc.pose.orientation.x;
-                    rs.rightQuats[j][1] = loc.pose.orientation.y;
-                    rs.rightQuats[j][2] = loc.pose.orientation.z;
-                    rs.rightQuats[j][3] = loc.pose.orientation.w;
+                if (rs.rightActive) {
+                    for (int j = 0; j < XR_HAND_JOINT_COUNT_EXT; ++j) {
+                        const auto& loc = engine.mHandTrackerLogic.RightHandJointLocations[j];
+                        rs.rightJoints[j][0] = loc.pose.position.x;
+                        rs.rightJoints[j][1] = loc.pose.position.y;
+                        rs.rightJoints[j][2] = loc.pose.position.z;
+                        rs.rightRadii[j] = loc.radius;
+                        rs.rightQuats[j][0] = loc.pose.orientation.x;
+                        rs.rightQuats[j][1] = loc.pose.orientation.y;
+                        rs.rightQuats[j][2] = loc.pose.orientation.z;
+                        rs.rightQuats[j][3] = loc.pose.orientation.w;
+                    }
                 }
             }
             engine.poseHandRing.push(rs);
@@ -4779,68 +5360,106 @@ void android_main(struct android_app *state)
         bool curToggle = engine.inputPtr->mRightBPressed || engine.dpadCenterPressed;
         engine.dpadCenterPressed = false;
         if (curToggle && !engine.prevRecordingToggle) {
-            if (!engine.mDatasetRecorder.isRecording()) {
-                // Wait for any async stop (encoder + recorder) to complete before starting
-                int waitCount = 0;
-                while (engine.mCameraAccessExtension.stopInProgress.load() ||
-                       engine.mDatasetRecorder.isRecording()) {
-                    usleep(10000); // 10ms
-                    if (++waitCount % 100 == 0) {
-                        LOGW("Right B start: waiting for stopEncoder (%d ms)", waitCount * 10);
-                    }
-                    if (waitCount > 300) break; // 3s timeout
-                }
-                LOGI("Starting dataset recording (right B)...");
-                engine.mDatasetRecorder.start();
-                engine.mCameraAccessExtension.encoderBaseDir = engine.mDatasetRecorder.getDatasetDir();
-                engine.mCameraAccessExtension.encodingEnabled = true;
-                engine.mCameraAccessExtension.encodersStopped = false;
-                engine.mCameraAccessExtension.cameraParamsSavedRgb = false;
-                engine.mCameraAccessExtension.cameraParamsSavedTracking = false;
-                engine.mCameraAccessExtension.cameraParamsSavedCtrl = false;
-                {
-                    std::lock_guard<std::mutex> lock(engine.alignedSnapshot.mutex);
-                    engine.alignedSnapshot.headPose.valid = false;
-                    engine.alignedSnapshot.leftHand.active = false;
-                    engine.alignedSnapshot.rightHand.active = false;
-                    engine.alignedSnapshot.rgbFrameCount = 0;
-                }
-                engine.poseHandRing.clear();
-                if (engine.useControllerMode) {
-                    engine.mControllerPoseSaver.StartSession(
-                        engine.mDatasetRecorder.getControllerPoseCsvPath());
-                } else {
-                    engine.mHandTrackerLogic.rawDateSave->StartNewSession(
-                        engine.mDatasetRecorder.getHandTrackingCsvPath());
-                    engine.mDatasetRecorder.writeCaptureStatusJson(
-                        "recording", engine.mHandTrackerLogic.rawDateSave);
-                }
-                ttsSpeak("开始录制");
+            if (engine.mDatasetRecorder.isRecording()) {
+                stopRecordingAsync(&engine, "right B", "录制已保存");
             } else {
-                LOGI("Stopping dataset recording (right B, async)...");
-                engine.mCameraAccessExtension.encodingEnabled = false;
-                if (!engine.useControllerMode) {
-                    engine.mDatasetRecorder.writeCaptureStatusJson(
-                        "finalizing", engine.mHandTrackerLogic.rawDateSave);
-                }
-                std::thread([&engine]() {
-                    engine.mCameraAccessExtension.stopEncoder();
-                    engine.mCameraAccessExtension.encoderBaseDir.clear();
-
-                    engine.mDatasetRecorder.stop();
-                    if (engine.useControllerMode) {
-                        engine.mControllerPoseSaver.StopSession();
-                    } else {
-                        engine.mHandTrackerLogic.rawDateSave->StopSession();
-                        engine.mDatasetRecorder.writeCaptureStatusJson(
-                            "complete", engine.mHandTrackerLogic.rawDateSave);
+                // Storage guard: refuse to start below 1 GiB free.
+                int64_t avail = getAvailableBytes(storagePath);
+                if (avail >= 0 && avail < MIN_FREE_BYTES) {
+                    LOGW("Right B start: insufficient storage (%lld bytes free)", (long long)avail);
+                    ttsSpeak("存储空间已满，无法录制");
+                } else {
+                    // Wait for any async stop (encoder + recorder) to complete before starting
+                    int waitCount = 0;
+                    while (engine.mCameraAccessExtension.stopInProgress.load() ||
+                           engine.mDatasetRecorder.isRecording()) {
+                        usleep(10000); // 10ms
+                        if (++waitCount % 100 == 0) {
+                            LOGW("Right B start: waiting for stopEncoder (%d ms)", waitCount * 10);
+                        }
+                        if (waitCount > 300) {
+                            break; // 3s timeout
+                        }
                     }
-                    ttsSpeak("录制已保存");
-                    LOGI("Right B: Async encoder + recorder stop completed");
-                }).detach();
+                    LOGI("Starting dataset recording (right B)...");
+                    engine.recordingStartTime = std::chrono::steady_clock::now();
+                    engine.autoStopRequested = false;
+                    engine.mDatasetRecorder.start();
+                    engine.mCameraAccessExtension.encoderBaseDir = engine.mDatasetRecorder.getDatasetDir();
+                    // IMU calibration sidecar (device-global; no camera context needed)
+                    {
+                        auto& ext = engine.mCameraAccessExtension;
+                        if (sxr_camera_api_is_valid(&ext.api) && ext.api.get_imu_calibration) {
+                            SXR::SxrImuCalibration calib{};
+                            if (sxr_camera_get_imu_calibration(&ext.api, &calib) == 0 && calib.valid) {
+                                ext.saveImuCalibration(ext.encoderBaseDir + "/imu_calibration.json", calib);
+                            } else {
+                                LOGW("IMU calibration unavailable; imu_calibration.json not written");
+                            }
+                        }
+                    }
+                    engine.mCameraAccessExtension.encodingEnabled = true;
+                    engine.mCameraAccessExtension.encodersStopped = false;
+                    engine.mCameraAccessExtension.cameraParamsSavedRgb = false;
+                    engine.mCameraAccessExtension.cameraParamsSavedTracking = false;
+                    engine.mCameraAccessExtension.cameraParamsSavedCtrl = false;
+                    {
+                        std::lock_guard<std::mutex> lock(engine.alignedSnapshot.mutex);
+                        engine.alignedSnapshot.headPose.valid = false;
+                        engine.alignedSnapshot.leftHand.active = false;
+                        engine.alignedSnapshot.rightHand.active = false;
+                        engine.alignedSnapshot.rgbFrameCount = 0;
+                    }
+                    engine.poseHandRing.clear();
+                    engine.controllerPoseRing.clear();
+                    // Propagate BOOTTIME→REALTIME offset to non-lazy-init components
+                    engine.propagateTimeOffset();
+                    if (engine.useControllerMode) {
+                        engine.mControllerPoseSaver.StartSession(
+                            engine.mDatasetRecorder.getControllerPoseCsvPath());
+                    } else {
+                        engine.mHandTrackerLogic.rawDateSave->StartNewSession(
+                            engine.mDatasetRecorder.getHandTrackingCsvPath());
+                        engine.mDatasetRecorder.writeCaptureStatusJson(
+                            "recording", engine.mHandTrackerLogic.rawDateSave);
+                    }
+                    ttsSpeak("开始录制");
+                }
             }
         }
         engine.prevRecordingToggle = curToggle;
+
+        // Auto-stop guard: end recording before AAudio's signed int32 frame
+        // counter overflows at ~13.5h @ 44100Hz (libaaudio internal, unfixable —
+        // aborts in getBestTimestamp). Reuses the same async stop path as manual
+        // stop so encoder/recorder/session tear down consistently.
+        if (engine.mDatasetRecorder.isRecording() &&
+            !engine.autoStopRequested.load() &&
+            std::chrono::steady_clock::now() - engine.recordingStartTime >=
+                std::chrono::hours(12)) {
+            engine.autoStopRequested = true;
+            stopRecordingAsync(&engine, "12h auto-stop (AAudio int32 overflow guard)",
+                               "录制已保存");
+        }
+
+        // Auto-stop when free space drops below 1 GiB mid-recording (checked ~1/sec).
+        // Reuses stopRecordingAsync so encoder/recorder/session tear down consistently;
+        // autoStopRequested prevents repeat triggers while the async stop drains.
+        if (engine.mDatasetRecorder.isRecording() &&
+            !engine.autoStopRequested.load()) {
+            static int storageCheckFrame = 0;
+            if (++storageCheckFrame >= 30) {  // ~once per second at 30fps
+                storageCheckFrame = 0;
+                int64_t avail = getAvailableBytes(storagePath);
+                if (avail >= 0 && avail < MIN_FREE_BYTES) {
+                    LOGW("Storage low mid-recording (%lld bytes free); auto-stopping",
+                         (long long)avail);
+                    engine.autoStopRequested = true;
+                    stopRecordingAsync(&engine, "low storage auto-stop",
+                                       "存储空间已满，无法继续保存");
+                }
+            }
+        }
 
         // Handle snapshot: non-blocking — check each frame, save when data is ready
         {
@@ -4946,70 +5565,6 @@ void android_main(struct android_app *state)
         }
 
         glFlush();
-
-        // Submit pending RGB SBS frame to encoder.
-        // saveAlignedSensorData is now called in the camera callback (handleRGBFrame)
-        // to minimize pipeline delay between frame arrival and CSV write.
-        {
-            uint64_t ts = engine.mCameraAccessExtension.pendingEncodeTimestamp.exchange(0);
-            if (ts != 0 &&
-                engine.mCameraAccessExtension.rgbEncoderSurface != nullptr &&
-                !engine.mCameraAccessExtension.encodersStopped.load() &&
-                !engine.mCameraAccessExtension.stopInProgress.load()) {
-
-                auto* encSurf = engine.mCameraAccessExtension.rgbEncoderSurface;
-                auto* encoder = engine.mCameraAccessExtension.rgbEncoder;
-
-                int sbsW = engine.mCameraAccessExtension.rgbFrameWidths[0] * 2;
-                int sbsH = engine.mCameraAccessExtension.rgbFrameHeights[0];
-                if (sbsW > 0 && sbsH > 0) {
-                    encSurf->makeCurrent();
-
-                    glViewport(0, 0, sbsW, sbsH);
-                    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-                    glClear(GL_COLOR_BUFFER_BIT);
-
-                    // Draw SBS texture fullscreen
-                    glUseProgram(engine.mCameraAccessExtension.sbsCopyShaderProgram);
-                    glActiveTexture(GL_TEXTURE0);
-                    glBindTexture(GL_TEXTURE_2D, engine.mCameraAccessExtension.rgbSbsTexture);
-                    glUniform1i(glGetUniformLocation(engine.mCameraAccessExtension.sbsCopyShaderProgram, "uTexture"), 0);
-
-                    glBindBuffer(GL_ARRAY_BUFFER, engine.mCameraAccessExtension.encoderVBO);
-                    GLint cpPosLoc = glGetAttribLocation(engine.mCameraAccessExtension.sbsCopyShaderProgram, "aPosition");
-                    GLint cpTexLoc = glGetAttribLocation(engine.mCameraAccessExtension.sbsCopyShaderProgram, "aTexCoord");
-                    glEnableVertexAttribArray(cpPosLoc);
-                    glVertexAttribPointer(cpPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-                    glEnableVertexAttribArray(cpTexLoc);
-                    glVertexAttribPointer(cpTexLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
-                    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-                    glDisableVertexAttribArray(cpPosLoc);
-                    glDisableVertexAttribArray(cpTexLoc);
-
-                    // Compute overlay projection using RGB-frame-time snapshot, then render
-                    if (engine.useProjectHand) {
-                        auto& os = engine.mCameraAccessExtension.overlaySnap;
-                        std::lock_guard<std::mutex> lock(os.mutex);
-                        if (os.headValid) {
-                            engine.handOverlay.computeProjection(
-                                os.leftActive, os.leftJoints,
-                                os.rightActive, os.rightJoints,
-                                os.headPos, os.headQuat);
-                            int halfW = sbsW / 2;
-                            engine.handOverlay.render(0, 0, halfW, sbsH);       // left eye
-                            engine.handOverlay.render(1, halfW, halfW, sbsH);   // right eye
-                        }
-                    }
-
-                    encSurf->setPresentationTime(ts);
-                    encoder->submitNsTimestamp(ts);
-                    encSurf->swapBuffers();
-
-                    // Restore main render context
-                    eglMakeCurrent(engine.display, engine.surface, engine.surface, engine.context);
-                }
-            }
-        }
 
         XrCompositionLayerProjection projectionLayer = {
                 .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,

@@ -29,6 +29,9 @@ public:
     void Init(const std::string& savePath);
     void Shutdown();
 
+    // Set BOOTTIME→REALTIME offset for timestamp conversion (called once per recording session)
+    void SetTimeOffset(int64_t offsetNs) { m_timeOffsetNs = offsetNs; }
+
     bool StartSession(const std::string& csvPath);
     void StopSession();
     bool IsSessionActive() const { return m_sessionActive.load(); }
@@ -43,6 +46,9 @@ private:
     std::string RecordToCsv(const ControllerPoseRecord& rec);
 
     std::string m_savePath;
+
+    // BOOTTIME→REALTIME offset for timestamp conversion
+    int64_t m_timeOffsetNs{0};
     std::queue<ControllerPoseRecord> m_queue;
     mutable std::mutex m_queueMutex;
     std::condition_variable m_queueCv;

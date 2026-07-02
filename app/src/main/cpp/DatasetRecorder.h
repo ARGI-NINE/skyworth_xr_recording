@@ -1,11 +1,10 @@
 #pragma once
 
 #include <string>
-#include <vector>
 #include <atomic>
 #include <mutex>
 #include <thread>
-#include <queue>
+#include <map>
 #include <condition_variable>
 #include <fstream>
 
@@ -38,18 +37,22 @@ public:
     std::string getAudioPath() const;
     bool writeCaptureStatusJson(const std::string& state, const RawDateSave* handSaver) const;
 
+    // Get BOOTTIME→REALTIME offset captured at recording start
+    int64_t getTimeOffset() const { return mBoottimeToRealtimeOffsetNs; }
+
     // Save head pose from render thread (async, non-blocking)
     void saveHeadPose(int64_t boottimeNs, const XrPosef& pose);
 
 private:
     void poseWriterThreadFunc();
-    void offsetSamplingThreadFunc();
-    void writeTimeOffsetJson();
 
     std::string mBasePath;
     std::string mDatasetDir;
     std::atomic<bool> mRecording{false};
     std::mutex mMutex;
+
+    // BOOTTIME→REALTIME offset captured once at recording start
+    int64_t mBoottimeToRealtimeOffsetNs{0};
 
     // IMU collector
     ImuPoseCollector mImuCollector;
@@ -57,13 +60,18 @@ private:
     // Audio encoder
     AudioEncoder mAudioEncoder;
 
-    // Head pose async writer
+    // Head pose async writer with reorder buffer.
+    // Entries are stored in a sorted map keyed by timestamp so that the writer
+    // thread always emits rows in monotonically increasing order, even when
+    // camera frames arrive out-of-order in the callback.
+    static constexpr int64_t REORDER_WINDOW_NS = 100000000LL;  // 100 ms
     struct PoseEntry {
         int64_t timestamp;
         float pos[3];
         float quat[4];
     };
-    std::queue<PoseEntry> mPoseQueue;
+    std::map<int64_t, PoseEntry> mPoseMap;
+    int64_t mMaxSeenPoseTimestamp{0};
     std::mutex mPoseMutex;
     std::condition_variable mPoseCV;
     std::thread mPoseWriterThread;
@@ -72,17 +80,6 @@ private:
     std::atomic<bool> mPoseWriterFinished{false};
     std::atomic<uint64_t> mPoseCount{0};
 
-    // BOOTTIME → REALTIME offset sampling (1 Hz)
-    struct TimeOffsetSample {
-        int64_t boottimeNs;
-        int64_t realtimeNs;
-        int64_t offsetNs;
-    };
-    std::vector<TimeOffsetSample> mTimeOffsets;
-    std::mutex mOffsetMutex;
-    std::thread mOffsetThread;
-    std::atomic<bool> mOffsetRunning{false};
-    std::atomic<bool> mTimeOffsetFinished{false};
     int64_t mCaptureStartUnixMs{0};
     int64_t mCaptureStopUnixMs{0};
 

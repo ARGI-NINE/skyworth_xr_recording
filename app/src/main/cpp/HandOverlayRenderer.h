@@ -2,11 +2,13 @@
 
 #include <GLES3/gl3.h>
 #include <cstdint>
+#include <mutex>
 
-// KB fisheye projection + GL 2D overlay renderer for hand joints.
-// Projects 3D hand joints (RootSpace) to 2D pixel coordinates using
-// Kannala-Brandt fisheye model, then renders bone lines and joint dots
-// as a 2D overlay on any target FBO.
+// KB fisheye projection + GL 2D overlay renderer for hand joints
+// and controller coordinate axes.
+// Projects 3D points (RootSpace) to 2D pixel coordinates using
+// Kannala-Brandt fisheye model, then renders bones+dots (hands) or
+// coordinate axis lines (controllers) as a 2D overlay on any target FBO.
 
 class HandOverlayRenderer {
 public:
@@ -32,6 +34,17 @@ public:
         ProjectedHand rightHand[2];
     };
 
+    // Per-controller projected origin (pixel coords, both eyes).
+    // Axis arms are fixed-length pixel lines drawn from this origin.
+    struct ProjectedControllerAxes {
+        float origin[2];     // pixel UV of controller position
+        bool valid = false;
+    };
+    struct ControllerAxesProj {
+        ProjectedControllerAxes left[2];   // [eye]
+        ProjectedControllerAxes right[2];  // [eye]
+    };
+
     HandOverlayRenderer() = default;
     ~HandOverlayRenderer();
 
@@ -46,10 +59,22 @@ public:
     void computeProjection(bool leftActive, const float leftJoints[26][3],
                            bool rightActive, const float rightJoints[26][3],
                            const float headPos[3], const float headQuat[4]);
+
+    // Controller coordinate axes: project controller origin through KB
+    // fisheye for both eyes, render 3 fixed-pixel-length axis arms.
+    void computeControllerAxes(bool leftActive, const float leftPos[3],
+                                const float leftQuat[4],
+                                bool rightActive, const float rightPos[3],
+                                const float rightQuat[4],
+                                const float headPos[3], const float headQuat[4]);
+    void renderControllerAxes(int eyeIndex, int vpX, int vpY,
+                               int vpW, int vpH, int resW, int resH) const;
+
     void render(int eyeIndex, int offsetX, int regionW, int regionH) const;
     void render(int eyeIndex, int vpX, int vpY, int vpW, int vpH,
                 int resW, int resH) const;
-    const FrameProjection& getProjection() const { return projection_; }
+    const FrameProjection& getProjection() const { return projectionStable_; }
+    const ControllerAxesProj& getControllerAxes() const { return controllerAxes_; }
     const EyeCameraParams& getEyeParams(int eyeIndex) const { return eyeParams_[eyeIndex]; }
     GLuint getShaderProgram() const { return shaderProgram_; }
 
@@ -69,9 +94,15 @@ private:
     static void quatRotate(const float q[4], const float v[3], float out[3]);
 
     EyeCameraParams eyeParams_[2];
-    FrameProjection projection_{};
+    // Double-buffer + mutual exclusion: computeProjection / updateCameraParams
+    // write under lock; render() swaps staging→stable then executes GL under
+    // the same lock to prevent concurrent VBO access from different EGL contexts.
+    FrameProjection projectionStaging_{};
+    mutable FrameProjection projectionStable_{};
+    ControllerAxesProj controllerAxes_{};
     GLuint shaderProgram_ = 0;
     GLuint lineVBO_ = 0;
     GLuint circleVBO_ = 0;
     bool initialized_ = false;
+    mutable std::mutex renderMutex_;
 };

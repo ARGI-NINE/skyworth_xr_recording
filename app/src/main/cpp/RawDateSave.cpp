@@ -282,7 +282,7 @@ std::string RawDateSave::FrameToCsv(const FrameData& frameData) {
 
     // 基础信息
     oss << frameData.frameNumber << ","
-        << frameData.timestamp << ","
+        << (frameData.timestamp + m_timeOffsetNs) << ","
         << (frameData.hasLeftHand && frameData.leftHand.isActive ? 1 : 0) << ","
         << (frameData.hasRightHand && frameData.rightHand.isActive ? 1 : 0);
 

@@ -124,8 +124,8 @@ HandOverlayRenderer::~HandOverlayRenderer() {
 //
 // cam = conj(extQuat) * conj(headQuat) * (joint_world - wc_pos)
 //
-// headQuat: view→world rotation (OpenXR: X=right, Y=up, Z=backward)
-// extQuat:  camera→view extrinsics rotation
+// headQuat: view->world rotation (OpenXR: X=right, Y=up, Z=backward)
+// extQuat:  camera->view extrinsics rotation
 //
 // Matches the Python visualize_hand_on_rgb.py reference implementation.
 // ---------------------------------------------------------------------------
@@ -159,6 +159,7 @@ void HandOverlayRenderer::updateCameraParams(int eyeIndex,
                                               const float extPos[3],
                                               const float extQuat[4],
                                               uint32_t width, uint32_t height) {
+    std::lock_guard<std::mutex> lock(renderMutex_);
     if (eyeIndex < 0 || eyeIndex > 1) return;
     EyeCameraParams& p = eyeParams_[eyeIndex];
     p.focalX   = focalX;
@@ -189,6 +190,7 @@ void HandOverlayRenderer::computeProjection(bool leftActive,
                                              const float rightJoints[26][3],
                                              const float headPos[3],
                                              const float headQuat[4]) {
+    std::lock_guard<std::mutex> lock(renderMutex_);
     for (int eye = 0; eye < 2; ++eye) {
         const EyeCameraParams& cam = eyeParams_[eye];
         if (!cam.valid) {
@@ -197,7 +199,7 @@ void HandOverlayRenderer::computeProjection(bool leftActive,
             continue;
         }
 
-        // Compute world camera position. headQuat is view→world (matches the
+        // Compute world camera position. headQuat is view->world (matches the
         // Python reference convention).
         //   wcPos = headPos + headQuat * extPos
         float extPosRotated[3];
@@ -213,12 +215,12 @@ void HandOverlayRenderer::computeProjection(bool leftActive,
 
         // Left hand
         if (leftActive) {
-            projection_.leftHand[eye].active = true;
+            projectionStaging_.leftHand[eye].active = true;
             for (int j = 0; j < 26; ++j) {
                 float camPt[3];
                 worldToCamera(leftJoints[j], wcPos, headQuat, cam.extQuat, camPt);
-                float& u = projection_.leftHand[eye].joints[j][0];
-                float& v = projection_.leftHand[eye].joints[j][1];
+                float& u = projectionStaging_.leftHand[eye].joints[j][0];
+                float& v = projectionStaging_.leftHand[eye].joints[j][1];
                 if (!projectKB(camPt, cam.focalX, cam.focalY,
                                cam.centerX, cam.centerY,
                                cam.distortion, u, v)) {
@@ -243,17 +245,17 @@ void HandOverlayRenderer::computeProjection(bool leftActive,
                 }
             }
         } else {
-            projection_.leftHand[eye].active = false;
+            projectionStaging_.leftHand[eye].active = false;
         }
 
         // Right hand
         if (rightActive) {
-            projection_.rightHand[eye].active = true;
+            projectionStaging_.rightHand[eye].active = true;
             for (int j = 0; j < 26; ++j) {
                 float camPt[3];
                 worldToCamera(rightJoints[j], wcPos, headQuat, cam.extQuat, camPt);
-                float& u = projection_.rightHand[eye].joints[j][0];
-                float& v = projection_.rightHand[eye].joints[j][1];
+                float& u = projectionStaging_.rightHand[eye].joints[j][0];
+                float& v = projectionStaging_.rightHand[eye].joints[j][1];
                 if (!projectKB(camPt, cam.focalX, cam.focalY,
                                cam.centerX, cam.centerY,
                                cam.distortion, u, v)) {
@@ -269,7 +271,7 @@ void HandOverlayRenderer::computeProjection(bool leftActive,
                 }
             }
         } else {
-            projection_.rightHand[eye].active = false;
+            projectionStaging_.rightHand[eye].active = false;
         }
     }
 }
@@ -383,7 +385,7 @@ void HandOverlayRenderer::init() {
         "HandOverlay init OK: prog=%u lineVBO=%u circleVBO=%u",
         shaderProgram_, lineVBO_, circleVBO_);
 
-    // Create VBOs (no VAO — VAOs are not shared between EGL contexts)
+    // Create VBOs (no VAO -- VAOs are not shared between EGL contexts)
     // Bone quads: 25 bones * 6 verts * 2 coords (2 triangles per bone)
     glGenBuffers(1, &lineVBO_);
     glBindBuffer(GL_ARRAY_BUFFER, lineVBO_);
@@ -401,9 +403,138 @@ void HandOverlayRenderer::init() {
     initialized_ = true;
 }
 
+
 // ---------------------------------------------------------------------------
-// render
+// computeControllerAxes -- project controller origin through KB fisheye
+// for both eyes.  Only the origin is projected; axis arms are fixed-length
+// pixel lines rendered by renderControllerAxes.
 // ---------------------------------------------------------------------------
+
+void HandOverlayRenderer::computeControllerAxes(bool leftActive,
+                                                 const float leftPos[3],
+                                                 const float leftQuat[4],
+                                                 bool rightActive,
+                                                 const float rightPos[3],
+                                                 const float rightQuat[4],
+                                                 const float headPos[3],
+                                                 const float headQuat[4]) {
+    for (int eye = 0; eye < 2; ++eye) {
+        const EyeCameraParams& cam = eyeParams_[eye];
+        if (!cam.valid) {
+            controllerAxes_.left[eye].valid = false;
+            controllerAxes_.right[eye].valid = false;
+            continue;
+        }
+        float extRot[3];
+        quatRotate(headQuat, cam.extPos, extRot);
+        float wcPos[3] = {headPos[0] + extRot[0], headPos[1] + extRot[1],
+                          headPos[2] + extRot[2]};
+        const float cx = cam.centerX, cy = cam.centerY;
+        const float ox = cam.offsetX, oy = cam.offsetY;
+
+        auto projOrigin = [&](bool active, const float pos[3],
+                              ProjectedControllerAxes& out) {
+            if (!active) { out.valid = false; return; }
+            float camPt[3];
+            worldToCamera(pos, wcPos, headQuat, cam.extQuat, camPt);
+            float u, v;
+            if (!projectKB(camPt, cam.focalX, cam.focalY,
+                           cam.centerX, cam.centerY,
+                           cam.distortion, u, v)) {
+                out.valid = false; return;
+            }
+            // 90deg CW rotation (matches hand rendering convention)
+            out.origin[0] = cx + (v - cy) + ox;
+            out.origin[1] = cy - (u - cx) + oy;
+            out.valid = true;
+        };
+        projOrigin(leftActive,  leftPos,  controllerAxes_.left[eye]);
+        projOrigin(rightActive, rightPos, controllerAxes_.right[eye]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// renderControllerAxes -- fixed-pixel-length axis arms from projected origin
+// ---------------------------------------------------------------------------
+
+void HandOverlayRenderer::renderControllerAxes(int eyeIndex, int vpX, int vpY,
+                                                int vpW, int vpH,
+                                                int resW, int resH) const {
+    if (!initialized_) return;
+    if (eyeIndex < 0 || eyeIndex > 1) return;
+    const EyeCameraParams& cam = eyeParams_[eyeIndex];
+    if (!cam.valid) return;
+    float fResW = static_cast<float>(resW), fResH = static_cast<float>(resH);
+
+    GLboolean prevDepthTest = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean prevBlend     = glIsEnabled(GL_BLEND);
+    GLboolean prevScissor   = glIsEnabled(GL_SCISSOR_TEST);
+    GLint prevViewport[4];
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+    glViewport(vpX, vpY, vpW, vpH);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glUseProgram(shaderProgram_);
+    GLint uResolution = glGetUniformLocation(shaderProgram_, "uResolution");
+    GLint uColor      = glGetUniformLocation(shaderProgram_, "uColor");
+    GLint uIsPoints   = glGetUniformLocation(shaderProgram_, "uIsPoints");
+    glUniform2f(uResolution, fResW, fResH);
+    glUniform1i(uIsPoints, 0);
+    glUniform1f(glGetUniformLocation(shaderProgram_, "uPointSize"), 1.0f);
+
+    // Use circleVBO_ to avoid clobbering lineVBO_ (shared with hand overlay).
+    glBindBuffer(GL_ARRAY_BUFFER, circleVBO_);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glEnableVertexAttribArray(0);
+
+    const float alpha = 0.9f;
+    const float halfThick = 2.5f;
+    const float axisPx = 25.0f;   // fixed length in pixels
+
+    auto drawAxis = [&](float ox, float oy, float dx, float dy,
+                         float r, float g, float b) {
+        float ax = ox, ay = oy;
+        float bx = ox + dx, by = oy + dy;
+        if (ax < 0.0f || bx < 0.0f || ax > fResW || bx > fResW) return;
+        float len = sqrtf(dx * dx + dy * dy);
+        if (len < 1.0f) return;
+        float px = (-dy / len) * halfThick;
+        float py = (dx / len) * halfThick;
+        float verts[12] = {
+            ax + px, ay + py,  ax - px, ay - py,  bx + px, by + py,
+            ax - px, ay - py,  bx - px, by - py,  bx + px, by + py,
+        };
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+        glUniform4f(uColor, r, g, b, alpha);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    };
+
+    const ProjectedControllerAxes* ctrls[2] = {
+        &controllerAxes_.left[eyeIndex],
+        &controllerAxes_.right[eyeIndex],
+    };
+    for (int c = 0; c < 2; ++c) {
+        if (!ctrls[c]->valid) continue;
+        const ProjectedControllerAxes& ax = *ctrls[c];
+        float u = ax.origin[0], v = ax.origin[1];
+        if (u < 0.0f || v < 0.0f || u > fResW || v > fResH) continue;
+        drawAxis(u, v,  axisPx, 0.0f,       1.0f, 0.2f, 0.2f);  // X: red right
+        drawAxis(u, v,  0.0f,   -axisPx,    0.2f, 1.0f, 0.2f);  // Y: green up
+        drawAxis(u, v,  axisPx * 0.7f,  axisPx * 0.7f,
+                                              0.2f, 0.4f, 1.0f);  // Z: blue down-right
+    }
+
+    glDisableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glUseProgram(0);
+    if (prevDepthTest) glEnable(GL_DEPTH_TEST);
+    if (prevScissor) glEnable(GL_SCISSOR_TEST);
+    if (!prevBlend) glDisable(GL_BLEND);
+    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+}
 
 void HandOverlayRenderer::render(int eyeIndex, int offsetX,
                                   int regionW, int regionH) const {
@@ -416,6 +547,12 @@ void HandOverlayRenderer::render(int eyeIndex, int vpX, int vpY,
                                   int resW, int resH) const {
     if (!initialized_) return;
     if (eyeIndex < 0 || eyeIndex > 1) return;
+
+    // Hold renderMutex_ for the full GL section: concurrent glBufferSubData
+    // / glDrawArrays on shared VBOs from different EGL contexts is undefined
+    // behaviour (GLES 3.2 §5.1). Also protects eyeParams_ reads.
+    std::lock_guard<std::mutex> lock(renderMutex_);
+    projectionStable_ = projectionStaging_;
 
     const EyeCameraParams& cam = eyeParams_[eyeIndex];
     if (!cam.valid) return;
@@ -451,8 +588,8 @@ void HandOverlayRenderer::render(int eyeIndex, int vpX, int vpY,
         float r, g, b;
     };
     HandInfo hands[2] = {
-        { projection_.leftHand[eyeIndex],  0.0f, 0.5f, 1.0f },
-        { projection_.rightHand[eyeIndex], 1.0f, 0.5f, 0.0f },
+        { projectionStable_.leftHand[eyeIndex],  0.0f, 0.5f, 1.0f },
+        { projectionStable_.rightHand[eyeIndex], 1.0f, 0.5f, 0.0f },
     };
 
     for (int h = 0; h < 2; ++h) {
