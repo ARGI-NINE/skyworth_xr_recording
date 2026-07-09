@@ -9,37 +9,41 @@ package com.ssnwt.helloxr;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.NativeActivity;
-import android.bluetooth.BluetoothAdapter;
-import android.bluetooth.BluetoothClass;
-import android.bluetooth.BluetoothDevice;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
 import android.media.MediaRecorder;
 import android.net.Uri;
 import android.net.wifi.WifiConfiguration;
+import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.Message;
+import android.os.RemoteException;
 import android.os.storage.StorageManager;
 import android.os.storage.StorageVolume;
-import android.os.Handler;
-import android.os.Message;
 import android.preference.PreferenceManager;
 import android.provider.Settings;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.WindowManager;
 import androidx.annotation.NonNull;
 import androidx.core.app.ActivityCompat;
-import androidx.core.content.ContextCompat;
+import com.ssnwt.helloxr.ble.BleService;
 import com.ssnwt.vr.androidmanager.AndroidInterface;
 import com.ssnwt.vr.androidmanager.SystemEventUtils;
 import java.io.File;
@@ -68,28 +72,38 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     public static final String ASSETS_SUB_FOLDER_NAME = "raw";
     public static final int BUFFER_SIZE = 1024;
 
-    // Intent actions for remote control
-    public static final String ACTION_SAVE_IMAGE = "com.ssnwt.helloxr.SAVE_IMAGE";
-    public static final String ACTION_START_RECORDING = "com.ssnwt.helloxr.START_RECORDING";
-    public static final String ACTION_STOP_RECORDING = "com.ssnwt.helloxr.STOP_RECORDING";
     public static final String ACTION_MEDIA_MOUNTED_CUSTOM = "com.ssnwt.action.MEDIA_MOUNTED";
     public static final String ACTION_MEDIA_EJECT_CUSTOM = "com.ssnwt.action.MEDIA_EJECT";
     private static final String EXPORT_DIR_NAME = "Export";
     private static final String USB_DEBUG_LOG_NAME = "usb_debug.log";
-    private static final String USB_PROBE_LOG_NAME = "usb_debug_probe.txt";
 
-    // Native methods for intent control
+    // Native control and bridge methods.
     public native void nativeRequestSnapshot();
     public native void nativeStartRecording();
     public native void nativeStopRecording();
     public native void nativeStartExporter(String exportPath);
     public native void nativeStopExporter();
+    public native String nativeGetSdkStateJson();
+    public native String nativeConsumeSdkErrorJson();
+    public native void nativeUpdatePlatformState(
+            boolean hasBattery,
+            int batteryLevel,
+            boolean batteryCharging,
+            float batteryVoltage,
+            boolean hasBatteryTemperature,
+            float batteryTemperature,
+            boolean hasWifi,
+            boolean wifiConnected,
+            String wifiSsid,
+            int wifiRssi,
+            int wifiChannel,
+            String wifiIpAddress,
+            long updateTimeMs);
     private BatteryManager mBatteryManager;
     private BatteryInfo mBatteryInfo;
     private boolean isRegisterReceiver = false;
     private MediaRecorder mRecorder;
     private boolean isRecording = false;
-    private BluetoothAdapter bluetoothAdapter;
     private WifiManager mWifiManager;
     private WifiManager.LocalOnlyHotspotReservation mReservation;
     private TextToSpeech mTts;
@@ -109,6 +123,53 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     private int mSoundStorageFullStop;
     private String mDatasetRootPath;
     private String mActiveExportRoot;
+    private final Handler mBleHandler = new Handler(Looper.getMainLooper());
+    private IBleService mBleService;
+    private boolean mBleServiceBound = false;
+    private final IBleCallback mBleCallback =
+            new IBleCallback.Stub() {
+                @Override
+                public void onCommand(String command) {
+                    Log.i(TAG, "Ignoring deprecated BLE control callback payload: " + command);
+                }
+
+                @Override
+                public void onWifiConnected(String ipAddress) {
+                    Log.i(TAG, "BLE WiFi connected callback: " + ipAddress);
+                    requestPlatformStatePush();
+                }
+
+                @Override
+                public void onWifiFailed(String message) {
+                    Log.w(TAG, "BLE WiFi failed callback: " + message);
+                    requestPlatformStatePush();
+                }
+
+                @Override
+                public void onBleConnectionChanged(boolean connected) {
+                    Log.i(TAG, "BLE connection callback: " + connected);
+                    requestPlatformStatePush();
+                }
+            };
+    private final ServiceConnection mBleServiceConnection =
+            new ServiceConnection() {
+                @Override
+                public void onServiceConnected(ComponentName name, IBinder service) {
+                    mBleService = IBleService.Stub.asInterface(service);
+                    mBleServiceBound = true;
+                    Log.i(TAG, "BleService bound");
+                    registerBleCallback();
+                }
+
+                @Override
+                public void onServiceDisconnected(ComponentName name) {
+                    Log.w(TAG, "BleService disconnected");
+                    mBleService = null;
+                    mBleServiceBound = false;
+                    requestPlatformStatePush();
+                    bindBleService();
+                }
+            };
     private Handler mHandler = new Handler() {
         @Override public void handleMessage(@NonNull Message msg) {
             switch (msg.what) {
@@ -129,6 +190,179 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
                 | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                 | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    }
+
+    private void bindBleService() {
+        if (mBleServiceBound) {
+            return;
+        }
+        Intent intent = new Intent(this, BleService.class);
+        boolean bound = bindService(intent, mBleServiceConnection, Context.BIND_AUTO_CREATE);
+        Log.i(TAG, "bindBleService requested: " + bound);
+    }
+
+    private void unregisterBleCallback() {
+        if (mBleService == null) {
+            return;
+        }
+        try {
+            mBleService.unregisterCallback(mBleCallback);
+        } catch (RemoteException e) {
+            Log.w(TAG, "Failed to unregister BLE callback", e);
+        }
+    }
+
+    private void unbindBleService() {
+        unregisterBleCallback();
+        if (mBleServiceBound) {
+            unbindService(mBleServiceConnection);
+        }
+        mBleService = null;
+        mBleServiceBound = false;
+    }
+
+    private void registerBleCallback() {
+        if (mBleService == null) {
+            return;
+        }
+        try {
+            mBleService.registerCallback(mBleCallback);
+            requestPlatformStatePush();
+        } catch (RemoteException e) {
+            Log.e(TAG, "Failed to register BLE callback", e);
+        }
+    }
+
+    private void requestPlatformStatePush() {
+        mBleHandler.post(this::pushPlatformStateToNative);
+    }
+
+    private void pushPlatformStateToNative() {
+        PlatformStateSnapshot snapshot = collectPlatformStateSnapshot();
+        nativeUpdatePlatformState(
+                snapshot.hasBattery,
+                snapshot.batteryLevel,
+                snapshot.batteryCharging,
+                snapshot.batteryVoltage,
+                snapshot.hasBatteryTemperature,
+                snapshot.batteryTemperature,
+                snapshot.hasWifi,
+                snapshot.wifiConnected,
+                snapshot.wifiSsid,
+                snapshot.wifiRssi,
+                snapshot.wifiChannel,
+                snapshot.wifiIpAddress,
+                snapshot.updateTimeMs);
+    }
+
+    private PlatformStateSnapshot collectPlatformStateSnapshot() {
+        PlatformStateSnapshot snapshot = new PlatformStateSnapshot();
+        snapshot.hasBattery = mBatteryInfo != null && mBatteryInfo.hasSample();
+        snapshot.batteryLevel = mBatteryInfo != null ? mBatteryInfo.level : -1;
+        snapshot.batteryCharging =
+                mBatteryInfo != null
+                        && (mBatteryInfo.plugged != 0
+                                || mBatteryInfo.status == BatteryManager.BATTERY_STATUS_CHARGING
+                                || mBatteryInfo.status == BatteryManager.BATTERY_STATUS_FULL);
+        snapshot.batteryVoltage = mBatteryInfo != null ? mBatteryInfo.voltage / 1000.0f : 0.0f;
+        snapshot.hasBatteryTemperature =
+                mBatteryInfo != null && mBatteryInfo.temperature > 0;
+        snapshot.batteryTemperature =
+                mBatteryInfo != null ? mBatteryInfo.temperature / 10.0f : 0.0f;
+        fillWifiSnapshot(snapshot);
+        snapshot.updateTimeMs = System.currentTimeMillis();
+        return snapshot;
+    }
+
+    private void fillWifiSnapshot(PlatformStateSnapshot snapshot) {
+        snapshot.hasWifi = mWifiManager != null;
+        snapshot.wifiSsid = queryProvisionedWifiSsid();
+        snapshot.wifiIpAddress = queryProvisionedWifiIpAddress();
+        if (snapshot.wifiSsid.isEmpty() || snapshot.wifiIpAddress.isEmpty()) {
+            tryFillWifiSnapshotFromManager(snapshot);
+        }
+        snapshot.wifiConnected =
+                !snapshot.wifiSsid.isEmpty() || !snapshot.wifiIpAddress.isEmpty();
+    }
+
+    private void tryFillWifiSnapshotFromManager(PlatformStateSnapshot snapshot) {
+        if (mWifiManager == null) {
+            return;
+        }
+        try {
+            WifiInfo wifiInfo = mWifiManager.getConnectionInfo();
+            if (wifiInfo == null) {
+                return;
+            }
+            if (TextUtils.isEmpty(snapshot.wifiSsid)) {
+                snapshot.wifiSsid = sanitizeWifiSsid(wifiInfo.getSSID());
+            }
+            snapshot.wifiRssi = wifiInfo.getRssi();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                snapshot.wifiChannel = frequencyToChannel(wifiInfo.getFrequency());
+            }
+        } catch (SecurityException e) {
+            Log.w(TAG, "WiFi state access denied", e);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to read WiFi manager state", e);
+        }
+    }
+
+    private String queryProvisionedWifiSsid() {
+        if (mBleService == null) {
+            return "";
+        }
+        try {
+            return sanitizeWifiSsid(mBleService.getWifiSsid());
+        } catch (RemoteException e) {
+            Log.w(TAG, "Failed to query provisioned WiFi SSID", e);
+            return "";
+        }
+    }
+
+    private String queryProvisionedWifiIpAddress() {
+        if (mBleService == null) {
+            return "";
+        }
+        try {
+            String ipAddress = mBleService.getWifiIpAddress();
+            return ipAddress != null ? ipAddress.trim() : "";
+        } catch (RemoteException e) {
+            Log.w(TAG, "Failed to query provisioned WiFi IP", e);
+            return "";
+        }
+    }
+
+    private String sanitizeWifiSsid(String ssid) {
+        if (ssid == null) {
+            return "";
+        }
+        String trimmed = ssid.trim();
+        if (trimmed.isEmpty()
+                || "<unknown ssid>".equalsIgnoreCase(trimmed)
+                || "unknown ssid".equalsIgnoreCase(trimmed)) {
+            return "";
+        }
+        if (trimmed.length() >= 2 && trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
+            return trimmed.substring(1, trimmed.length() - 1);
+        }
+        return trimmed;
+    }
+
+    private int frequencyToChannel(int frequency) {
+        if (frequency >= 2412 && frequency <= 2484) {
+            if (frequency == 2484) {
+                return 14;
+            }
+            return (frequency - 2407) / 5;
+        }
+        if (frequency >= 5000 && frequency <= 5895) {
+            return (frequency - 5000) / 5;
+        }
+        if (frequency >= 5955 && frequency <= 7115) {
+            return (frequency - 5950) / 5;
+        }
+        return 0;
     }
 
     @Override
@@ -183,6 +417,8 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         mSoundUsbUnplugged = mSoundPool.load(this, R.raw.usb_unplug, 1);
         mSoundStorageFullStart = mSoundPool.load(this, R.raw.storage_full_start, 1);
         mSoundStorageFullStop = mSoundPool.load(this, R.raw.storage_full_stop, 1);
+        bindBleService();
+        requestPlatformStatePush();
     }
 
     private void onSvrApiInitialized() {
@@ -282,20 +518,6 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
                 super.onFailed(reason);
             }
         }, mHandler);
-    }
-
-    @SuppressLint("MissingPermission")
-    private void startPairBluetoothKeyboard() {
-        bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
-        bluetoothAdapter.startDiscovery();
-    }
-
-    @SuppressLint("MissingPermission")
-    private void pairDevice(BluetoothDevice device) {
-        bluetoothAdapter.cancelDiscovery();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-            device.createBond();
-        }
     }
 
     /**
@@ -422,22 +644,12 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             setImmersiveSticky();
         }
         super.onResume();
+        bindBleService();
+        requestPlatformStatePush();
         if (!isRegisterReceiver) {
             IntentFilter filter = new IntentFilter();
             filter.addAction(Intent.ACTION_BATTERY_CHANGED);
             registerReceiver(mBroadcastReceiver, filter);
-
-            IntentFilter btfilter = new IntentFilter();
-            btfilter.addAction(BluetoothDevice.ACTION_FOUND);
-            btfilter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
-            registerReceiver(bluetoothReceiver, btfilter);
-
-            // Register command intent receiver
-            IntentFilter cmdFilter = new IntentFilter();
-            cmdFilter.addAction(ACTION_SAVE_IMAGE);
-            cmdFilter.addAction(ACTION_START_RECORDING);
-            cmdFilter.addAction(ACTION_STOP_RECORDING);
-            ContextCompat.registerReceiver(this, mCommandReceiver, cmdFilter, ContextCompat.RECEIVER_EXPORTED);
 
             IntentFilter usbFilter = new IntentFilter();
             usbFilter.addAction(Intent.ACTION_MEDIA_MOUNTED);
@@ -455,18 +667,19 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     }
 
     @Override protected void onStop() {
+        requestPlatformStatePush();
         super.onStop();
         if (isRegisterReceiver) {
             unregisterReceiver(mBroadcastReceiver);
-            unregisterReceiver(bluetoothReceiver);
-            unregisterReceiver(mCommandReceiver);
             unregisterReceiver(mUsbReceiver);
             isRegisterReceiver = false;
         }
     }
 
     @Override protected void onDestroy() {
-        super.onDestroy();
+        pushPlatformStateToNative();
+        unbindBleService();
+        mBleHandler.removeCallbacksAndMessages(null);
         if (mSoundPool != null) {
             mSoundPool.release();
             mSoundPool = null;
@@ -480,6 +693,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             mReservation.close();
             mReservation = null;
         }
+        super.onDestroy();
     }
 
     /*
@@ -587,37 +801,6 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         }
     }
 
-    private String formatUsbDebugLine(String message) {
-        return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
-                .format(new Date()) + " " + message + "\n";
-    }
-
-    private void appendUsbProbe(File targetDir, String message) {
-        if (targetDir == null) {
-            appendUsbDebug("appendUsbProbe: target dir is null for message=" + message);
-            return;
-        }
-
-        File probeFile = new File(targetDir, USB_PROBE_LOG_NAME);
-        FileOutputStream fos = null;
-        try {
-            fos = new FileOutputStream(probeFile, true);
-            fos.write(formatUsbDebugLine(message).getBytes());
-            fos.flush();
-            appendUsbDebug("appendUsbProbe: wrote " + probeFile.getAbsolutePath());
-        } catch (IOException e) {
-            Log.w(TAG, "appendUsbProbe failed: " + probeFile.getAbsolutePath(), e);
-            appendUsbDebug("appendUsbProbe failed: " + probeFile.getAbsolutePath() + " err=" + e.getMessage());
-        } finally {
-            if (fos != null) {
-                try {
-                    fos.close();
-                } catch (IOException ignored) {
-                }
-            }
-        }
-    }
-
     private void refreshExportUsbRoot() {
         if (mDatasetRootPath == null || mDatasetRootPath.isEmpty()) {
             Log.w(TAG, "refreshExportUsbRoot: dataset root not ready");
@@ -633,23 +816,12 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             if (mActiveExportRoot == null) {
                 return;
             }
-            try {
-                nativeStopExporter();
-                mActiveExportRoot = null;
-                speak("u盘已卸载");
-                appendUsbDebug("refreshExportUsbRoot: nativeStopExporter called");
-            } catch (UnsatisfiedLinkError e) {
-                Log.w(TAG, "nativeStopExporter not implemented yet", e);
-                appendUsbDebug("refreshExportUsbRoot: nativeStopExporter missing " + e.getMessage());
-            }
+            nativeStopExporter();
+            mActiveExportRoot = null;
+            speak("u盘已卸载");
+            appendUsbDebug("refreshExportUsbRoot: nativeStopExporter called");
             return;
         }
-
-        File usbRootDir = new File(usbRoot);
-        appendUsbProbe(usbRootDir, "mounted root=" + usbRoot
-                + " exists=" + usbRootDir.exists()
-                + " canRead=" + usbRootDir.canRead()
-                + " canWrite=" + usbRootDir.canWrite());
 
         File exportRoot = new File(usbRoot, EXPORT_DIR_NAME);
         String exportRootPath = exportRoot.getAbsolutePath();
@@ -658,46 +830,27 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
                 + " exportRoot=" + exportRootPath
                 + " ready=" + exportRootReady
                 + " canWrite=" + exportRoot.canWrite());
-        appendUsbProbe(usbRootDir, "export_root path=" + exportRootPath
-                + " ready=" + exportRootReady
-                + " canWrite=" + exportRoot.canWrite());
         if (!exportRootReady) {
             Log.w(TAG, "refreshExportUsbRoot: export root is not ready " + exportRootPath);
             appendUsbDebug("refreshExportUsbRoot: export root is not ready " + exportRootPath);
             return;
         }
-        appendUsbProbe(exportRoot, "export_root_ready path=" + exportRootPath
-                + " canWrite=" + exportRoot.canWrite());
         if (exportRootPath.equals(mActiveExportRoot)) {
             appendUsbDebug("refreshExportUsbRoot: export root unchanged");
-            appendUsbProbe(exportRoot, "export_root_unchanged path=" + exportRootPath);
             return;
         }
 
         if (mActiveExportRoot != null) {
-            try {
-                nativeStopExporter();
-                appendUsbDebug("refreshExportUsbRoot: switched exporter root, stopped previous exporter");
-                appendUsbProbe(exportRoot, "stopped_previous_exporter oldRoot=" + mActiveExportRoot);
-            } catch (UnsatisfiedLinkError e) {
-                Log.w(TAG, "nativeStopExporter not implemented yet", e);
-                appendUsbDebug("refreshExportUsbRoot: nativeStopExporter missing while switching " + e.getMessage());
-            }
+            nativeStopExporter();
+            appendUsbDebug("refreshExportUsbRoot: switched exporter root, stopped previous exporter");
         }
 
         Log.i(TAG, "refreshExportUsbRoot: start exporter with " + exportRootPath);
         appendUsbDebug("refreshExportUsbRoot: preparing nativeStartExporter with " + exportRootPath);
-        appendUsbProbe(exportRoot, "before_nativeStartExporter exportRoot=" + exportRootPath);
-        try {
-            nativeStartExporter(exportRootPath);
-            mActiveExportRoot = exportRootPath;
-            speak("u盘已识别");
-            appendUsbDebug("refreshExportUsbRoot: nativeStartExporter called successfully");
-            appendUsbProbe(exportRoot, "after_nativeStartExporter exportRoot=" + exportRootPath);
-        } catch (UnsatisfiedLinkError e) {
-            Log.w(TAG, "nativeStartExporter not implemented yet", e);
-            appendUsbDebug("refreshExportUsbRoot: nativeStartExporter missing " + e.getMessage());
-        }
+        nativeStartExporter(exportRootPath);
+        mActiveExportRoot = exportRootPath;
+        speak("u盘已识别");
+        appendUsbDebug("refreshExportUsbRoot: nativeStartExporter called successfully");
     }
 
     private String findMountedUsbRoot() {
@@ -738,9 +891,6 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             appendUsbDebug("findMountedUsbRoot: mounted removable volume readable=" + directory.canRead()
                     + " writable=" + directory.canWrite()
                     + " exists=" + directory.exists());
-            appendUsbProbe(directory, "selected_usb_root path=" + directory.getAbsolutePath()
-                    + " canRead=" + directory.canRead()
-                    + " canWrite=" + directory.canWrite());
             String usbRoot = directory.getAbsolutePath();
             appendUsbDebug("findMountedUsbRoot: selected usb root=" + usbRoot);
             return usbRoot;
@@ -803,6 +953,10 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             mBatteryLevel = context.getResources().getStringArray(R.array.case_battery_level);
         }
 
+        public boolean hasSample() {
+            return present || level > 0 || voltage > 0 || temperature > 0;
+        }
+
         public String[] toArrayString() {
             String[] batteryInfo = new String[11];
             batteryInfo[0] = mBatteryTitle[0] + mBatteryStatus[status - 1];
@@ -831,6 +985,22 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         }
     }
 
+    private static class PlatformStateSnapshot {
+        boolean hasBattery;
+        int batteryLevel = -1;
+        boolean batteryCharging;
+        float batteryVoltage;
+        boolean hasBatteryTemperature;
+        float batteryTemperature;
+        boolean hasWifi;
+        boolean wifiConnected;
+        String wifiSsid = "";
+        int wifiRssi;
+        int wifiChannel;
+        String wifiIpAddress = "";
+        long updateTimeMs;
+    }
+
     private BroadcastReceiver mBroadcastReceiver = new BroadcastReceiver() {
 
         @Override
@@ -850,52 +1020,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
                     mBatteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW);
                 mBatteryInfo.technology = intent.getStringExtra("technology");
                 Log.d(TAG, Arrays.toString(mBatteryInfo.toArrayString()));
-            }
-        }
-    };
-
-    private final BroadcastReceiver bluetoothReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            String action = intent.getAction();
-            if (BluetoothDevice.ACTION_FOUND.equals(action)) {
-                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                @SuppressLint("MissingPermission") String name = device.getName();
-                @SuppressLint("MissingPermission") BluetoothClass btClass = device.getBluetoothClass();
-                if (btClass != null) {
-                    int major = btClass.getMajorDeviceClass();
-                    int deviceClass = btClass.getDeviceClass();
-                    if (major == BluetoothClass.Device.Major.PERIPHERAL) {
-                        if (deviceClass == 0x0540/*BluetoothClass.Device.PERIPHERAL_KEYBOARD*/ ||
-                            deviceClass == 0x05C0/*BluetoothClass.Device.PERIPHERAL_KEYBOARD_POINTING*/) {
-                            pairDevice(device);
-                        }
-                    }
-                }
-            }
-
-            if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(action)) {
-                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                int state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1);
-                if (state == BluetoothDevice.BOND_BONDED) {
-                }
-            }
-        }
-    };
-
-    private final BroadcastReceiver mCommandReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            String action = intent.getAction();
-            if (ACTION_SAVE_IMAGE.equals(action)) {
-                Log.i(TAG, "Intent: SAVE_IMAGE");
-                nativeRequestSnapshot();
-            } else if (ACTION_START_RECORDING.equals(action)) {
-                Log.i(TAG, "Intent: START_RECORDING");
-                nativeStartRecording();
-            } else if (ACTION_STOP_RECORDING.equals(action)) {
-                Log.i(TAG, "Intent: STOP_RECORDING");
-                nativeStopRecording();
+                requestPlatformStatePush();
             }
         }
     };

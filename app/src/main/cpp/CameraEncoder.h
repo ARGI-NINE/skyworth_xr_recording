@@ -41,14 +41,18 @@ namespace SXR {
     };
 
     // Per-frame metadata carried alongside each encoded sample.
-    // All BOOTTIME fields are converted to UTC at CSV-write time by adding
+    // callbackBootNs is captured at app-side callback entry (CLOCK_BOOTTIME, ns).
+    // BOOTTIME fields are converted to UTC at CSV-write time by adding
     // mTimeOffsetNs (BOOTTIME→REALTIME offset).
     struct FrameMeta {
+        int64_t callbackBootNs;
         int64_t midExposureBootNs;
         int64_t exposureStartBootNs;
         uint32_t exposure;
         uint32_t gain;
         uint32_t frameId;
+        int64_t utcTime;
+        int64_t bootTime;
     };
 
     // Encoder type

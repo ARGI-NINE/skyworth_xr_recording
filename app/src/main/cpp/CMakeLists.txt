@@ -97,7 +97,19 @@ target_link_libraries(qxr-app-common PRIVATE
         qxr-thirdparty-openxr
         )
 file(GLOB main_src "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+file(GLOB ble_time_sync_src "${CMAKE_CURRENT_SOURCE_DIR}/ble_time_sync/*.cpp")
+list(REMOVE_ITEM main_src
+        ${CMAKE_CURRENT_SOURCE_DIR}/BleServiceJni.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/SdkStateBridge.cpp)
+list(APPEND main_src
+        ${CMAKE_CURRENT_SOURCE_DIR}/BleServiceJni.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/SdkStateBridge.cpp
+        ${ble_time_sync_src}
+        ${CMAKE_CURRENT_SOURCE_DIR}/packet_codec.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/platform_state_bridge.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/protocol_adapter.cpp)
 add_library(mixedreality SHARED ${main_src})
+target_include_directories(mixedreality PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set(LINKED_LIBRARIES
         mixedreality
         android

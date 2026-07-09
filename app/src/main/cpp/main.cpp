@@ -73,6 +73,8 @@ namespace glext {
 #include "DatasetExporter.h"
 #include "ControllerPoseSaver.h"
 #include "NativeLogger.h"
+#include "SdkStateBridge.h"
+#include "protocol_adapter.h"
 #include <sys/system_properties.h>
 
 #define LOGI(...)                                                              \
@@ -122,6 +124,27 @@ static int64_t getAvailableBytes(const char* path) {
         return -1;
     }
     return (int64_t)stat.f_bavail * (int64_t)stat.f_frsize;
+}
+
+static void reportSdkBridgeError(const char* source,
+                                 const char* code,
+                                 const char* message,
+                                 const std::string& detail = std::string()) {
+    sdk_state_bridge::ReportError(source,
+                                  code,
+                                  message,
+                                  detail.empty() ? nullptr : detail.c_str());
+}
+
+static int64_t getCurrentUtcNs() {
+    struct timespec ts{};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+static int64_t getCurrentBootNs() {
+    struct timespec ts{};
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
 // TTS JNI bridge
@@ -1751,6 +1774,7 @@ struct CameraAccessExtension{
             rgbEncoder = nullptr;
             return;
         }
+        protocol_adapter::OnRgbEncoderReady(rgbEncoder->getCodec());
         LOGI("RGB SBS encoder initialized: %dx%d", sbsWidth, height);
     }
 
@@ -1778,6 +1802,8 @@ struct CameraAccessExtension{
         }
         const bool recordThisFrame =
             ext->encodingEnabled.load() && !ext->encodersStopped.load();
+        const int64_t startUtcTime = getCurrentUtcNs();
+        const int64_t startBootTime = getCurrentBootNs();
 
         auto t0 = std::chrono::steady_clock::now();
 
@@ -1806,7 +1832,7 @@ struct CameraAccessExtension{
             return;
         }
 
-        ext->handleRGBFrame(data, recordThisFrame);
+        ext->handleRGBFrame(data, recordThisFrame, startUtcTime, startBootTime);
 
         ext->rgbCtx.releaseCurrent();
 
@@ -1975,7 +2001,7 @@ struct CameraAccessExtension{
 
     // Handle RGB camera frame (render directly in callback, release hwBuffer immediately)
     // Caller ensures rgbCtx is current, no mutex needed
-    void handleRGBFrame(const SXR::FrameData* data, bool recordThisFrame) {
+    void handleRGBFrame(const SXR::FrameData* data, bool recordThisFrame, int64_t utcTime, int64_t bootTime) {
         // Save camera params on first frame of recording session
         saveCameraParams(data, "rgb", cameraParamsSavedRgb);
 
@@ -2135,6 +2161,8 @@ struct CameraAccessExtension{
                 fm.gain                = data->frames[0].gain;
                 fm.frameId             = data->frames[0].frameId;
                 fm.midExposureBootNs   = midExposureNs;
+                fm.utcTime             = utcTime;
+                fm.bootTime            = bootTime;
                 rgbEncoder->submitFrameMeta(fm);
             }
             rgbEncoderSurface->swapBuffers();
@@ -2787,6 +2815,7 @@ struct CameraAccessExtension{
         stopInProgress = true;
         // Set flag first to prevent camera thread from entering SBS block
         encodersStopped = true;
+        protocol_adapter::OnRecordingSessionStopped();
         LOGI("stopEncoder: setting encodersStopped=true");
 
         {
@@ -2940,6 +2969,7 @@ struct CameraAccessExtension{
         return xrTime;
     }
 };
+
 /**
  * Shared state for our app.
  */
@@ -3035,6 +3065,57 @@ struct engine : public AppCommon::base_engine {
     {
     }
 };
+
+static bool FillSdkStateSnapshot(sdk_state_bridge::StateSnapshot* out) {
+    if (out == nullptr || g_engine == nullptr) {
+        return false;
+    }
+
+    auto& camera = g_engine->mCameraAccessExtension;
+    out->engineAvailable = true;
+    out->isRecording = g_engine->mDatasetRecorder.isRecording();
+    out->stopInProgress = camera.stopInProgress.load();
+    out->encodingEnabled = camera.encodingEnabled.load();
+    out->encodersStopped = camera.encodersStopped.load();
+    out->autoStopRequested = g_engine->autoStopRequested.load();
+    out->useControllerMode = g_engine->useControllerMode;
+    out->cameraContextAvailable = camera.cameraContext != nullptr;
+    const bool canQueryCameraGroups =
+        out->cameraContextAvailable &&
+        sxr_camera_api_is_valid(&camera.api) &&
+        camera.api.is_group_open != nullptr;
+    out->cameraRgbOpen =
+        canQueryCameraGroups &&
+        sxr_camera_is_group_open(&camera.api, camera.cameraContext, SXR::CameraGroup::RGB);
+    out->cameraTrackingOpen =
+        canQueryCameraGroups &&
+        sxr_camera_is_group_open(&camera.api, camera.cameraContext, SXR::CameraGroup::TRACKING);
+    out->cameraCtrlOpen =
+        canQueryCameraGroups &&
+        sxr_camera_is_group_open(&camera.api, camera.cameraContext, SXR::CameraGroup::CTRL);
+    out->rgbFrameReady = camera.rgbFrameReady.load();
+    out->trackingFrameReady = camera.trackingFrameReady.load();
+    out->ctrlFrameReady = camera.ctrlFrameReady.load();
+    out->imuRunning = g_engine->mDatasetRecorder.isImuRunning();
+    out->imuFinished = g_engine->mDatasetRecorder.isImuFinished();
+    out->micRunning = g_engine->mDatasetRecorder.isMicRunning();
+    out->micFinished = g_engine->mDatasetRecorder.isMicFinished();
+    out->storageThresholdBytes = MIN_FREE_BYTES;
+    out->storageAvailableBytes = getAvailableBytes(storagePath);
+    out->storageKnown = out->storageAvailableBytes >= 0;
+    out->storageLow = out->storageKnown &&
+                      out->storageAvailableBytes < out->storageThresholdBytes;
+
+    if (out->stopInProgress) {
+        out->captureState = "finalizing";
+    } else if (out->isRecording) {
+        out->captureState = "recording";
+    } else {
+        out->captureState = "idle";
+    }
+
+    return true;
+}
 
 // Save aligned head pose and hand tracking data with the RGB frame timestamp.
 // Called from CameraAccessExtension::handleRGBFrame (camera callback thread).
@@ -3565,71 +3646,98 @@ static void stopRecordingAsync(struct engine* e, const char* reason, const char*
     }).detach();
 }
 
+static bool waitForRecordingStopDrain(struct engine* e, const char* startSource) {
+    int waitCount = 0;
+    while (e->mCameraAccessExtension.stopInProgress.load() ||
+           e->mDatasetRecorder.isRecording()) {
+        usleep(10000); // 10ms
+        if (++waitCount % 100 == 0) {
+            LOGW("%s: waiting for stopEncoder (%d ms)", startSource, waitCount * 10);
+        }
+        if (waitCount > 300) {
+            LOGE("%s: timed out waiting for stopEncoder", startSource);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool startDatasetRecordingSession(struct engine* e,
+                                         const char* startSource,
+                                         const char* startLogMessage) {
+    if (e == nullptr || e->mDatasetRecorder.isRecording()) {
+        return false;
+    }
+
+    // Storage guard: refuse to start below 1 GiB free.
+    int64_t avail = getAvailableBytes(storagePath);
+    if (avail >= 0 && avail < MIN_FREE_BYTES) {
+        LOGW("%s: insufficient storage (%lld bytes free)", startSource, (long long)avail);
+        ttsSpeak("存储空间已满，无法录制");
+        return false;
+    }
+
+    if (!waitForRecordingStopDrain(e, startSource)) {
+        return false;
+    }
+
+    LOGI("%s", startLogMessage);
+    if (!e->mDatasetRecorder.start()) {
+        LOGE("%s: DatasetRecorder::start failed", startSource);
+        return false;
+    }
+    protocol_adapter::OnRecordingSessionStarted();
+    e->recordingStartTime = std::chrono::steady_clock::now();
+    e->autoStopRequested = false;
+    e->mCameraAccessExtension.encoderBaseDir = e->mDatasetRecorder.getDatasetDir();
+    // IMU calibration sidecar (device-global; no camera context needed)
+    {
+        auto& ext = e->mCameraAccessExtension;
+        if (sxr_camera_api_is_valid(&ext.api) && ext.api.get_imu_calibration) {
+            SXR::SxrImuCalibration calib{};
+            if (sxr_camera_get_imu_calibration(&ext.api, &calib) == 0 && calib.valid) {
+                ext.saveImuCalibration(ext.encoderBaseDir + "/imu_calibration.json", calib);
+            } else {
+                LOGW("IMU calibration unavailable; imu_calibration.json not written");
+            }
+        }
+    }
+    e->mCameraAccessExtension.encodingEnabled = true;
+    e->mCameraAccessExtension.encodersStopped = false;
+    e->mCameraAccessExtension.cameraParamsSavedRgb = false;
+    e->mCameraAccessExtension.cameraParamsSavedTracking = false;
+    e->mCameraAccessExtension.cameraParamsSavedCtrl = false;
+    {
+        std::lock_guard<std::mutex> lock(e->alignedSnapshot.mutex);
+        e->alignedSnapshot.headPose.valid = false;
+        e->alignedSnapshot.leftHand.active = false;
+        e->alignedSnapshot.rightHand.active = false;
+        e->alignedSnapshot.rgbFrameCount = 0;
+    }
+    e->poseHandRing.clear();
+    e->controllerPoseRing.clear();
+    // Propagate BOOTTIME→REALTIME offset to non-lazy-init components
+    e->propagateTimeOffset();
+    if (e->useControllerMode) {
+        e->mControllerPoseSaver.StartSession(
+            e->mDatasetRecorder.getControllerPoseCsvPath());
+    } else {
+        e->mHandTrackerLogic.rawDateSave->StartNewSession(
+            e->mDatasetRecorder.getHandTrackingCsvPath());
+        e->mDatasetRecorder.writeCaptureStatusJson(
+            "recording", e->mHandTrackerLogic.rawDateSave);
+    }
+    ttsSpeak("开始录制");
+    return true;
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartRecording(JNIEnv *env, jobject thiz) {
     if (g_engine && !g_engine->mDatasetRecorder.isRecording()) {
-        // Storage guard: refuse to start below 1 GiB free.
-        int64_t avail = getAvailableBytes(storagePath);
-        if (avail >= 0 && avail < MIN_FREE_BYTES) {
-            LOGW("nativeStartRecording: insufficient storage (%lld bytes free)", (long long)avail);
-            ttsSpeak("存储空间已满，无法录制");
-            return;
-        }
-        // Wait for any async stop (encoder + recorder) to complete before starting
-        int waitCount = 0;
-        while (g_engine->mCameraAccessExtension.stopInProgress.load() ||
-               g_engine->mDatasetRecorder.isRecording()) {
-            usleep(10000); // 10ms
-            if (++waitCount % 100 == 0) {
-                LOGW("nativeStartRecording: waiting for stopEncoder to finish (%d ms)", waitCount * 10);
-            }
-            if (waitCount > 300) { // 3s timeout
-                LOGE("nativeStartRecording: timed out waiting for stopEncoder");
-                return;
-            }
-        }
-        LOGI("Start recording via intent");
-        g_engine->recordingStartTime = std::chrono::steady_clock::now();
-        g_engine->autoStopRequested = false;
-        g_engine->mDatasetRecorder.start();
-        g_engine->mCameraAccessExtension.encoderBaseDir = g_engine->mDatasetRecorder.getDatasetDir();
-        // IMU calibration sidecar (device-global; no camera context needed)
-        {
-            auto& ext = g_engine->mCameraAccessExtension;
-            if (sxr_camera_api_is_valid(&ext.api) && ext.api.get_imu_calibration) {
-                SXR::SxrImuCalibration calib{};
-                if (sxr_camera_get_imu_calibration(&ext.api, &calib) == 0 && calib.valid) {
-                    ext.saveImuCalibration(ext.encoderBaseDir + "/imu_calibration.json", calib);
-                } else {
-                    LOGW("IMU calibration unavailable; imu_calibration.json not written");
-                }
-            }
-        }
-        g_engine->mCameraAccessExtension.encodingEnabled = true;
-        g_engine->mCameraAccessExtension.encodersStopped = false;
-        g_engine->mCameraAccessExtension.cameraParamsSavedRgb = false;
-        g_engine->mCameraAccessExtension.cameraParamsSavedTracking = false;
-        g_engine->mCameraAccessExtension.cameraParamsSavedCtrl = false;
-        {
-            std::lock_guard<std::mutex> lock(g_engine->alignedSnapshot.mutex);
-            g_engine->alignedSnapshot.headPose.valid = false;
-            g_engine->alignedSnapshot.leftHand.active = false;
-            g_engine->alignedSnapshot.rightHand.active = false;
-            g_engine->alignedSnapshot.rgbFrameCount = 0;
-        }
-        g_engine->controllerPoseRing.clear();
-        // Propagate BOOTTIME→REALTIME offset to non-lazy-init components
-        g_engine->propagateTimeOffset();
-        if (g_engine->useControllerMode) {
-            g_engine->mControllerPoseSaver.StartSession(
-                g_engine->mDatasetRecorder.getControllerPoseCsvPath());
-        } else {
-            g_engine->mHandTrackerLogic.rawDateSave->StartNewSession(
-                g_engine->mDatasetRecorder.getHandTrackingCsvPath());
-            g_engine->mDatasetRecorder.writeCaptureStatusJson(
-                "recording", g_engine->mHandTrackerLogic.rawDateSave);
-        }
-        ttsSpeak("开始录制");
+        startDatasetRecordingSession(
+            g_engine,
+            "nativeStartRecording",
+            "Start recording via intent");
     }
 }
 
@@ -5090,6 +5198,7 @@ void android_main(struct android_app *state)
     engine_init_openxr(&engine);
     engine.mCameraAccessExtension.initTimeConversion();
     engine.mDatasetRecorder.init(storagePath);
+    sdk_state_bridge::RegisterStateProvider(&FillSdkStateSnapshot);
 
     // Initialize cameras using new callback-based API
     JavaVM* vm = engine.app->activity->vm;
@@ -5103,11 +5212,15 @@ void android_main(struct android_app *state)
         g_activity = ttsEnv->NewGlobalRef(activity);
     }
     NativeLoggerInit(storagePath);
+    protocol_adapter::Start(storagePath);
 
     if (engine.mCameraAccessExtension.initCameras(vm, activity)) {
         LOGI("All cameras initialized successfully");
     } else {
         LOGE("Failed to initialize cameras");
+        reportSdkBridgeError("camera",
+                             "camera_init_failed",
+                             "CameraAccessExtension::initCameras() failed");
     }
 
     // Start image saver worker thread
@@ -5363,67 +5476,12 @@ void android_main(struct android_app *state)
             if (engine.mDatasetRecorder.isRecording()) {
                 stopRecordingAsync(&engine, "right B", "录制已保存");
             } else {
-                // Storage guard: refuse to start below 1 GiB free.
-                int64_t avail = getAvailableBytes(storagePath);
-                if (avail >= 0 && avail < MIN_FREE_BYTES) {
-                    LOGW("Right B start: insufficient storage (%lld bytes free)", (long long)avail);
-                    ttsSpeak("存储空间已满，无法录制");
-                } else {
-                    // Wait for any async stop (encoder + recorder) to complete before starting
-                    int waitCount = 0;
-                    while (engine.mCameraAccessExtension.stopInProgress.load() ||
-                           engine.mDatasetRecorder.isRecording()) {
-                        usleep(10000); // 10ms
-                        if (++waitCount % 100 == 0) {
-                            LOGW("Right B start: waiting for stopEncoder (%d ms)", waitCount * 10);
-                        }
-                        if (waitCount > 300) {
-                            break; // 3s timeout
-                        }
-                    }
-                    LOGI("Starting dataset recording (right B)...");
-                    engine.recordingStartTime = std::chrono::steady_clock::now();
-                    engine.autoStopRequested = false;
-                    engine.mDatasetRecorder.start();
-                    engine.mCameraAccessExtension.encoderBaseDir = engine.mDatasetRecorder.getDatasetDir();
-                    // IMU calibration sidecar (device-global; no camera context needed)
-                    {
-                        auto& ext = engine.mCameraAccessExtension;
-                        if (sxr_camera_api_is_valid(&ext.api) && ext.api.get_imu_calibration) {
-                            SXR::SxrImuCalibration calib{};
-                            if (sxr_camera_get_imu_calibration(&ext.api, &calib) == 0 && calib.valid) {
-                                ext.saveImuCalibration(ext.encoderBaseDir + "/imu_calibration.json", calib);
-                            } else {
-                                LOGW("IMU calibration unavailable; imu_calibration.json not written");
-                            }
-                        }
-                    }
-                    engine.mCameraAccessExtension.encodingEnabled = true;
-                    engine.mCameraAccessExtension.encodersStopped = false;
-                    engine.mCameraAccessExtension.cameraParamsSavedRgb = false;
-                    engine.mCameraAccessExtension.cameraParamsSavedTracking = false;
-                    engine.mCameraAccessExtension.cameraParamsSavedCtrl = false;
-                    {
-                        std::lock_guard<std::mutex> lock(engine.alignedSnapshot.mutex);
-                        engine.alignedSnapshot.headPose.valid = false;
-                        engine.alignedSnapshot.leftHand.active = false;
-                        engine.alignedSnapshot.rightHand.active = false;
-                        engine.alignedSnapshot.rgbFrameCount = 0;
-                    }
-                    engine.poseHandRing.clear();
-                    engine.controllerPoseRing.clear();
-                    // Propagate BOOTTIME→REALTIME offset to non-lazy-init components
-                    engine.propagateTimeOffset();
-                    if (engine.useControllerMode) {
-                        engine.mControllerPoseSaver.StartSession(
-                            engine.mDatasetRecorder.getControllerPoseCsvPath());
-                    } else {
-                        engine.mHandTrackerLogic.rawDateSave->StartNewSession(
-                            engine.mDatasetRecorder.getHandTrackingCsvPath());
-                        engine.mDatasetRecorder.writeCaptureStatusJson(
-                            "recording", engine.mHandTrackerLogic.rawDateSave);
-                    }
-                    ttsSpeak("开始录制");
+                if (!startDatasetRecordingSession(
+                        &engine,
+                        "Right B start",
+                        "Starting dataset recording (right B)...")) {
+                    engine.prevRecordingToggle = curToggle;
+                    continue;
                 }
             }
         }
@@ -5603,6 +5661,7 @@ cleanup:
 
     // Stop image saver worker thread
     ImageSaver::Instance().shutdown();
+    protocol_adapter::Stop();
     NativeLoggerShutdown();
 
     // Release JNI global reference

@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package egocollect;
+
+option java_package = "com.ssnwt.helloxr.protocol";
+option java_multiple_files = true;
+
+message Packet {
+  uint32 seq = 1;
+  uint64 timestamp_ms = 2;
+  uint32 version = 3;
+
+  oneof payload {
+    Command command = 10;
+    Status status = 20;
+    Response response = 30;
+    Event event = 40;
+  }
+}
+
+message Command {
+  CommandType cmd = 1;
+  map<string, string> params = 10;
+
+  enum CommandType {
+    CMD_UNSPECIFIED = 0;
+    CMD_START_COLLECT = 1;
+    CMD_STOP_COLLECT = 2;
+    CMD_START_VIDEO = 3;
+    CMD_STOP_VIDEO = 4;
+    CMD_HEARTBEAT = 5;
+    CMD_GET_PARAM = 10;
+    CMD_SET_PARAM = 11;
+    CMD_REBOOT = 20;
+    // Legacy values kept only for wire compatibility. Not part of the current
+    // PROTOCOL.md command surface.
+    CMD_FACTORY_RESET = 21 [deprecated = true];
+    CMD_OTA_START = 30 [deprecated = true];
+    CMD_OTA_DATA = 31 [deprecated = true];
+    CMD_OTA_END = 32 [deprecated = true];
+  }
+}
+
+message Status {
+  BatteryInfo battery = 1;
+  WifiInfo wifi = 2;
+  DeviceState state = 3;
+  StorageInfo storage = 4;
+  repeated PeripheralState peripherals = 10;
+}
+
+message BatteryInfo {
+  uint32 level = 1;
+  bool charging = 2;
+  float voltage = 3;
+  optional float temperature = 4;
+}
+
+message WifiInfo {
+  int32 rssi = 1;
+  string ssid = 2;
+  uint32 channel = 3;
+}
+
+message DeviceState {
+  DeviceWorkingState working = 1;
+
+  enum DeviceWorkingState {
+    IDLE = 0;
+    COLLECTING = 1;
+    UPLOADING = 2;
+    SLEEPING = 3;
+    FAULT = 4;
+  }
+}
+
+message StorageInfo {
+  uint64 total_bytes = 1;
+  uint64 free_bytes = 2;
+}
+
+message PeripheralState {
+  string name = 1;
+  bool connected = 2;
+  bool healthy = 3;
+}
+
+message Event {
+  oneof event {
+    FaultEvent fault = 1;
+    FaultCleared fault_cleared = 2;
+    ConnectionStateChanged connection_changed = 3;
+  }
+}
+
+message FaultEvent {
+  string code = 1;
+  string desc = 2;
+  FaultLevel level = 3;
+  uint64 raise_time_ms = 4;
+
+  enum FaultLevel {
+    INFO = 0;
+    WARN = 1;
+    ERROR = 2;
+    FATAL = 3;
+  }
+}
+
+message FaultCleared {
+  string code = 1;
+}
+
+message ConnectionStateChanged {
+  ConnectionState state = 1;
+
+  enum ConnectionState {
+    DISCONNECTED = 0;
+    CONNECTING = 1;
+    CONNECTED = 2;
+    RECONNECTING = 3;
+  }
+}
+
+message Response {
+  uint32 req_seq = 1;
+  ResultCode code = 2;
+  string message = 3;
+  map<string, string> data = 10;
+
+  enum ResultCode {
+    OK = 0;
+    ERR_UNKNOWN_CMD = 100;
+    ERR_INVALID_PARAM = 101;
+    ERR_DEVICE_BUSY = 102;
+    ERR_STORAGE_FULL = 200;
+    ERR_WIFI_DISCONNECTED = 300;
+    ERR_CAMERA_FAILED = 400;
+    ERR_MICROPHONE_FAILED = 401;
+    ERR_INTERNAL = 500;
+    // Legacy value kept only for wire compatibility. Not part of the current
+    // PROTOCOL.md result-code surface.
+    ERR_OTA_CHECK_FAILED = 501 [deprecated = true];
+  }
+}

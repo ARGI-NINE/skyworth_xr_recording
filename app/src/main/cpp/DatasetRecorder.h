@@ -39,6 +39,10 @@ public:
 
     // Get BOOTTIME→REALTIME offset captured at recording start
     int64_t getTimeOffset() const { return mBoottimeToRealtimeOffsetNs; }
+    bool isImuRunning() const { return mImuCollector.isRunning(); }
+    bool isImuFinished() const { return mImuCollector.isFinished(); }
+    bool isMicRunning() const { return mAudioEncoder.isRecording(); }
+    bool isMicFinished() const { return mAudioEncoder.isFinished(); }
 
     // Save head pose from render thread (async, non-blocking)
     void saveHeadPose(int64_t boottimeNs, const XrPosef& pose);

@@ -412,8 +412,8 @@ namespace SXR {
                     // exactly). The UTC columns stay absolute: they come from
                     // FrameMeta (midExposureBoot/exposureStartBoot) plus the
                     // BOOTTIME→REALTIME offset, independent of the muxer PTS.
-                    const int64_t startUtc = fm.exposureStartBootNs + mTimeOffsetNs;
-                    const int64_t midUtc   = fm.midExposureBootNs  + mTimeOffsetNs;
+                    const int64_t startUtc = fm.utcTime;
+                    const int64_t midUtc = fm.bootTime + mTimeOffsetNs;
                     fprintf(mMetaFile, "%llu,%u,%lld,%lld,%u,%u,%lld\n",
                             (unsigned long long)mFrameIndex, fm.frameId,
                             (long long)ptsRel,
