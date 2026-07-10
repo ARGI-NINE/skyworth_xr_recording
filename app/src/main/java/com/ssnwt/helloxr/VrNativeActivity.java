@@ -72,8 +72,11 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     public static final String ASSETS_SUB_FOLDER_NAME = "raw";
     public static final int BUFFER_SIZE = 1024;
 
+    public static final String ACTION_SAVE_IMAGE = "com.ssnwt.helloxr.SAVE_IMAGE";
     public static final String ACTION_MEDIA_MOUNTED_CUSTOM = "com.ssnwt.action.MEDIA_MOUNTED";
     public static final String ACTION_MEDIA_EJECT_CUSTOM = "com.ssnwt.action.MEDIA_EJECT";
+    public static final String ACTION_START_RECORDING = "com.ssnwt.helloxr.START_RECORDING";
+    public static final String ACTION_STOP_RECORDING = "com.ssnwt.helloxr.STOP_RECORDING";
     private static final String EXPORT_DIR_NAME = "Export";
     private static final String USB_DEBUG_LOG_NAME = "usb_debug.log";
 
@@ -649,7 +652,10 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         if (!isRegisterReceiver) {
             IntentFilter filter = new IntentFilter();
             filter.addAction(Intent.ACTION_BATTERY_CHANGED);
-            registerReceiver(mBroadcastReceiver, filter);
+            filter.addAction(ACTION_SAVE_IMAGE);
+            filter.addAction(ACTION_START_RECORDING);
+            filter.addAction(ACTION_STOP_RECORDING);
+            registerAppReceiver(mBroadcastReceiver, filter);
 
             IntentFilter usbFilter = new IntentFilter();
             usbFilter.addAction(Intent.ACTION_MEDIA_MOUNTED);
@@ -657,7 +663,7 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             usbFilter.addAction(ACTION_MEDIA_MOUNTED_CUSTOM);
             usbFilter.addAction(ACTION_MEDIA_EJECT_CUSTOM);
             usbFilter.addDataScheme("file");
-            registerReceiver(mUsbReceiver, usbFilter);
+            registerAppReceiver(mUsbReceiver, usbFilter);
 
             appendUsbDebug("onResume: USB receiver registered");
             refreshExportUsbRoot();
@@ -735,6 +741,14 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         int read;
         while ((read = in.read(buffer)) != -1) {
             out.write(buffer, 0, read);
+        }
+    }
+
+    private void registerAppReceiver(BroadcastReceiver receiver, IntentFilter filter) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+        } else {
+            registerReceiver(receiver, filter);
         }
     }
 
@@ -1005,7 +1019,8 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
 
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (Intent.ACTION_BATTERY_CHANGED.equals(intent.getAction())) {
+            String action = intent.getAction();
+            if (Intent.ACTION_BATTERY_CHANGED.equals(action)) {
                 mBatteryInfo.status = intent.getIntExtra("status", 0);
                 mBatteryInfo.plugged = intent.getIntExtra("plugged", 0);
                 mBatteryInfo.health = intent.getIntExtra("health", 0);
@@ -1021,6 +1036,15 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
                 mBatteryInfo.technology = intent.getStringExtra("technology");
                 Log.d(TAG, Arrays.toString(mBatteryInfo.toArrayString()));
                 requestPlatformStatePush();
+            } else if (ACTION_SAVE_IMAGE.equals(action)) {
+                Log.i(TAG, "Remote broadcast save image");
+                nativeRequestSnapshot();
+            } else if (ACTION_START_RECORDING.equals(action)) {
+                Log.i(TAG, "Remote broadcast start recording");
+                nativeStartRecording();
+            } else if (ACTION_STOP_RECORDING.equals(action)) {
+                Log.i(TAG, "Remote broadcast stop recording");
+                nativeStopRecording();
             }
         }
     };
