@@ -26,6 +26,7 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
     private BleAidlImpl bleAidlImpl;
     private BleServerManager bleServerManager;
     private WifiConnector wifiConnector;
+    private HotspotManager hotspotManager;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private long timeSyncHandle = 0L;
 
@@ -139,6 +140,8 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
         Log.i(TAG, "BleService onCreate");
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, buildNotification());
+        hotspotManager = new HotspotManager(getApplication());
+        hotspotManager.start();
         wifiConnector = new WifiConnector(this);
         bleServerManager = new BleServerManager(this);
         bleServerManager.setOnControlChannelReadyListener(this::onControlChannelReady);
@@ -151,6 +154,10 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
     @Override
     public void onDestroy() {
         Log.i(TAG, "BleService onDestroy");
+        if (hotspotManager != null) {
+            hotspotManager.stop();
+            hotspotManager = null;
+        }
         mainHandler.removeCallbacksAndMessages(null);
         if (wifiConnector != null) {
             wifiConnector.disconnect();
@@ -176,6 +183,9 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.i(TAG, "BleService onStartCommand");
+        if (hotspotManager != null) {
+            hotspotManager.start();
+        }
         if (bleServerManager != null && !bleServerManager.isDeviceConnected()) {
             startBleAdvertising();
         }

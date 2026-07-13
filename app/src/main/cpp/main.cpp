@@ -3646,6 +3646,44 @@ static void stopRecordingAsync(struct engine* e, const char* reason, const char*
     }).detach();
 }
 
+extern "C" bool RequestDeviceReboot() {
+    if (!g_javaVm || !g_activity) {
+        LOGE("Device reboot unavailable: JVM/activity not set");
+        return false;
+    }
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    int result = g_javaVm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (result != JNI_OK) {
+        result = g_javaVm->AttachCurrentThread(&env, nullptr);
+        if (result != JNI_OK) {
+            LOGE("Failed to attach protocol thread for device reboot");
+            return false;
+        }
+        attached = true;
+    }
+
+    bool scheduled = false;
+    jclass activityClass = env->GetObjectClass(g_activity);
+    if (activityClass != nullptr) {
+        jmethodID method = env->GetMethodID(activityClass, "requestDeviceReboot", "()Z");
+        if (method != nullptr) {
+            scheduled = env->CallBooleanMethod(g_activity, method) == JNI_TRUE &&
+                        !env->ExceptionCheck();
+        }
+        env->DeleteLocalRef(activityClass);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    if (attached) {
+        g_javaVm->DetachCurrentThread();
+    }
+    return scheduled;
+}
+
 static bool waitForRecordingStopDrain(struct engine* e, const char* startSource) {
     int waitCount = 0;
     while (e->mCameraAccessExtension.stopInProgress.load() ||

@@ -31,6 +31,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.Message;
+import android.os.PowerManager;
 import android.os.RemoteException;
 import android.os.storage.StorageManager;
 import android.os.storage.StorageVolume;
@@ -44,6 +45,7 @@ import android.view.WindowManager;
 import androidx.annotation.NonNull;
 import androidx.core.app.ActivityCompat;
 import com.ssnwt.helloxr.ble.BleService;
+import com.ssnwt.helloxr.ble.WifiConnector;
 import com.ssnwt.vr.androidmanager.AndroidInterface;
 import com.ssnwt.vr.androidmanager.SystemEventUtils;
 import java.io.File;
@@ -95,6 +97,8 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             float batteryVoltage,
             boolean hasBatteryTemperature,
             float batteryTemperature,
+            boolean hasThermalStatus,
+            int thermalStatus,
             boolean hasWifi,
             boolean wifiConnected,
             String wifiSsid,
@@ -108,6 +112,15 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     private MediaRecorder mRecorder;
     private boolean isRecording = false;
     private WifiManager mWifiManager;
+    private PowerManager mPowerManager;
+    private boolean mHasThermalStatus;
+    private int mThermalStatus = PowerManager.THERMAL_STATUS_NONE;
+    private final PowerManager.OnThermalStatusChangedListener mThermalStatusListener =
+            status -> {
+                mHasThermalStatus = true;
+                mThermalStatus = status;
+                requestPlatformStatePush();
+            };
     private WifiManager.LocalOnlyHotspotReservation mReservation;
     private TextToSpeech mTts;
     private boolean mTtsReady = false;
@@ -249,6 +262,8 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
                 snapshot.batteryVoltage,
                 snapshot.hasBatteryTemperature,
                 snapshot.batteryTemperature,
+                snapshot.hasThermalStatus,
+                snapshot.thermalStatus,
                 snapshot.hasWifi,
                 snapshot.wifiConnected,
                 snapshot.wifiSsid,
@@ -272,6 +287,8 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
                 mBatteryInfo != null && mBatteryInfo.temperature > 0;
         snapshot.batteryTemperature =
                 mBatteryInfo != null ? mBatteryInfo.temperature / 10.0f : 0.0f;
+        snapshot.hasThermalStatus = mHasThermalStatus;
+        snapshot.thermalStatus = mThermalStatus;
         fillWifiSnapshot(snapshot);
         snapshot.updateTimeMs = System.currentTimeMillis();
         return snapshot;
@@ -280,12 +297,11 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     private void fillWifiSnapshot(PlatformStateSnapshot snapshot) {
         snapshot.hasWifi = mWifiManager != null;
         snapshot.wifiSsid = queryProvisionedWifiSsid();
-        snapshot.wifiIpAddress = queryProvisionedWifiIpAddress();
-        if (snapshot.wifiSsid.isEmpty() || snapshot.wifiIpAddress.isEmpty()) {
+        snapshot.wifiIpAddress = WifiConnector.queryStaIpAddress(this);
+        if (snapshot.wifiSsid.isEmpty()) {
             tryFillWifiSnapshotFromManager(snapshot);
         }
-        snapshot.wifiConnected =
-                !snapshot.wifiSsid.isEmpty() || !snapshot.wifiIpAddress.isEmpty();
+        snapshot.wifiConnected = !snapshot.wifiIpAddress.isEmpty();
     }
 
     private void tryFillWifiSnapshotFromManager(PlatformStateSnapshot snapshot) {
@@ -319,19 +335,6 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             return sanitizeWifiSsid(mBleService.getWifiSsid());
         } catch (RemoteException e) {
             Log.w(TAG, "Failed to query provisioned WiFi SSID", e);
-            return "";
-        }
-    }
-
-    private String queryProvisionedWifiIpAddress() {
-        if (mBleService == null) {
-            return "";
-        }
-        try {
-            String ipAddress = mBleService.getWifiIpAddress();
-            return ipAddress != null ? ipAddress.trim() : "";
-        } catch (RemoteException e) {
-            Log.w(TAG, "Failed to query provisioned WiFi IP", e);
             return "";
         }
     }
@@ -399,6 +402,12 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         mBatteryInfo.init(this);
 
         mWifiManager = (WifiManager) getSystemService(Context.WIFI_SERVICE);
+        mPowerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (mPowerManager != null) {
+            mThermalStatus = mPowerManager.getCurrentThermalStatus();
+            mHasThermalStatus = true;
+            mPowerManager.addThermalStatusListener(mThermalStatusListener);
+        }
 
         // Initialize TTS (optional, may not be available on device)
         mTts = new TextToSpeech(this, this);
@@ -482,6 +491,24 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         } else {
             Log.w(TAG, "No audio for: " + text);
         }
+    }
+
+    public boolean requestDeviceReboot() {
+        if (!AndroidInterface.getInstance().isInitialized()
+                || AndroidInterface.getInstance().getDeviceUtils() == null) {
+            Log.e(TAG, "Device reboot unavailable: SVR AndroidInterface is not ready");
+            return false;
+        }
+        mBleHandler.postDelayed(
+                () -> {
+                    try {
+                        AndroidInterface.getInstance().getDeviceUtils().reboot();
+                    } catch (Exception e) {
+                        Log.e(TAG, "Device reboot failed", e);
+                    }
+                },
+                500L);
+        return true;
     }
 
     private void initSvrApi() {
@@ -684,6 +711,9 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
 
     @Override protected void onDestroy() {
         pushPlatformStateToNative();
+        if (mPowerManager != null) {
+            mPowerManager.removeThermalStatusListener(mThermalStatusListener);
+        }
         unbindBleService();
         mBleHandler.removeCallbacksAndMessages(null);
         if (mSoundPool != null) {
@@ -1006,6 +1036,8 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         float batteryVoltage;
         boolean hasBatteryTemperature;
         float batteryTemperature;
+        boolean hasThermalStatus;
+        int thermalStatus;
         boolean hasWifi;
         boolean wifiConnected;
         String wifiSsid = "";

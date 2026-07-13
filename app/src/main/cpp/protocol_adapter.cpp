@@ -45,6 +45,7 @@ constexpr uint16_t kVideoPort = 8802;
 constexpr int kAcceptPollTimeoutMs = 1000;
 constexpr int kControlStatusIntervalMs = 1000;
 constexpr int kFaultPollIntervalMs = 250;
+constexpr int32_t kThermalStatusSevere = 3;
 constexpr std::size_t kControlReadBufferBytes = 4096;
 constexpr std::size_t kMaxVideoQueueFrames = 24;
 
@@ -58,6 +59,7 @@ extern "C" void Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartRecording(
 extern "C" void Java_com_ssnwt_helloxr_VrNativeActivity_nativeStopRecording(
         JNIEnv* env,
         jobject thiz);
+extern "C" bool RequestDeviceReboot();
 
 int64_t CurrentRealtimeMs() {
     timespec ts{};
@@ -275,6 +277,8 @@ public:
         sessionPhase_ = "idle";
         sessionStatus_ = "idle";
         lastSampleIndex_ = -1;
+        nextSampleIndex_ = 0U;
+        syncSampleCount_ = 0U;
         status_.state = State::kRunning;
         NATIVE_LOGI(kLogTag,
                     "event=custom_ntp_server_started role=server transport=tcp_control_json");
@@ -294,6 +298,8 @@ public:
         sessionPhase_ = "idle";
         sessionStatus_ = "idle";
         lastSampleIndex_ = -1;
+        nextSampleIndex_ = 0U;
+        syncSampleCount_ = 0U;
     }
 
     Status GetStatus() const {
@@ -308,11 +314,18 @@ public:
         sessionPhase_ = "idle";
         sessionStatus_ = "idle";
         lastSampleIndex_ = -1;
+        nextSampleIndex_ = 0U;
+        syncSampleCount_ = 0U;
     }
 
     bool HandleJsonMessage(const std::string& requestJson, std::string* responseJson) {
         if (responseJson == nullptr) {
             return false;
+        }
+        if (GetStatus().state != State::kRunning) {
+            *responseJson =
+                    BuildSessionStatusJson("query", "failed", "ntp_server_not_running");
+            return true;
         }
 
         std::string type;
@@ -574,6 +587,8 @@ private:
         sessionPhase_ = "sync";
         sessionStatus_ = "started";
         lastSampleIndex_ = -1;
+        nextSampleIndex_ = 0U;
+        syncSampleCount_ = 0U;
         return BuildSessionStatusJsonLocked("sync", "started", std::string());
     }
 
@@ -590,6 +605,8 @@ private:
         sessionPhase_ = "idle";
         sessionStatus_ = "cancelled";
         lastSampleIndex_ = -1;
+        nextSampleIndex_ = 0U;
+        syncSampleCount_ = 0U;
         return BuildSessionStatusJsonLocked("sync", "cancelled", std::string());
     }
 
@@ -605,12 +622,43 @@ private:
         if (phase != "sync" && phase != "verify") {
             return BuildSessionStatusJsonLocked("sync", "failed", "malformed_command");
         }
+        if (!sessionActive_) {
+            return BuildSessionStatusJsonLocked("sync", "failed", "not_started");
+        }
+        if (sessionId_ != sessionId) {
+            return BuildSessionStatusJsonLocked("sync", "failed", "mismatched_session");
+        }
 
-        sessionActive_ = true;
-        sessionId_ = sessionId;
+        const bool isLatestRetry =
+                nextSampleIndex_ > 0U && sampleIndex == nextSampleIndex_ - 1U;
+        if (phase == "sync") {
+            if (sessionPhase_ != "sync") {
+                return BuildSessionStatusJsonLocked("sync", "failed", "mismatched_phase");
+            }
+        } else if (sessionPhase_ == "sync") {
+            if (syncSampleCount_ == 0U || sampleIndex != 0U) {
+                return BuildSessionStatusJsonLocked("sync", "failed", "mismatched_phase");
+            }
+            sessionPhase_ = "verify";
+            nextSampleIndex_ = 0U;
+        } else if (sessionPhase_ != "verify") {
+            return BuildSessionStatusJsonLocked("sync", "failed", "mismatched_phase");
+        }
+        const bool retryAfterPhaseTransition =
+                nextSampleIndex_ > 0U && sampleIndex == nextSampleIndex_ - 1U;
+        if (sampleIndex != nextSampleIndex_ && !isLatestRetry && !retryAfterPhaseTransition) {
+            return BuildSessionStatusJsonLocked("sync", "failed", "mismatched_sample");
+        }
+
         sessionPhase_ = phase;
         sessionStatus_ = phase;
         lastSampleIndex_ = static_cast<int>(sampleIndex);
+        if (sampleIndex == nextSampleIndex_) {
+            ++nextSampleIndex_;
+            if (phase == "sync") {
+                ++syncSampleCount_;
+            }
+        }
         status_.lastClientRequestUtcNs = t2Ns;
         const int64_t t3Ns = CurrentRealtimeNs();
         status_.lastServerResponseUtcNs = t3Ns;
@@ -726,6 +774,8 @@ private:
     std::string sessionPhase_ = "idle";
     std::string sessionStatus_ = "idle";
     int lastSampleIndex_ = -1;
+    uint32_t nextSampleIndex_ = 0U;
+    uint32_t syncSampleCount_ = 0U;
 };
 
 class ProtocolAdapterService final : public SXR::IEncoderOutputListener {
@@ -1428,6 +1478,16 @@ private:
             ClearFaultIfActive("E_SD_FULL");
         }
 
+        if (platform.hasThermalStatus &&
+            platform.thermalStatus >= kThermalStatusSevere) {
+            ActivateFault(MakeFault("E_OVERHEAT",
+                                    "Android thermal protection status is severe or higher",
+                                    egocollect::FaultLevel::kFatal),
+                          true);
+        } else if (platform.hasThermalStatus) {
+            ClearFaultIfActive("E_OVERHEAT");
+        }
+
         if (platform.hasWifi && platform.wifiConnected) {
             wifiWasConnected_ = true;
             ClearFaultIfActive("E_WIFI_LOST");
@@ -1495,6 +1555,9 @@ private:
                 break;
             case egocollect::CommandType::kSetParam:
                 HandleSetParam(command);
+                break;
+            case egocollect::CommandType::kReboot:
+                HandleReboot(command);
                 break;
             default:
                 SendResponse(command.seq,
@@ -1676,6 +1739,20 @@ private:
         SendResponse(command.seq,
                      egocollect::ResultCode::kOk,
                      "heartbeat ok",
+                     std::map<std::string, std::string>());
+    }
+
+    void HandleReboot(const egocollect::CommandPacket& command) {
+        if (!RequestDeviceReboot()) {
+            SendResponse(command.seq,
+                         egocollect::ResultCode::kInternal,
+                         "device reboot unavailable",
+                         std::map<std::string, std::string>());
+            return;
+        }
+        SendResponse(command.seq,
+                     egocollect::ResultCode::kOk,
+                     "device reboot scheduled",
                      std::map<std::string, std::string>());
     }
 

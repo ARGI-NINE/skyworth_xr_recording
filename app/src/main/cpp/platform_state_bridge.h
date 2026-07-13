@@ -12,6 +12,8 @@ struct PlatformSnapshot {
     float batteryVoltage = 0.0f;
     bool hasBatteryTemperature = false;
     float batteryTemperature = 0.0f;
+    bool hasThermalStatus = false;
+    int32_t thermalStatus = 0;
 
     bool hasWifi = false;
     bool wifiConnected = false;

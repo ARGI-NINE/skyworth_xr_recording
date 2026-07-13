@@ -1,6 +1,11 @@
 package com.ssnwt.helloxr.ble;
 
 import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
@@ -11,13 +16,12 @@ import com.ssnwt.vr.androidmanager.wifi.WifiInfo;
 import com.ssnwt.vr.androidmanager.wifi.WifiUtils;
 
 import java.net.InetAddress;
-import java.net.NetworkInterface;
 import java.util.ArrayList;
-import java.util.Enumeration;
 
 public class WifiConnector {
     private static final long CONNECT_TIMEOUT_MS = 30000L;
     private static final String TAG = "WifiConnector";
+    private final Context context;
 
     public interface OnWifiConnectListener {
         void onWifiConnected(String ipAddress);
@@ -38,6 +42,7 @@ public class WifiConnector {
     private boolean listenerRegistered = false;
 
     public WifiConnector(Context context) {
+        this.context = context.getApplicationContext();
         ensureWifiUtils();
     }
 
@@ -274,21 +279,37 @@ public class WifiConnector {
     }
 
     private String queryIpAddress() {
+        return queryStaIpAddress(context);
+    }
+
+    public static String queryStaIpAddress(Context context) {
+        if (context == null) {
+            return "";
+        }
         try {
-            Enumeration<NetworkInterface> networkInterfaces = NetworkInterface.getNetworkInterfaces();
-            if (networkInterfaces == null) {
+            ConnectivityManager connectivityManager =
+                    (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (connectivityManager == null) {
                 return "";
             }
-            while (networkInterfaces.hasMoreElements()) {
-                NetworkInterface networkInterface = networkInterfaces.nextElement();
-                if (networkInterface.isUp() && !networkInterface.isLoopback()) {
-                    Enumeration<InetAddress> inetAddresses = networkInterface.getInetAddresses();
-                    while (inetAddresses.hasMoreElements()) {
-                        InetAddress inetAddress = inetAddresses.nextElement();
-                        if (!inetAddress.isLoopbackAddress()
-                                && inetAddress.getAddress().length == 4) {
-                            return inetAddress.getHostAddress();
-                        }
+            for (Network network : connectivityManager.getAllNetworks()) {
+                NetworkCapabilities capabilities =
+                        connectivityManager.getNetworkCapabilities(network);
+                if (capabilities == null
+                        || !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    continue;
+                }
+                LinkProperties properties = connectivityManager.getLinkProperties(network);
+                if (properties == null) {
+                    continue;
+                }
+                for (LinkAddress linkAddress : properties.getLinkAddresses()) {
+                    InetAddress address = linkAddress.getAddress();
+                    if (address != null
+                            && address.getAddress().length == 4
+                            && !address.isAnyLocalAddress()
+                            && !address.isLoopbackAddress()) {
+                        return address.getHostAddress();
                     }
                 }
             }

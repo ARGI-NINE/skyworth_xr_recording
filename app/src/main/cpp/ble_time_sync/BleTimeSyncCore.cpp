@@ -8,6 +8,8 @@ namespace ble_time_sync {
 namespace {
 
 constexpr char kLogTag[] = "BleTimeSync";
+constexpr int kSyncSampleTarget = 8;
+constexpr int kVerifySampleTarget = 4;
 
 }  // namespace
 
@@ -52,13 +54,49 @@ TimeSyncStep BleTimeSyncCore::HandleRequest(const TimeSyncRequest& request,
         return step;
     }
 
+    const int currentCount = request.phase == SyncPhase::kSync
+                                     ? status_.syncSampleCount
+                                     : status_.verifySampleCount;
+    const int targetCount = request.phase == SyncPhase::kSync
+                                    ? kSyncSampleTarget
+                                    : kVerifySampleTarget;
+    const bool isLatestRetry = currentCount > 0 && request.sampleIndex == currentCount - 1;
+    bool sequenceValid = false;
+    if (request.phase == SyncPhase::kSync) {
+        sequenceValid = phase_ == SyncPhase::kSync &&
+                        currentCount <= kSyncSampleTarget &&
+                        (request.sampleIndex == currentCount || isLatestRetry);
+    } else if (request.phase == SyncPhase::kVerify) {
+        const bool enteringVerify = phase_ == SyncPhase::kSync &&
+                                    status_.syncSampleCount == kSyncSampleTarget &&
+                                    request.sampleIndex == 0;
+        const bool continuingVerify = phase_ == SyncPhase::kVerify &&
+                                      currentCount <= kVerifySampleTarget &&
+                                      (request.sampleIndex == currentCount || isLatestRetry);
+        sequenceValid = enteringVerify || continuingVerify;
+    }
+    if (!sequenceValid || (currentCount >= targetCount && !isLatestRetry)) {
+        step.type = ResultType::kError;
+        step.error = ErrorCode::kMismatchedReply;
+        NATIVE_LOGW(kLogTag,
+                    "session=%d event=request_sequence_mismatch current_phase=%s request_phase=%s sample=%d expected=%d",
+                    sessionId_,
+                    PhaseName(phase_),
+                    PhaseName(request.phase),
+                    request.sampleIndex,
+                    currentCount);
+        return step;
+    }
+
     phase_ = request.phase;
     status_.phase = phase_;
     status_.sessionId = sessionId_;
-    if (request.phase == SyncPhase::kSync) {
-        ++status_.syncSampleCount;
-    } else if (request.phase == SyncPhase::kVerify) {
-        ++status_.verifySampleCount;
+    if (!isLatestRetry) {
+        if (request.phase == SyncPhase::kSync) {
+            ++status_.syncSampleCount;
+        } else {
+            ++status_.verifySampleCount;
+        }
     }
 
     step.type = ResultType::kSendReply;
@@ -107,6 +145,21 @@ TimeSyncStep BleTimeSyncCore::ApplySyncResult(const SyncResultReport& result) {
                     sessionId_,
                     sessionId_,
                     result.sessionId);
+        return step;
+    }
+    if (phase_ != SyncPhase::kVerify ||
+        status_.syncSampleCount != kSyncSampleTarget ||
+        status_.verifySampleCount != kVerifySampleTarget ||
+        result.syncSampleCount != kSyncSampleTarget ||
+        result.verifySampleCount != kVerifySampleTarget) {
+        step.type = ResultType::kError;
+        step.error = ErrorCode::kMismatchedReply;
+        NATIVE_LOGW(kLogTag,
+                    "session=%d event=sync_result_sequence_mismatch phase=%s sync=%d verify=%d",
+                    sessionId_,
+                    PhaseName(phase_),
+                    status_.syncSampleCount,
+                    status_.verifySampleCount);
         return step;
     }
 

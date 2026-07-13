@@ -68,6 +68,8 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeUpdatePlatformState(
         jfloat batteryVoltage,
         jboolean hasBatteryTemperature,
         jfloat batteryTemperature,
+        jboolean hasThermalStatus,
+        jint thermalStatus,
         jboolean hasWifi,
         jboolean wifiConnected,
         jstring wifiSsid,
@@ -82,6 +84,8 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeUpdatePlatformState(
     snapshot.batteryVoltage = batteryVoltage;
     snapshot.hasBatteryTemperature = hasBatteryTemperature == JNI_TRUE;
     snapshot.batteryTemperature = batteryTemperature;
+    snapshot.hasThermalStatus = hasThermalStatus == JNI_TRUE;
+    snapshot.thermalStatus = thermalStatus;
     snapshot.hasWifi = hasWifi == JNI_TRUE;
     snapshot.wifiConnected = wifiConnected == JNI_TRUE;
     snapshot.wifiSsid = JStringToStdString(env, wifiSsid);
