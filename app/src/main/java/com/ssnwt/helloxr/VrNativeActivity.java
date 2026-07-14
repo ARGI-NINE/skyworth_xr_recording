@@ -111,6 +111,10 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
     private boolean isRegisterReceiver = false;
     private MediaRecorder mRecorder;
     private boolean isRecording = false;
+    // Bright-screen wake lock held for the lifetime of the Activity so Android's
+    // screen-off timeout cannot power the display down and drop the OpenXR
+    // session out of FOCUSED (which pauses camera + head_pose capture).
+    private PowerManager.WakeLock mWakeLock;
     private WifiManager mWifiManager;
     private PowerManager mPowerManager;
     private boolean mHasThermalStatus;
@@ -395,6 +399,9 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
 
         initExporterConfig();
         super.onCreate(savedInstanceState);
+        // Hold a bright-screen wake lock for the whole Activity lifetime so the
+        // screen-off timeout cannot suspend the device and drop the XR session.
+        acquireWakeLock();
         ensureManageExternalStoragePermission();
         initSvrApi();
         mBatteryManager = (BatteryManager) getSystemService(BATTERY_SERVICE);
@@ -729,7 +736,32 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
             mReservation.close();
             mReservation = null;
         }
+        releaseWakeLock();
         super.onDestroy();
+    }
+
+    // Acquire a bright-screen wake lock so the system screen-off timeout cannot
+    // suspend the device and drop the OpenXR session out of FOCUSED (which
+    // pauses camera + head_pose capture).
+    private synchronized void acquireWakeLock() {
+        if (mWakeLock == null) {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            mWakeLock = pm.newWakeLock(
+                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                    "HelloXr:ScreenOnWakeLock");
+            mWakeLock.setReferenceCounted(false);
+        }
+        if (!mWakeLock.isHeld()) {
+            mWakeLock.acquire();
+            Log.i(TAG, "Wake lock acquired (keep screen on)");
+        }
+    }
+
+    private synchronized void releaseWakeLock() {
+        if (mWakeLock != null && mWakeLock.isHeld()) {
+            mWakeLock.release();
+            Log.i(TAG, "Wake lock released");
+        }
     }
 
     /*
