@@ -4,6 +4,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.RemoteException;
 import android.util.Log;
+import android.bluetooth.BluetoothDevice;
 
 import com.ssnwt.helloxr.IBleCallback;
 import com.ssnwt.helloxr.IBleService;
@@ -15,7 +16,7 @@ public class BleAidlImpl extends IBleService.Stub {
     private static final long PROVISIONING_DISCONNECT_DELAY_MS = 750L;
 
     public interface BleControlListener {
-        boolean onControlCommand(String command);
+        boolean onControlCommand(BluetoothDevice device, String command);
 
         void onBleConnectionChanged(boolean connected);
     }
@@ -144,10 +145,15 @@ public class BleAidlImpl extends IBleService.Stub {
                                             });
                                 }));
         bleServerManager.setOnControlCommandListener(
-                command -> {
-                    Log.i(TAG, "Control command from BLE: " + command);
+                (device, command) -> {
+                    Log.i(
+                            TAG,
+                            "Control command from BLE: address="
+                                    + device.getAddress()
+                                    + " payload="
+                                    + command);
                     if (bleControlListener != null
-                            && bleControlListener.onControlCommand(command)) {
+                            && bleControlListener.onControlCommand(device, command)) {
                         return;
                     }
                     notifyCommand(command);

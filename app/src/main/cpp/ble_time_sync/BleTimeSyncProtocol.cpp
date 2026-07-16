@@ -436,8 +436,7 @@ bool ParseControlCommand(const std::string& commandJson,
         return true;
     }
 
-    command->type = ControlCommandType::kUnknown;
-    return true;
+    return false;
 }
 
 std::string BuildStartedJson(int sessionId) {
