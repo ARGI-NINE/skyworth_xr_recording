@@ -16,6 +16,9 @@ local.properties
 .idea/
 3rdlibs/build
 docs
+!docs/
+docs/*
+!docs/LINUX_PORTING_PLAN.md
 dataset*
 openspec/
 .claude/

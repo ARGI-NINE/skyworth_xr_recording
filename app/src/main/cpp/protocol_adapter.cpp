@@ -9,6 +9,7 @@
 #include <jni.h>
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -27,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -45,7 +47,8 @@ constexpr uint16_t kVideoPort = 8802;
 constexpr int kAcceptPollTimeoutMs = 1000;
 constexpr int kControlStatusIntervalMs = 1000;
 constexpr int kFaultPollIntervalMs = 250;
-constexpr int32_t kThermalStatusSevere = 3;
+constexpr float kOverheatTemperatureCelsius = 80.0f;
+constexpr float kOverheatClearTemperatureCelsius = 78.0f;
 constexpr std::size_t kControlReadBufferBytes = 4096;
 constexpr std::size_t kMaxVideoQueueFrames = 24;
 
@@ -133,6 +136,59 @@ bool BuildStorageInfo(egocollect::StorageInfo* out) {
     out->freeBytes =
             static_cast<uint64_t>(fs.f_bavail) * static_cast<uint64_t>(fs.f_frsize);
     return true;
+}
+
+bool ReadSkinTemperatureCelsius(float* outTemperature) {
+    if (outTemperature == nullptr) {
+        return false;
+    }
+
+    DIR* directory = opendir("/sys/class/thermal");
+    if (directory == nullptr) {
+        return false;
+    }
+
+    bool found = false;
+    float maximumTemperature = 0.0f;
+    for (dirent* entry = readdir(directory); entry != nullptr; entry = readdir(directory)) {
+        const std::string zoneName(entry->d_name);
+        if (zoneName.compare(0, std::strlen("thermal_zone"), "thermal_zone") != 0) {
+            continue;
+        }
+
+        const std::string zonePath = "/sys/class/thermal/" + zoneName;
+        std::ifstream typeFile(zonePath + "/type");
+        std::string type;
+        if (!(typeFile >> type)) {
+            continue;
+        }
+        std::transform(type.begin(), type.end(), type.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (type.find("skin") == std::string::npos) {
+            continue;
+        }
+
+        std::ifstream temperatureFile(zonePath + "/temp");
+        float rawTemperature = 0.0f;
+        if (!(temperatureFile >> rawTemperature)) {
+            continue;
+        }
+        const float temperature = rawTemperature > 1000.0f
+                                          ? rawTemperature / 1000.0f
+                                          : rawTemperature;
+        if (temperature < 0.0f || temperature > 200.0f) {
+            continue;
+        }
+        maximumTemperature = found ? std::max(maximumTemperature, temperature) : temperature;
+        found = true;
+    }
+    closedir(directory);
+
+    if (found) {
+        *outTemperature = maximumTemperature;
+    }
+    return found;
 }
 
 bool ExtractNextEgFrame(std::string* buffer, std::string* payload) {
@@ -1478,14 +1534,20 @@ private:
             ClearFaultIfActive("E_SD_FULL");
         }
 
-        if (platform.hasThermalStatus &&
-            platform.thermalStatus >= kThermalStatusSevere) {
-            ActivateFault(MakeFault("E_OVERHEAT",
-                                    "Android thermal protection status is severe or higher",
-                                    egocollect::FaultLevel::kFatal),
-                          true);
-        } else if (platform.hasThermalStatus) {
-            ClearFaultIfActive("E_OVERHEAT");
+        float skinTemperature = 0.0f;
+        if (ReadSkinTemperatureCelsius(&skinTemperature)) {
+            if (skinTemperature >= kOverheatTemperatureCelsius) {
+                std::ostringstream description;
+                description << "skin temperature " << skinTemperature
+                            << " C reached " << kOverheatTemperatureCelsius
+                            << " C threshold";
+                ActivateFault(MakeFault("E_OVERHEAT",
+                                        description.str(),
+                                        egocollect::FaultLevel::kFatal),
+                              true);
+            } else if (skinTemperature < kOverheatClearTemperatureCelsius) {
+                ClearFaultIfActive("E_OVERHEAT");
+            }
         }
 
         if (platform.hasWifi && platform.wifiConnected) {

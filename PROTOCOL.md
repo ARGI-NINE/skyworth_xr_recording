@@ -1323,13 +1323,13 @@ message Response {
 | `E_SD_FULL` | SD 卡空间不足 | ERROR | 当前 SDK 已直接使用，空间恢复后可清除。 |
 | `E_CAM_INIT_FAIL` | 摄像头报错 | FATAL | 当前 SDK 已直接使用，主要对应摄像头初始化失败类错误。 |
 | `E_WIFI_LOST` | WiFi 断连 | WARN | 当前 SDK 已直接使用，可自动恢复并清除。 |
-| `E_OVERHEAT` | 设备严重过热 | FATAL | 当前版本保留此故障类别；仅在热保护错误源接入后上报。 |
+| `E_OVERHEAT` | 设备严重过热 | FATAL | 设备端读取 skin 温度传感器的最高值；达到 `80.0°C` 时上报，降到 `78.0°C` 以下时清除。Android Thermal Status 的 `SEVERE` 不单独触发此故障。 |
 | `E_SYSTEM_FAULT` | 系统崩溃 / 严重内部故障 | FATAL | 当前 SDK 已直接使用，兜底承接严重 SDK / 系统故障。 |
 
 补充说明：
 
 - 当前 SDK 控制通道里已直接可见的故障上报主要是 `E_SD_FULL`、`E_CAM_INIT_FAIL`、`E_WIFI_LOST`、`E_SYSTEM_FAULT`。
-- `E_BAT_LOW`、`E_OVERHEAT` 属于当前版本保留的协议约定；文档不伪称设备端已经完整实现了对应上报链路。
+- `E_BAT_LOW` 属于当前版本保留的协议约定；`E_OVERHEAT` 已按上述 skin 温度阈值接入设备端上报链路。
 - 不再扩展其他基础故障码；手机端仅需按上表处理。
 
 ---

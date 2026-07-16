@@ -302,9 +302,10 @@ public class VrNativeActivity extends NativeActivity implements SystemEventUtils
         snapshot.hasWifi = mWifiManager != null;
         snapshot.wifiSsid = queryProvisionedWifiSsid();
         snapshot.wifiIpAddress = WifiConnector.queryStaIpAddress(this);
-        if (snapshot.wifiSsid.isEmpty()) {
-            tryFillWifiSnapshotFromManager(snapshot);
-        }
+        // The provisioning service can provide the SSID, but it does not
+        // provide RSSI/frequency. Always enrich the snapshot from WifiManager;
+        // tryFillWifiSnapshotFromManager keeps the provisioned SSID when set.
+        tryFillWifiSnapshotFromManager(snapshot);
         snapshot.wifiConnected = !snapshot.wifiIpAddress.isEmpty();
     }
 
