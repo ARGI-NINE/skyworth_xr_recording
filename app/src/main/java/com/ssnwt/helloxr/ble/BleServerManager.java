@@ -25,7 +25,12 @@ import com.ssnwt.vr.androidmanager.AndroidInterface;
 
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 public class BleServerManager {
@@ -61,8 +66,6 @@ public class BleServerManager {
     private static final int MAX_WIFI_PASSWORD_BYTES = 64;
     private static final int WIFI_TRIGGER_BYTES = 1;
     private static final int MANUFACTURER_ID = 4884;
-    private static final int RESTART_ADVERTISE_DELAY_MS = 1500;
-    private static final int RESTART_ADVERTISE_MAX_RETRIES = 3;
 
     public interface OnConnectionStateChangeListener {
         void onConnectionStateChanged(boolean connected);
@@ -73,11 +76,15 @@ public class BleServerManager {
     }
 
     public interface OnControlCommandListener {
-        void onControlCommand(String command);
+        void onControlCommand(BluetoothDevice device, String command);
     }
 
     public interface OnControlChannelReadyListener {
-        void onControlChannelReady();
+        void onControlChannelReady(BluetoothDevice device);
+    }
+
+    public interface OnDeviceDisconnectedListener {
+        void onDeviceDisconnected(BluetoothDevice device);
     }
 
     private final Context context;
@@ -87,7 +94,13 @@ public class BleServerManager {
 
     private BluetoothLeAdvertiser advertiser;
     private BluetoothGattServer gattServer;
-    private BluetoothDevice connectedDevice;
+    private BluetoothGattService provisioningService;
+    private BluetoothGattService controlService;
+    private final Set<BluetoothDevice> connectedDevices = new HashSet<>();
+    private final Map<UUID, Set<BluetoothDevice>> notificationSubscribers = new HashMap<>();
+    private final Set<BluetoothDevice> controlChannelReadyDevices = new HashSet<>();
+    private BluetoothDevice provisioningDevice;
+    private BluetoothDevice lastControlDevice;
 
     private BluetoothGattCharacteristic wifiSsidChar;
     private BluetoothGattCharacteristic wifiPasswordChar;
@@ -101,30 +114,35 @@ public class BleServerManager {
     private OnWifiProvisionRequestListener wifiProvisionRequestListener;
     private OnControlCommandListener controlCommandListener;
     private OnControlChannelReadyListener controlChannelReadyListener;
+    private OnDeviceDisconnectedListener deviceDisconnectedListener;
 
     private String pendingSsid;
     private String pendingPassword;
     private String currentIpAddress = "";
     private int currentWifiStatus = WIFI_STATUS_IDLE;
     private boolean isAdvertising = false;
-    private boolean restartAdvertisingOnDisconnect = true;
-    private boolean wifiStatusNotifyEnabled = false;
-    private boolean ipAddressNotifyEnabled = false;
-    private boolean cmdResponseNotifyEnabled = false;
-    private boolean errorMsgNotifyEnabled = false;
-    private boolean controlChannelReadyNotified = false;
+    private boolean gattServicesReady = false;
+    private boolean advertisingStartPending = false;
+    private byte[] pendingManufacturerPayload;
 
     private final AdvertiseCallback advertiseCallback = new AdvertiseCallback() {
         @Override
         public void onStartSuccess(AdvertiseSettings settingsInEffect) {
-            isAdvertising = true;
+            synchronized (BleServerManager.this) {
+                advertisingStartPending = false;
+                isAdvertising = true;
+            }
             Log.i(TAG, "BLE advertising started");
         }
 
         @Override
         public void onStartFailure(int errorCode) {
-            isAdvertising = false;
+            synchronized (BleServerManager.this) {
+                advertisingStartPending = false;
+                isAdvertising = false;
+            }
             Log.e(TAG, "BLE advertising failed: " + errorCode);
+            mainHandler.postDelayed(BleServerManager.this::startAdvertising, 1000L);
         }
     };
 
@@ -141,37 +159,50 @@ public class BleServerManager {
                                     + " newState="
                                     + newState);
                     if (newState == BluetoothProfile.STATE_CONNECTED) {
-                        connectedDevice = device;
-                        wifiStatusNotifyEnabled = false;
-                        ipAddressNotifyEnabled = false;
-                        cmdResponseNotifyEnabled = false;
-                        errorMsgNotifyEnabled = false;
-                        controlChannelReadyNotified = false;
-                        stopAdvertising();
-                        if (connectionStateChangeListener != null) {
+                        boolean wasEmpty;
+                        synchronized (BleServerManager.this) {
+                            wasEmpty = connectedDevices.isEmpty();
+                            connectedDevices.add(device);
+                        }
+                        Log.i(TAG, "BLE client connected; total=" + getConnectedDeviceCount());
+                        if (wasEmpty && connectionStateChangeListener != null) {
                             connectionStateChangeListener.onConnectionStateChanged(true);
                         }
                         return;
                     }
 
                     if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                        boolean shouldRestartAdvertising = restartAdvertisingOnDisconnect;
-                        connectedDevice = null;
-                        wifiStatusNotifyEnabled = false;
-                        ipAddressNotifyEnabled = false;
-                        cmdResponseNotifyEnabled = false;
-                        errorMsgNotifyEnabled = false;
-                        controlChannelReadyNotified = false;
-                        resetProvisioningState();
-                        if (connectionStateChangeListener != null) {
+                        boolean isNowEmpty;
+                        boolean resetProvisioning;
+                        synchronized (BleServerManager.this) {
+                            connectedDevices.remove(device);
+                            removeNotificationSubscriptions(device);
+                            controlChannelReadyDevices.remove(device);
+                            resetProvisioning = device.equals(provisioningDevice);
+                            if (resetProvisioning) {
+                                provisioningDevice = null;
+                            }
+                            if (device.equals(lastControlDevice)) {
+                                lastControlDevice = null;
+                            }
+                            isNowEmpty = connectedDevices.isEmpty();
+                        }
+                        if (resetProvisioning) {
+                            resetProvisioningState();
+                        }
+                        Log.i(TAG, "BLE client disconnected; total=" + getConnectedDeviceCount());
+                        if (deviceDisconnectedListener != null) {
+                            deviceDisconnectedListener.onDeviceDisconnected(device);
+                        }
+                        if (isNowEmpty && connectionStateChangeListener != null) {
                             connectionStateChangeListener.onConnectionStateChanged(false);
                         }
-                        if (shouldRestartAdvertising) {
-                            restartAdvertisingWithRetry(0);
-                        } else {
-                            Log.i(TAG, "Provisioning complete, keeping BLE advertising stopped");
-                        }
                     }
+                }
+
+                @Override
+                public void onServiceAdded(int status, BluetoothGattService service) {
+                    handleServiceAdded(status, service);
                 }
 
                 @Override
@@ -211,18 +242,34 @@ public class BleServerManager {
                         boolean responseNeeded,
                         int offset,
                         byte[] value) {
+                    logCharacteristicWrite(
+                            device,
+                            requestId,
+                            characteristic,
+                            preparedWrite,
+                            responseNeeded,
+                            offset,
+                            value);
                     int responseStatus = BluetoothGatt.GATT_SUCCESS;
                     if (preparedWrite || offset != 0) {
                         responseStatus = BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED;
                     } else if (value == null) {
                         responseStatus = BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH;
                     } else {
-                        responseStatus = handleCharacteristicWrite(characteristic, value);
+                        responseStatus = handleCharacteristicWrite(device, characteristic, value);
                     }
 
                     if (responseNeeded && gattServer != null) {
                         gattServer.sendResponse(device, requestId, responseStatus, 0, null);
                     }
+                    Log.i(
+                            TAG,
+                            "GATT write handled: address="
+                                    + device.getAddress()
+                                    + " uuid="
+                                    + characteristic.getUuid()
+                                    + " status="
+                                    + responseStatus);
                 }
 
                 @Override
@@ -234,10 +281,15 @@ public class BleServerManager {
                     if (gattServer == null) {
                         return;
                     }
-                    byte[] value = descriptor.getValue();
-                    if (value == null) {
-                        value = BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE;
-                    }
+                    boolean enabled =
+                            descriptor != null
+                                    && descriptor.getCharacteristic() != null
+                                    && isSubscribed(
+                                            descriptor.getCharacteristic().getUuid(), device);
+                    byte[] value =
+                            enabled
+                                    ? BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                                    : BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE;
                     gattServer.sendResponse(
                             device,
                             requestId,
@@ -255,23 +307,53 @@ public class BleServerManager {
                         boolean responseNeeded,
                         int offset,
                         byte[] value) {
+                    Log.i(
+                            TAG,
+                            "GATT descriptor write received: address="
+                                    + device.getAddress()
+                                    + " requestId="
+                                    + requestId
+                                    + " uuid="
+                                    + (descriptor == null ? null : descriptor.getUuid())
+                                    + " characteristic="
+                                    + (descriptor == null || descriptor.getCharacteristic() == null
+                                            ? null
+                                            : descriptor.getCharacteristic().getUuid())
+                                    + " prepared="
+                                    + preparedWrite
+                                    + " offset="
+                                    + offset
+                                    + " length="
+                                    + (value == null ? 0 : value.length));
                     int responseStatus = BluetoothGatt.GATT_SUCCESS;
                     if (preparedWrite || offset != 0) {
                         responseStatus = BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED;
-                    } else if (descriptor != null) {
-                        descriptor.setValue(value);
-                        handleDescriptorWrite(descriptor, value);
+                    } else if (descriptor == null || value == null) {
+                        responseStatus = BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH;
+                    } else {
+                        handleDescriptorWrite(device, descriptor, value);
                     }
 
                     if (responseNeeded && gattServer != null) {
                         gattServer.sendResponse(device, requestId, responseStatus, 0, null);
                     }
+                    Log.i(
+                            TAG,
+                            "GATT descriptor write handled: address="
+                                    + device.getAddress()
+                                    + " status="
+                                    + responseStatus);
                 }
 
                 @Override
                 public void onNotificationSent(BluetoothDevice device, int status) {
                     if (status != BluetoothGatt.GATT_SUCCESS) {
-                        Log.w(TAG, "Notification send failed: " + status);
+                        Log.w(
+                                TAG,
+                                "Notification send failed: address="
+                                        + device.getAddress()
+                                        + " status="
+                                        + status);
                     }
                 }
             };
@@ -295,9 +377,14 @@ public class BleServerManager {
 
     private String getDeviceSerial() {
         try {
+            if (!AndroidInterface.getInstance().isInitialized()) {
+                Log.w(TAG, "SVR AndroidInterface is not initialized; BLE advertising is deferred");
+                return null;
+            }
             String serial = AndroidInterface.getInstance().getDeviceUtils().getSerialNumber();
             if (serial == null || serial.isEmpty()) {
-                return "VR-UNKNOWN";
+                Log.e(TAG, "SVR device serial is unavailable; BLE advertising is deferred");
+                return null;
             }
             if (serial.length() > 11) {
                 String truncatedSerial = serial.substring(serial.length() - 11);
@@ -338,16 +425,85 @@ public class BleServerManager {
             return truncatedSerial;
         } catch (Exception e) {
             Log.e(TAG, "Failed to get device serial", e);
-            return "VR-UNKNOWN";
+            return null;
         }
     }
 
-    private int handleCharacteristicWrite(BluetoothGattCharacteristic characteristic, byte[] value) {
+    private void logCharacteristicWrite(
+            BluetoothDevice device,
+            int requestId,
+            BluetoothGattCharacteristic characteristic,
+            boolean preparedWrite,
+            boolean responseNeeded,
+            int offset,
+            byte[] value) {
+        UUID uuid = characteristic != null ? characteristic.getUuid() : null;
+        String payload;
+        if (CHAR_WIFI_PASSWORD_ID.equals(uuid)) {
+            payload = "<redacted>";
+        } else if (value == null) {
+            payload = "<null>";
+        } else if (CHAR_WIFI_STATUS_ID.equals(uuid)) {
+            payload = bytesToHex(value);
+        } else {
+            payload = new String(value, StandardCharsets.UTF_8);
+        }
+        Log.i(
+                TAG,
+                "GATT write received: address="
+                        + device.getAddress()
+                        + " requestId="
+                        + requestId
+                        + " uuid="
+                        + uuid
+                        + " prepared="
+                        + preparedWrite
+                        + " responseNeeded="
+                        + responseNeeded
+                        + " offset="
+                        + offset
+                        + " length="
+                        + (value == null ? 0 : value.length)
+                        + " payload="
+                        + payload);
+    }
+
+    private String bytesToHex(byte[] value) {
+        StringBuilder builder = new StringBuilder(value.length * 2);
+        for (byte item : value) {
+            builder.append(String.format("%02X", item & 0xFF));
+        }
+        return builder.toString();
+    }
+
+    private synchronized boolean claimProvisioningDevice(BluetoothDevice device) {
+        if (provisioningDevice == null) {
+            provisioningDevice = device;
+            Log.i(TAG, "Provisioning client selected: address=" + device.getAddress());
+            return true;
+        }
+        if (provisioningDevice.equals(device)) {
+            return true;
+        }
+        Log.w(
+                TAG,
+                "Rejecting provisioning write from address="
+                        + device.getAddress()
+                        + "; activeAddress="
+                        + provisioningDevice.getAddress());
+        return false;
+    }
+
+    private int handleCharacteristicWrite(
+            BluetoothDevice device, BluetoothGattCharacteristic characteristic, byte[] value) {
         UUID uuid = characteristic.getUuid();
         if (CHAR_WIFI_SSID_ID.equals(uuid)) {
             if (value.length > MAX_WIFI_SSID_BYTES) {
                 Log.w(TAG, "Rejecting FFE1 write larger than " + MAX_WIFI_SSID_BYTES + " bytes");
                 return BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH;
+            }
+            if (!claimProvisioningDevice(device)) {
+                return BluetoothGatt.GATT_FAILURE;
             }
             pendingSsid = new String(value, StandardCharsets.UTF_8);
             Log.d(TAG, "WiFi SSID received: " + pendingSsid);
@@ -362,18 +518,29 @@ public class BleServerManager {
                                 + " bytes");
                 return BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH;
             }
+            if (!claimProvisioningDevice(device)) {
+                return BluetoothGatt.GATT_FAILURE;
+            }
             pendingPassword = new String(value, StandardCharsets.UTF_8);
             Log.d(TAG, "WiFi password received");
             return BluetoothGatt.GATT_SUCCESS;
         }
         if (CHAR_WIFI_STATUS_ID.equals(uuid)) {
-            return handleWifiStatusWrite(value);
+            return handleWifiStatusWrite(device, value);
         }
         if (CHAR_CONTROL_CMD_ID.equals(uuid)) {
             String command = new String(value, StandardCharsets.UTF_8);
-            Log.d(TAG, "Control command received: " + command);
+            synchronized (this) {
+                lastControlDevice = device;
+            }
+            Log.i(
+                    TAG,
+                    "Control command received: address="
+                            + device.getAddress()
+                            + " payload="
+                            + command);
             if (controlCommandListener != null) {
-                controlCommandListener.onControlCommand(command);
+                controlCommandListener.onControlCommand(device, command);
             }
             return BluetoothGatt.GATT_SUCCESS;
         }
@@ -381,7 +548,7 @@ public class BleServerManager {
         return BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED;
     }
 
-    private int handleWifiStatusWrite(byte[] value) {
+    private int handleWifiStatusWrite(BluetoothDevice device, byte[] value) {
         if (value == null || value.length != WIFI_TRIGGER_BYTES) {
             Log.w(
                     TAG,
@@ -394,6 +561,9 @@ public class BleServerManager {
         if (value[0] != WIFI_CONNECT_TRIGGER) {
             Log.w(TAG, "Rejecting unsupported FFE3 trigger value: " + (value[0] & 0xFF));
             return BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED;
+        }
+        if (!claimProvisioningDevice(device)) {
+            return BluetoothGatt.GATT_FAILURE;
         }
         if (pendingSsid == null || pendingSsid.isEmpty()) {
             Log.w(TAG, "WiFi connect trigger ignored: SSID missing");
@@ -414,49 +584,90 @@ public class BleServerManager {
         return BluetoothGatt.GATT_SUCCESS;
     }
 
-    private void handleDescriptorWrite(BluetoothGattDescriptor descriptor, byte[] value) {
+    private void handleDescriptorWrite(
+            BluetoothDevice device, BluetoothGattDescriptor descriptor, byte[] value) {
         if (descriptor == null || descriptor.getCharacteristic() == null) {
             return;
         }
         UUID uuid = descriptor.getCharacteristic().getUuid();
         boolean enabled = isNotificationEnabled(value);
+        setNotificationSubscription(uuid, device, enabled);
+        Log.i(
+                TAG,
+                "CCCD updated: address="
+                        + device.getAddress()
+                        + " uuid="
+                        + uuid
+                        + " enabled="
+                        + enabled);
         if (CHAR_WIFI_STATUS_ID.equals(uuid)) {
-            wifiStatusNotifyEnabled = enabled;
             if (enabled) {
-                notifyCharacteristic(wifiStatusChar);
+                notifyCharacteristic(device, wifiStatusChar);
             }
             return;
         }
         if (CHAR_IP_ADDRESS_ID.equals(uuid)) {
-            ipAddressNotifyEnabled = enabled;
             if (enabled && currentIpAddress != null && !currentIpAddress.isEmpty()) {
-                notifyCharacteristic(ipAddressChar);
+                notifyCharacteristic(device, ipAddressChar);
             }
             return;
         }
         if (CHAR_CMD_RESPONSE_ID.equals(uuid)) {
-            cmdResponseNotifyEnabled = enabled;
-            updateControlChannelReadyState();
+            updateControlChannelReadyState(device);
             return;
         }
         if (CHAR_ERROR_MSG_ID.equals(uuid)) {
-            errorMsgNotifyEnabled = enabled;
-            updateControlChannelReadyState();
+            updateControlChannelReadyState(device);
         }
     }
 
-    private void updateControlChannelReadyState() {
+    private synchronized void setNotificationSubscription(
+            UUID uuid, BluetoothDevice device, boolean enabled) {
+        Set<BluetoothDevice> subscribers = notificationSubscribers.get(uuid);
+        if (enabled) {
+            if (subscribers == null) {
+                subscribers = new HashSet<>();
+                notificationSubscribers.put(uuid, subscribers);
+            }
+            subscribers.add(device);
+        } else if (subscribers != null) {
+            subscribers.remove(device);
+            if (subscribers.isEmpty()) {
+                notificationSubscribers.remove(uuid);
+            }
+        }
+    }
+
+    private synchronized boolean isSubscribed(UUID uuid, BluetoothDevice device) {
+        Set<BluetoothDevice> subscribers = notificationSubscribers.get(uuid);
+        return subscribers != null && subscribers.contains(device);
+    }
+
+    private synchronized void removeNotificationSubscriptions(BluetoothDevice device) {
+        for (Set<BluetoothDevice> subscribers : notificationSubscribers.values()) {
+            subscribers.remove(device);
+        }
+        notificationSubscribers.entrySet().removeIf(entry -> entry.getValue().isEmpty());
+    }
+
+    private void updateControlChannelReadyState(BluetoothDevice device) {
         boolean isReady =
-                connectedDevice != null && cmdResponseNotifyEnabled && errorMsgNotifyEnabled;
+                isSubscribed(CHAR_CMD_RESPONSE_ID, device)
+                        && isSubscribed(CHAR_ERROR_MSG_ID, device);
         if (!isReady) {
-            controlChannelReadyNotified = false;
+            synchronized (this) {
+                controlChannelReadyDevices.remove(device);
+            }
             return;
         }
-        if (controlChannelReadyNotified || controlChannelReadyListener == null) {
-            return;
+        synchronized (this) {
+            if (controlChannelReadyDevices.contains(device) || controlChannelReadyListener == null) {
+                return;
+            }
+            controlChannelReadyDevices.add(device);
         }
-        controlChannelReadyNotified = true;
-        controlChannelReadyListener.onControlChannelReady();
+        Log.i(TAG, "Control channel ready: address=" + device.getAddress());
+        controlChannelReadyListener.onControlChannelReady(device);
     }
 
     private boolean isNotificationEnabled(byte[] value) {
@@ -469,60 +680,52 @@ public class BleServerManager {
         pendingPassword = null;
         currentIpAddress = "";
         currentWifiStatus = WIFI_STATUS_IDLE;
-        restartAdvertisingOnDisconnect = true;
         if (wifiStatusChar != null) {
             wifiStatusChar.setValue(new byte[] {(byte) currentWifiStatus});
         }
         if (ipAddressChar != null) {
             ipAddressChar.setValue(currentIpAddress);
         }
-        if (cmdResponseChar != null) {
-            cmdResponseChar.setValue(new byte[0]);
-        }
-        if (errorMsgChar != null) {
-            errorMsgChar.setValue(new byte[0]);
-        }
+        // Control characteristic values belong to independent clients and are not
+        // provisioning state. Keep them untouched when the phone disconnects.
     }
 
     @SuppressLint("MissingPermission")
     private void notifyCharacteristic(BluetoothGattCharacteristic characteristic) {
-        if (gattServer == null || connectedDevice == null || characteristic == null) {
+        if (gattServer == null || characteristic == null) {
             return;
         }
-        UUID uuid = characteristic.getUuid();
-        if (CHAR_WIFI_STATUS_ID.equals(uuid) && !wifiStatusNotifyEnabled) {
-            return;
+        ArrayList<BluetoothDevice> subscribers;
+        synchronized (this) {
+            Set<BluetoothDevice> devices = notificationSubscribers.get(characteristic.getUuid());
+            if (devices == null || devices.isEmpty()) {
+                return;
+            }
+            subscribers = new ArrayList<>(devices);
         }
-        if (CHAR_IP_ADDRESS_ID.equals(uuid) && !ipAddressNotifyEnabled) {
-            return;
+        for (BluetoothDevice device : subscribers) {
+            notifyCharacteristic(device, characteristic);
         }
-        if (CHAR_CMD_RESPONSE_ID.equals(uuid) && !cmdResponseNotifyEnabled) {
-            return;
-        }
-        if (CHAR_ERROR_MSG_ID.equals(uuid) && !errorMsgNotifyEnabled) {
-            return;
-        }
-        gattServer.notifyCharacteristicChanged(connectedDevice, characteristic, false);
     }
 
     @SuppressLint("MissingPermission")
-    private void restartAdvertisingWithRetry(int attempt) {
-        mainHandler.postDelayed(
-                () -> {
-                    boolean started = startAdvertising();
-                    int nextAttempt = attempt + 1;
-                    Log.i(TAG, "Restart advertising (attempt " + nextAttempt + "): " + started);
-                    if (!started && nextAttempt < RESTART_ADVERTISE_MAX_RETRIES) {
-                        restartAdvertisingWithRetry(nextAttempt);
-                    } else if (!started) {
-                        Log.e(
-                                TAG,
-                                "Failed to restart advertising after "
-                                        + RESTART_ADVERTISE_MAX_RETRIES
-                                        + " retries");
-                    }
-                },
-                RESTART_ADVERTISE_DELAY_MS);
+    private void notifyCharacteristic(
+            BluetoothDevice device, BluetoothGattCharacteristic characteristic) {
+        if (gattServer == null
+                || device == null
+                || characteristic == null
+                || !isSubscribed(characteristic.getUuid(), device)) {
+            return;
+        }
+        boolean queued = gattServer.notifyCharacteristicChanged(device, characteristic, false);
+        Log.d(
+                TAG,
+                "Notification queued: address="
+                        + device.getAddress()
+                        + " uuid="
+                        + characteristic.getUuid()
+                        + " queued="
+                        + queued);
     }
 
     @SuppressLint("MissingPermission")
@@ -540,9 +743,9 @@ public class BleServerManager {
             return false;
         }
 
-        BluetoothGattService provisioningService =
+        provisioningService =
                 new BluetoothGattService(SERVICE_ID, BluetoothGattService.SERVICE_TYPE_PRIMARY);
-        BluetoothGattService controlService =
+        controlService =
                 new BluetoothGattService(
                         CONTROL_SERVICE_ID, BluetoothGattService.SERVICE_TYPE_PRIMARY);
 
@@ -597,34 +800,64 @@ public class BleServerManager {
         controlService.addCharacteristic(cmdResponseChar);
         controlService.addCharacteristic(errorMsgChar);
 
-        boolean provisioningAdded = gattServer.addService(provisioningService);
-        boolean controlAdded = provisioningAdded && gattServer.addService(controlService);
-        if (provisioningAdded && controlAdded) {
-            Log.d(TAG, "GATT server setup complete with service: " + SERVICE_UUID);
-        } else {
-            Log.e(
-                    TAG,
-                    "Failed to add GATT services: provisioning="
-                            + provisioningAdded
-                            + " control="
-                            + controlAdded);
+        boolean provisioningAddRequested = gattServer.addService(provisioningService);
+        if (!provisioningAddRequested) {
+            Log.e(TAG, "Failed to request provisioning GATT service addition");
         }
-        return provisioningAdded && controlAdded;
+        return provisioningAddRequested;
+    }
+
+    @SuppressLint("MissingPermission")
+    private void handleServiceAdded(int status, BluetoothGattService service) {
+        if (service == null) {
+            Log.e(TAG, "GATT service callback returned no service");
+            return;
+        }
+        UUID uuid = service.getUuid();
+        Log.i(TAG, "GATT service added: uuid=" + uuid + " status=" + status);
+        if (status != BluetoothGatt.GATT_SUCCESS || gattServer == null) {
+            Log.e(TAG, "GATT service initialization failed: uuid=" + uuid + " status=" + status);
+            return;
+        }
+        if (SERVICE_ID.equals(uuid)) {
+            if (!gattServer.addService(controlService)) {
+                Log.e(TAG, "Failed to request control GATT service addition");
+            }
+            return;
+        }
+        if (!CONTROL_SERVICE_ID.equals(uuid)) {
+            return;
+        }
+        synchronized (this) {
+            gattServicesReady = true;
+        }
+        Log.i(TAG, "All GATT services ready");
+        startPendingAdvertisingIfReady();
     }
 
     @SuppressLint("MissingPermission")
     public void close() {
         stopAdvertising();
         mainHandler.removeCallbacksAndMessages(null);
-        if (gattServer != null && connectedDevice != null) {
-            gattServer.cancelConnection(connectedDevice);
+        ArrayList<BluetoothDevice> devices;
+        synchronized (this) {
+            devices = new ArrayList<>(connectedDevices);
         }
-        connectedDevice = null;
-        wifiStatusNotifyEnabled = false;
-        ipAddressNotifyEnabled = false;
-        cmdResponseNotifyEnabled = false;
-        errorMsgNotifyEnabled = false;
-        controlChannelReadyNotified = false;
+        if (gattServer != null) {
+            for (BluetoothDevice device : devices) {
+                gattServer.cancelConnection(device);
+            }
+        }
+        synchronized (this) {
+            connectedDevices.clear();
+            notificationSubscribers.clear();
+            controlChannelReadyDevices.clear();
+            provisioningDevice = null;
+            lastControlDevice = null;
+            gattServicesReady = false;
+            advertisingStartPending = false;
+            pendingManufacturerPayload = null;
+        }
         if (gattServer != null) {
             gattServer.close();
             gattServer = null;
@@ -632,8 +865,12 @@ public class BleServerManager {
         Log.d(TAG, "BLE server closed");
     }
 
-    public boolean isDeviceConnected() {
-        return connectedDevice != null;
+    public synchronized boolean isDeviceConnected() {
+        return !connectedDevices.isEmpty();
+    }
+
+    public synchronized int getConnectedDeviceCount() {
+        return connectedDevices.size();
     }
 
     public void notifyIpAddress(String ipAddress) {
@@ -643,7 +880,11 @@ public class BleServerManager {
             return;
         }
         ipAddressChar.setValue(currentIpAddress);
-        notifyCharacteristic(ipAddressChar);
+        BluetoothDevice device;
+        synchronized (this) {
+            device = provisioningDevice;
+        }
+        notifyCharacteristic(device, ipAddressChar);
     }
 
     public void notifyWifiStatus(int status) {
@@ -653,35 +894,58 @@ public class BleServerManager {
             return;
         }
         wifiStatusChar.setValue(new byte[] {(byte) currentWifiStatus});
-        notifyCharacteristic(wifiStatusChar);
+        BluetoothDevice device;
+        synchronized (this) {
+            device = provisioningDevice;
+        }
+        notifyCharacteristic(device, wifiStatusChar);
     }
 
     public void sendCommandResponse(String response) {
+        BluetoothDevice device;
+        synchronized (this) {
+            device = lastControlDevice;
+        }
+        sendCommandResponse(device, response);
+    }
+
+    public void sendCommandResponse(BluetoothDevice device, String response) {
         if (cmdResponseChar == null) {
             Log.w(TAG, "Cannot send command response: characteristic unavailable");
             return;
         }
         cmdResponseChar.setValue(response != null ? response : "");
-        notifyCharacteristic(cmdResponseChar);
+        notifyCharacteristic(device, cmdResponseChar);
     }
 
     public void sendErrorMessage(String message) {
+        BluetoothDevice device;
+        synchronized (this) {
+            device = lastControlDevice;
+        }
+        sendErrorMessage(device, message);
+    }
+
+    public void sendErrorMessage(BluetoothDevice device, String message) {
         if (errorMsgChar == null) {
             Log.w(TAG, "Cannot send error message: characteristic unavailable");
             return;
         }
         errorMsgChar.setValue(message != null ? message : "");
-        notifyCharacteristic(errorMsgChar);
+        notifyCharacteristic(device, errorMsgChar);
     }
 
     @SuppressLint("MissingPermission")
     public void finishProvisioningSession() {
-        restartAdvertisingOnDisconnect = false;
-        stopAdvertising();
-        if (gattServer == null || connectedDevice == null) {
+        BluetoothDevice device;
+        synchronized (this) {
+            device = provisioningDevice;
+        }
+        if (gattServer == null || device == null) {
             return;
         }
-        gattServer.cancelConnection(connectedDevice);
+        Log.i(TAG, "Finishing provisioning client only: address=" + device.getAddress());
+        gattServer.cancelConnection(device);
     }
 
     public void setOnConnectionStateChangeListener(OnConnectionStateChangeListener listener) {
@@ -700,9 +964,13 @@ public class BleServerManager {
         this.controlChannelReadyListener = listener;
     }
 
+    public void setOnDeviceDisconnectedListener(OnDeviceDisconnectedListener listener) {
+        this.deviceDisconnectedListener = listener;
+    }
+
     @SuppressLint("MissingPermission")
-    public boolean startAdvertising() {
-        if (isAdvertising) {
+    public synchronized boolean startAdvertising() {
+        if (isAdvertising || advertisingStartPending) {
             Log.d(TAG, "Already advertising, skipping");
             return true;
         }
@@ -715,13 +983,34 @@ public class BleServerManager {
             Log.e(TAG, "BLE advertising is not supported on this device");
             return false;
         }
+        String serial = getDeviceSerial();
+        if (serial == null || serial.isEmpty()) {
+            Log.e(TAG, "BLE advertising blocked until a valid device serial is available");
+            return false;
+        }
+        pendingManufacturerPayload = serial.getBytes(StandardCharsets.UTF_8);
+        Log.i(TAG, "BLE manufacturer payload ready: length=" + pendingManufacturerPayload.length);
         if (!setupGattServer()) {
             Log.e(TAG, "Failed to setup GATT server");
             return false;
         }
+        if (gattServicesReady) {
+            startPendingAdvertisingIfReady();
+        } else {
+            Log.i(TAG, "BLE advertising deferred until all GATT services are ready");
+        }
+        return true;
+    }
 
-        restartAdvertisingOnDisconnect = true;
-        resetProvisioningState();
+    @SuppressLint("MissingPermission")
+    private synchronized void startPendingAdvertisingIfReady() {
+        if (isAdvertising || advertisingStartPending || !gattServicesReady) {
+            return;
+        }
+        if (advertiser == null || pendingManufacturerPayload == null) {
+            Log.e(TAG, "BLE advertising prerequisites are incomplete");
+            return;
+        }
 
         AdvertiseSettings settings =
                 new AdvertiseSettings.Builder()
@@ -742,20 +1031,21 @@ public class BleServerManager {
                         .setIncludeDeviceName(true)
                         .addManufacturerData(
                                 MANUFACTURER_ID,
-                                getDeviceSerial().getBytes(StandardCharsets.UTF_8))
+                                pendingManufacturerPayload)
                         .build();
 
+        advertisingStartPending = true;
         advertiser.startAdvertising(settings, data, scanResponse, advertiseCallback);
-        return true;
     }
 
     @SuppressLint("MissingPermission")
     public void stopAdvertising() {
-        if (!isAdvertising || advertiser == null) {
+        if ((!isAdvertising && !advertisingStartPending) || advertiser == null) {
             return;
         }
         advertiser.stopAdvertising(advertiseCallback);
         isAdvertising = false;
+        advertisingStartPending = false;
         Log.d(TAG, "BLE advertising stopped");
     }
 }

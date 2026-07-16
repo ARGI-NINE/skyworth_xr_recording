@@ -4,6 +4,7 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.bluetooth.BluetoothDevice;
 import android.content.Intent;
 import android.os.Build;
 import android.os.Handler;
@@ -15,12 +16,18 @@ import android.util.Log;
 import androidx.core.app.NotificationCompat;
 
 import com.ssnwt.helloxr.R;
+import com.ssnwt.vr.androidmanager.AndroidInterface;
 
 import org.json.JSONObject;
+
+import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.Map;
 
 public class BleService extends Service implements BleAidlImpl.BleControlListener {
     private static final String CHANNEL_ID = "ble_service_channel";
     private static final int NOTIFICATION_ID = 1001;
+    private static final long BLE_ADVERTISING_RETRY_DELAY_MS = 1000L;
     private static final String TAG = "BleService";
 
     private BleAidlImpl bleAidlImpl;
@@ -28,7 +35,40 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
     private WifiConnector wifiConnector;
     private HotspotManager hotspotManager;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private long timeSyncHandle = 0L;
+    private final Map<String, Long> timeSyncHandles = new HashMap<>();
+    private boolean bleApiInitializationRequested;
+    private final Runnable bleAdvertisingRetry = this::startBleAdvertising;
+
+    private final AndroidInterface.InitListener bleApiInitListener =
+            new AndroidInterface.InitListener() {
+                @Override
+                public void onInitialized() {
+                    mainHandler.post(
+                            () -> {
+                                bleApiInitializationRequested = false;
+                                startBleAdvertising();
+                            });
+                }
+
+                @Override
+                public void onReleased() {
+                    mainHandler.post(
+                            () -> {
+                                bleApiInitializationRequested = false;
+                                scheduleBleAdvertisingRetry();
+                            });
+                }
+
+                @Override
+                public void onInitError() {
+                    mainHandler.post(
+                            () -> {
+                                bleApiInitializationRequested = false;
+                                Log.e(TAG, "SVR AndroidInterface initialization failed");
+                                scheduleBleAdvertisingRetry();
+                            });
+                }
+            };
 
     private native void nativeInitBleService(String filesDir);
 
@@ -46,20 +86,20 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
         System.loadLibrary("mixedreality");
     }
 
-    private void dispatchNativePayload(String payload) {
+    private void dispatchNativePayload(BluetoothDevice device, String payload) {
         if (payload == null || payload.isEmpty() || bleServerManager == null) {
             return;
         }
         try {
             JSONObject json = new JSONObject(payload);
             if ("failed".equals(json.optString("status"))) {
-                bleServerManager.sendErrorMessage(payload);
+                bleServerManager.sendErrorMessage(device, payload);
             } else {
-                bleServerManager.sendCommandResponse(payload);
+                bleServerManager.sendCommandResponse(device, payload);
             }
         } catch (Exception e) {
             Log.w(TAG, "Failed to parse native BLE payload, sending as response", e);
-            bleServerManager.sendCommandResponse(payload);
+            bleServerManager.sendCommandResponse(device, payload);
         }
     }
 
@@ -82,12 +122,44 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
         }
     }
 
-    private void onControlChannelReady() {
-        if (timeSyncHandle == 0L) {
+    private void onControlChannelReady(BluetoothDevice device) {
+        long handle = getOrCreateTimeSyncHandle(device);
+        if (handle == 0L) {
             return;
         }
         dispatchNativePayload(
-                nativeOnBleReady(timeSyncHandle, SystemClock.elapsedRealtimeNanos()));
+                device,
+                nativeOnBleReady(handle, SystemClock.elapsedRealtimeNanos()));
+    }
+
+    private synchronized long getOrCreateTimeSyncHandle(BluetoothDevice device) {
+        if (device == null) {
+            return 0L;
+        }
+        String address = device.getAddress();
+        Long existing = timeSyncHandles.get(address);
+        if (existing != null) {
+            return existing;
+        }
+        long handle = nativeCreateTimeSyncHandle();
+        if (handle != 0L) {
+            timeSyncHandles.put(address, handle);
+            Log.i(TAG, "Created BLE time-sync session: address=" + address);
+        }
+        return handle;
+    }
+
+    private synchronized void releaseTimeSyncHandle(BluetoothDevice device) {
+        if (device == null) {
+            return;
+        }
+        Long handle = timeSyncHandles.remove(device.getAddress());
+        if (handle == null || handle == 0L) {
+            return;
+        }
+        nativeOnBleDisconnected(handle);
+        nativeDestroyTimeSyncHandle(handle);
+        Log.i(TAG, "Released BLE time-sync session: address=" + device.getAddress());
     }
 
     private Notification buildNotification() {
@@ -120,12 +192,38 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
         if (bleServerManager == null) {
             return;
         }
+
+        AndroidInterface androidInterface = AndroidInterface.getInstance();
+        if (!androidInterface.isInitialized()) {
+            if (!bleApiInitializationRequested) {
+                bleApiInitializationRequested = true;
+                Log.i(TAG, "Waiting for SVR AndroidInterface before BLE advertising");
+                try {
+                    androidInterface.init(getApplication(), bleApiInitListener);
+                } catch (Exception e) {
+                    bleApiInitializationRequested = false;
+                    Log.e(TAG, "Failed to initialize SVR AndroidInterface", e);
+                    scheduleBleAdvertisingRetry();
+                }
+            }
+            return;
+        }
+
+        bleApiInitializationRequested = false;
         boolean started = bleServerManager.startAdvertising();
         Log.i(TAG, "BLE advertising started: " + started);
         if (!started) {
-            Log.e(TAG, "Failed to start BLE advertising, retrying in 3s");
-            mainHandler.postDelayed(bleServerManager::startAdvertising, 3000L);
+            Log.e(TAG, "Failed to start BLE advertising, retrying");
+            scheduleBleAdvertisingRetry();
         }
+    }
+
+    private void scheduleBleAdvertisingRetry() {
+        if (bleServerManager == null) {
+            return;
+        }
+        mainHandler.removeCallbacks(bleAdvertisingRetry);
+        mainHandler.postDelayed(bleAdvertisingRetry, BLE_ADVERTISING_RETRY_DELAY_MS);
     }
 
     @Override
@@ -145,8 +243,8 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
         wifiConnector = new WifiConnector(this);
         bleServerManager = new BleServerManager(this);
         bleServerManager.setOnControlChannelReadyListener(this::onControlChannelReady);
+        bleServerManager.setOnDeviceDisconnectedListener(this::releaseTimeSyncHandle);
         nativeInitBleService(getFilesDir().getAbsolutePath());
-        timeSyncHandle = nativeCreateTimeSyncHandle();
         bleAidlImpl = new BleAidlImpl(bleServerManager, wifiConnector, this);
         startBleAdvertising();
     }
@@ -167,9 +265,14 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
             bleServerManager.close();
             bleServerManager = null;
         }
-        if (timeSyncHandle != 0L) {
-            nativeDestroyTimeSyncHandle(timeSyncHandle);
-            timeSyncHandle = 0L;
+        ArrayList<Long> handles;
+        synchronized (this) {
+            handles = new ArrayList<>(timeSyncHandles.values());
+            timeSyncHandles.clear();
+        }
+        for (long handle : handles) {
+            nativeOnBleDisconnected(handle);
+            nativeDestroyTimeSyncHandle(handle);
         }
         bleAidlImpl = null;
         super.onDestroy();
@@ -186,7 +289,7 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
         if (hotspotManager != null) {
             hotspotManager.start();
         }
-        if (bleServerManager != null && !bleServerManager.isDeviceConnected()) {
+        if (bleServerManager != null) {
             startBleAdvertising();
         }
         return START_STICKY;
@@ -199,13 +302,18 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
     }
 
     @Override
-    public boolean onControlCommand(String command) {
-        if (timeSyncHandle == 0L || !isTimeSyncCommand(command)) {
+    public boolean onControlCommand(BluetoothDevice device, String command) {
+        if (!isTimeSyncCommand(command)) {
+            return false;
+        }
+        long handle = getOrCreateTimeSyncHandle(device);
+        if (handle == 0L) {
             return false;
         }
         dispatchNativePayload(
+                device,
                 nativeOnBleCommand(
-                        timeSyncHandle,
+                        handle,
                         command,
                         SystemClock.elapsedRealtimeNanos()));
         return true;
@@ -213,9 +321,6 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
 
     @Override
     public void onBleConnectionChanged(boolean connected) {
-        if (connected || timeSyncHandle == 0L) {
-            return;
-        }
-        nativeOnBleDisconnected(timeSyncHandle);
+        // Per-device native sessions are released by the device disconnect callback.
     }
 }

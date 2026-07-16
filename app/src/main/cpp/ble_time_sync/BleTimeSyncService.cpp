@@ -50,9 +50,6 @@ std::string BleTimeSyncService::OnControlCommand(const std::string& commandJson,
 
     std::lock_guard<std::mutex> lock(mutex_);
     switch (parsed.type) {
-        case ControlCommandType::kUnknown:
-            NATIVE_LOGI(kLogTag, "event=command_ignored reason=unknown");
-            return std::string();
         case ControlCommandType::kStartTimeSync:
             if (!bleReady_) {
                 lastError_ = ErrorCode::kBleNotReady;

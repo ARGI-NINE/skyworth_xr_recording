@@ -8,7 +8,6 @@
 namespace ble_time_sync {
 
 enum class ControlCommandType {
-    kUnknown,
     kStartTimeSync,
     kCancelSync,
     kTimeSyncRequest,
@@ -17,7 +16,7 @@ enum class ControlCommandType {
 };
 
 struct ControlCommand {
-    ControlCommandType type = ControlCommandType::kUnknown;
+    ControlCommandType type;
     std::string op;
     std::string status;
     std::string action;
