@@ -4,6 +4,8 @@
 #include <unordered_map>
 #include <android/api-level.h>   // android_get_device_api_level()
 #include "CameraEncoder.h"
+#include "OperationCoordinator.h"
+#include "SdkStateBridge.h"
 
 // ======== Global output listener (class-level singleton) ========
 static SXR::IEncoderOutputListener* s_listener = nullptr;
@@ -119,34 +121,10 @@ namespace SXR {
         // When baseDir is empty, skip file output — this encoder is for
         // WebSocket preview streaming only (no MP4 saved to disk).
         if (!mBaseDir.empty()) {
-            if (mType == EncoderType::RGB) {
-                mOutputPath = mBaseDir + "/" + mOutputName;
-            } else {
-                mOutputPath = mBaseDir + "/" + mGroupName + ".mp4";
-            }
-            LOGI("Output path: %s, size: %dx%d, fps: %d, mode: %s",
-                 mOutputPath.c_str(), mWidth, mHeight, mFrameRate,
-                 mMode == EncoderMode::SURFACE ? "Surface" : "Buffer");
-            unlink(mOutputPath.c_str());
-            mkdir(mBaseDir.c_str(), 0777);
-
-            // Fragmented-MP4 writer: ftyp+moov are written lazily from
-            // processOutputBuffer() once the codec reports csd-0 (VPS+SPS+PPS).
-            if (!mFmp4.open(mOutputPath)) {
-                LOGE("FMP4Writer open failed for %s", mOutputPath.c_str());
-            }
-            mFmp4Started = false;
-
-            // Open the per-stream metainfo CSV next to the output mp4:
-            // <name>.mp4 -> <name>_metainfo.csv
-            const std::string csvPath = mOutputPath.substr(0, mOutputPath.size()-4) + "_metainfo.csv";
-            mMetaFile = fopen(csvPath.c_str(), "w");
-            if (mMetaFile) {
-                fprintf(mMetaFile, "frame_index,frame_id,pts_us,exposure_start_utc_ns,exposure_duration_ns,gain,mid_exposure_utc_ns\n");
-                fflush(mMetaFile);
-            } else {
-                LOGE("Failed to open metainfo csv: %s", csvPath.c_str());
-            }
+            std::lock_guard<std::mutex> lock(mDiskMutex);
+            mPendingBaseDir = mBaseDir;
+            mBaseDir.clear();
+            mDiskState = DiskState::ARMING;
         } else {
             LOGI("Output: streaming-only (no MP4), size: %dx%d, fps: %d",
                  mWidth, mHeight, mFrameRate);
@@ -156,20 +134,30 @@ namespace SXR {
     }
 
     bool CameraEncoder::start() {
+        EncoderState expected = EncoderState::STOPPED;
+        if (!mEncoderState.compare_exchange_strong(expected, EncoderState::STARTING))
+            return expected == EncoderState::RUNNING;
         initEncoder();
 
         if (mMode == EncoderMode::SURFACE && !mInputSurface) {
             LOGE("Failed to create input surface");
+            mEncoderState = EncoderState::STOPPED;
             return false;
         }
 
         if (!mCodec) {
             LOGE("Failed to create codec");
+            mEncoderState = EncoderState::STOPPED;
             return false;
         }
 
         mRunning = true;
+        mEncoderState = EncoderState::RUNNING;
         mOutputThread = std::thread(&CameraEncoder::outputLoop, this);
+        {
+            std::lock_guard<std::mutex> lock(mDiskMutex);
+            if (mDiskState == DiskState::ARMING) requestKeyFrame(mCodec, mGroupName);
+        }
 
         const char* typeStr = (mType == EncoderType::RGB) ? "RGB" : "grayscale";
         const char* nameStr = (mType == EncoderType::RGB)
@@ -182,7 +170,8 @@ namespace SXR {
     }
 
     void CameraEncoder::stop() {
-        if (!mRunning) {
+        EncoderState expected = EncoderState::RUNNING;
+        if (!mEncoderState.compare_exchange_strong(expected, EncoderState::STOPPING)) {
             return;
         }
 
@@ -224,24 +213,94 @@ namespace SXR {
 
         // Finalize the fragmented mp4. close() is safe even if start() was never
         // reached (no frames emitted) — it just closes the fd.
-        if (mFmp4Started) {
-            mFmp4.close();
-            LOGI("FMP4Writer closed for %s", mOutputPath.c_str());
-        } else {
-            // Writer was opened but never started (no csd/frames). Close the fd
-            // so we don't leak it; the file may be empty/partial.
-            mFmp4.close();
-        }
-        mFmp4Started = false;
-
-        // Close the per-stream metainfo CSV.
-        if (mMetaFile) {
-            fflush(mMetaFile);
-            fclose(mMetaFile);
-            mMetaFile = nullptr;
-        }
-
         LOGI("CameraEncoder stopped for %s", mOutputPath.c_str());
+        mEncoderState = EncoderState::STOPPED;
+    }
+
+    bool CameraEncoder::armWriter(const std::string& baseDir) {
+        if (baseDir.empty() || !mRunning.load()) return false;
+        {
+            std::lock_guard<std::mutex> lock(mMetaMutex);
+            mMetaQueue.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mDiskMutex);
+            if (mDiskState != DiskState::DETACHED) return mDiskState == DiskState::WRITING;
+            mPendingBaseDir = baseDir;
+            mDiskFailed = false;
+            mDiskState = DiskState::ARMING;
+        }
+        requestKeyFrame(mCodec, mGroupName);
+        return true;
+    }
+
+    bool CameraEncoder::waitWriterArmed(int timeoutMs) {
+        std::unique_lock<std::mutex> lock(mDiskMutex);
+        mDiskCv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] {
+            return mDiskState == DiskState::WRITING || mDiskFailed || !mRunning.load();
+        });
+        return mDiskState == DiskState::WRITING;
+    }
+
+    void CameraEncoder::finalizeWriter() {
+        std::unique_lock<std::mutex> lock(mDiskMutex);
+        if (mDiskState == DiskState::DETACHED) return;
+        mDiskState = DiskState::FINALIZING;
+        lock.unlock(); mDiskCv.notify_all(); lock.lock();
+        mDiskCv.wait(lock, [this] { return mDiskState == DiskState::DETACHED || !mRunning.load(); });
+    }
+
+    bool CameraEncoder::hasWriter() const {
+        std::lock_guard<std::mutex> lock(mDiskMutex);
+        return mDiskState == DiskState::WRITING;
+    }
+
+    bool CameraEncoder::openWriterOnOutputThread() {
+        mBaseDir = mPendingBaseDir;
+        mOutputPath = mBaseDir + "/" + (mType == EncoderType::RGB ? mOutputName : mGroupName + ".mp4");
+        mkdir(mBaseDir.c_str(), 0777); unlink(mOutputPath.c_str());
+        if (!mFmp4.open(mOutputPath)) return false;
+        const std::string csvPath = mOutputPath.substr(0, mOutputPath.size()-4) + "_metainfo.csv";
+        mMetaFile = fopen(csvPath.c_str(), "w");
+        if (!mMetaFile) { mFmp4.close(); return false; }
+        fprintf(mMetaFile, "frame_index,frame_id,pts_us,exposure_start_utc_ns,exposure_duration_ns,gain,mid_exposure_utc_ns\n");
+        mFmp4Started = false; mFirstPtsUs = -1; mFrameIndex = 0;
+        return true;
+    }
+
+    void CameraEncoder::closeWriterOnOutputThread() {
+        mFmp4.close(); mFmp4Started = false;
+        if (mMetaFile) { fflush(mMetaFile); fclose(mMetaFile); mMetaFile = nullptr; }
+        mBaseDir.clear(); mOutputPath.clear();
+    }
+
+    void CameraEncoder::handleDiskCommands() {
+        std::lock_guard<std::mutex> lock(mDiskMutex);
+        if (mDiskState == DiskState::ARMING && mOutputPath.empty()) {
+            if (!openWriterOnOutputThread()) {
+                mDiskFailed = true; mDiskState = DiskState::DETACHED; mDiskCv.notify_all();
+            }
+        } else if (mDiskState == DiskState::FINALIZING) {
+            closeWriterOnOutputThread(); mDiskState = DiskState::DETACHED; mDiskCv.notify_all();
+        }
+    }
+
+    bool CameraEncoder::isVerifiedHevcIdr(const uint8_t* data, size_t size, uint32_t flags) {
+        if (!data || size < 2 || (flags & 0x1U) == 0) return false;
+        size_t p = 0;
+        while (p + 2 <= size) {
+            size_t nal = p, next = size;
+            if (p + 4 <= size && data[p] == 0 && data[p+1] == 0 && data[p+2] == 0 && data[p+3] == 1) nal = p + 4;
+            else if (p + 3 <= size && data[p] == 0 && data[p+1] == 0 && data[p+2] == 1) nal = p + 3;
+            else if (p + 4 <= size) {
+                uint32_t n=(uint32_t(data[p])<<24)|(uint32_t(data[p+1])<<16)|(uint32_t(data[p+2])<<8)|data[p+3];
+                if (n && p + 4 + n <= size) { nal = p + 4; next = p + 4 + n; }
+            }
+            if (nal < size) { const uint8_t type = (data[nal] >> 1) & 0x3f; if (type == 19 || type == 20) return true; }
+            if (next <= p || next == size) break;
+            p = next;
+        }
+        return false;
     }
 
     ANativeWindow* CameraEncoder::getInputSurface() {
@@ -256,7 +315,7 @@ namespace SXR {
 
     void CameraEncoder::submitFrameMeta(const FrameMeta& m) {
         std::lock_guard<std::mutex> lock(mMetaMutex);
-        mMetaQueue.push(m);
+        mMetaQueue.push_back(m);
     }
 
     // Feed frame data to encoder (Buffer mode only)
@@ -326,18 +385,34 @@ namespace SXR {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        // Process remaining output buffers until we get EOS
-        LOGI("Processing remaining buffers for %s", nameStr);
-        int maxIterations = 100;
-        while (!eosReceived && maxIterations-- > 0) {
+        // After input admission is closed, EOS is the authoritative last-frame
+        // boundary. Do not finalize on a fixed dequeue count.
+        LOGI("Processing remaining buffers through EOS for %s", nameStr);
+        const auto eosDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!eosReceived) {
             eosReceived = processOutputBuffer();
+            if (!eosReceived && std::chrono::steady_clock::now() >= eosDeadline) {
+                LOGE("event=encoder_eos_timeout group=%s", nameStr);
+                sdk_state_bridge::ReportError("CameraEncoder", "encoder_eos_timeout",
+                                              "MediaCodec EOS drain timed out", nameStr);
+                break;
+            }
         }
 
-        LOGI("Output loop exited for %s (EOS=%s)", nameStr, eosReceived ? "true" : "false");
+        {
+            std::lock_guard<std::mutex> lock(mDiskMutex);
+            closeWriterOnOutputThread();
+            mDiskState = DiskState::DETACHED;
+            mDiskCv.notify_all();
+        }
+
+        LOGI("event=encoder_eos_drained group=%s last_pts_us=%lld", nameStr,
+             static_cast<long long>(mLastPtsUs));
     }
 
     // Returns true if EOS was received
     bool CameraEncoder::processOutputBuffer() {
+        handleDiskCommands();
         AMediaCodecBufferInfo info;
         ssize_t outIndex = AMediaCodec_dequeueOutputBuffer(mCodec, &info, 5000);
 
@@ -345,10 +420,25 @@ namespace SXR {
             size_t outSize;
             uint8_t* outBuf = AMediaCodec_getOutputBuffer(mCodec, outIndex, &outSize);
 
-            // Lazily start the FMP4Writer on the first usable output: pull the
+            bool isConfig = (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) != 0;
+            FrameMeta outputMeta{};
+            if (!isConfig && outBuf && info.size > 0) {
+                std::lock_guard<std::mutex> lk(mMetaMutex);
+                for (auto it = mMetaQueue.begin(); it != mMetaQueue.end(); ++it) {
+                    const int64_t midUs = it->midExposureBootNs / 1000;
+                    const int64_t startUs = it->exposureStartBootNs / 1000;
+                    if (midUs == info.presentationTimeUs || startUs == info.presentationTimeUs) {
+                        outputMeta = *it; mMetaQueue.erase(it); break;
+                    }
+                }
+                while (mMetaQueue.size() > 240) mMetaQueue.pop_front();
+            }
+
+            // Start the writer only on a flag + NAL verified HEVC IDR.
             // codec's csd-0 (HEVC VPS+SPS+PPS) so the moov/stsd is complete.
             // Skip when mBaseDir is empty (streaming-only mode — no file output).
-            if (!mFmp4Started && outBuf && !mBaseDir.empty()) {
+            if (!mFmp4Started && outBuf && !mBaseDir.empty() && !isConfig &&
+                isVerifiedHevcIdr(outBuf + info.offset, info.size, info.flags)) {
                 AMediaFormat* fmt = AMediaCodec_getOutputFormat(mCodec);
                 const uint8_t* csd0 = nullptr;
                 size_t csd0Len = 0;
@@ -359,17 +449,28 @@ namespace SXR {
                                      mFrameRate > 0 ? 1000000 / mFrameRate : 0);
                 if (mFmp4.start()) {
                     mFmp4Started = true;
+                    {
+                        std::lock_guard<std::mutex> lock(mDiskMutex);
+                        mDiskState = DiskState::WRITING;
+                        mDiskCv.notify_all();
+                    }
                     LOGI("FMP4Writer started for %s (csd-0 %zu bytes)",
                          mOutputPath.c_str(), csd0Len);
                 } else {
                     LOGE("FMP4Writer start() FAILED for %s — samples will be dropped",
                          mOutputPath.c_str());
                     // do NOT set mFmp4Started; subsequent writeSample calls are skipped
+                    {
+                        std::lock_guard<std::mutex> lock(mDiskMutex);
+                        mDiskFailed = true;
+                        mDiskCv.notify_all();
+                    }
+                    sdk_state_bridge::ReportError("CameraEncoder", "writer_start_failed",
+                                                  "fMP4 writer start failed", mGroupName.c_str());
+                    operation::Coordinator::Instance().HandleRecordStop("writer start failure");
                 }
                 AMediaFormat_delete(fmt);
             }
-
-            bool isConfig = (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) != 0;
 
             // === Streaming: forward codec config (VPS/SPS/PPS) to listener ===
             if (isConfig && outBuf && info.size > 0) {
@@ -394,20 +495,19 @@ namespace SXR {
                 if (mFirstPtsUs < 0) mFirstPtsUs = info.presentationTimeUs;
                 const int64_t ptsRel = info.presentationTimeUs - mFirstPtsUs;
 
-                mFmp4.writeSample(outBuf + info.offset, info.size, ptsRel, isKey);
-                mLastPtsUs = ptsRel;
+                const bool sampleWritten =
+                        mFmp4.writeSample(outBuf + info.offset, info.size, ptsRel, isKey);
+                if (!sampleWritten) {
+                    sdk_state_bridge::ReportError("CameraEncoder", "writer_write_failed",
+                                                  "fMP4 sample write failed", mGroupName.c_str());
+                    operation::Coordinator::Instance().HandleRecordStop("writer write failure");
+                }
+                if (sampleWritten) mLastPtsUs = ptsRel;
 
                 // Emit one CSV row per written sample (in encoder output order).
                 // Pop the matching FrameMeta staged by the producer thread.
-                FrameMeta fm{};
-                {
-                    std::lock_guard<std::mutex> lk(mMetaMutex);
-                    if (!mMetaQueue.empty()) {
-                        fm = mMetaQueue.front();
-                        mMetaQueue.pop();
-                    }
-                }
-                if (mMetaFile) {
+                const FrameMeta& fm = outputMeta;
+                if (sampleWritten && mMetaFile) {
                     // pts_us is the zero-based PTS (matches the mp4 sample's PTS
                     // exactly). The UTC columns stay absolute: they come from
                     // FrameMeta (midExposureBoot/exposureStartBoot) plus the

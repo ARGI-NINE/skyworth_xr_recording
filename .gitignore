@@ -19,6 +19,7 @@ docs
 !docs/
 docs/*
 !docs/LINUX_PORTING_PLAN.md
+!docs/LINUX_NATIVE_REIMPLEMENTATION_PLAN.md
 dataset*
 openspec/
 .claude/

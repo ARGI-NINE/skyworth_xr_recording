@@ -9,7 +9,9 @@
 #include <thread>
 #include <atomic>
 #include <queue>
+#include <deque>
 #include <mutex>
+#include <condition_variable>
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -69,6 +71,7 @@ namespace SXR {
 
     class CameraEncoder {
     public:
+        enum class EncoderState { STOPPED, STARTING, RUNNING, STOPPING };
         // Constructor for RGB cameras with Surface mode
         CameraEncoder(int width, int height, int frameRate, int bitRate,
                       const std::string& outputName, const std::string& baseDir = "");
@@ -127,6 +130,11 @@ namespace SXR {
         // switching camera groups so consumers get fresh codec config.
         static void requestKeyFrame(AMediaCodec* codec, const std::string& group);
 
+        bool armWriter(const std::string& baseDir);
+        bool waitWriterArmed(int timeoutMs);
+        void finalizeWriter();
+        bool hasWriter() const;
+
     private:
         void initEncoder();
 
@@ -158,6 +166,7 @@ namespace SXR {
 
         std::thread mOutputThread;
         std::atomic<bool> mRunning{false};
+        std::atomic<EncoderState> mEncoderState{EncoderState::STOPPED};
 
         // Per-frame metadata queue, consumed in encoder output order to write
         // one CSV row per emitted sample. Bounded in practice by the 1:1 drain
@@ -165,7 +174,7 @@ namespace SXR {
         // disabled so output order == presentation order is preserved), so it
         // does not grow unbounded under normal operation.
         std::mutex mMetaMutex;
-        std::queue<FrameMeta> mMetaQueue;
+        std::deque<FrameMeta> mMetaQueue;
 
         // Per-stream CSV (one row per encoded sample).
         FILE* mMetaFile = nullptr;
@@ -178,6 +187,18 @@ namespace SXR {
         // frame so the fMP4 timeline starts at 0, matching AMediaMuxer's
         // behaviour. Reset to -1 in initEncoder().
         int64_t mFirstPtsUs = -1;
+
+        enum class DiskState { DETACHED, ARMING, WRITING, FINALIZING };
+        mutable std::mutex mDiskMutex;
+        std::condition_variable mDiskCv;
+        DiskState mDiskState = DiskState::DETACHED;
+        std::string mPendingBaseDir;
+        bool mDiskFailed = false;
+
+        void handleDiskCommands();
+        void closeWriterOnOutputThread();
+        bool openWriterOnOutputThread();
+        static bool isVerifiedHevcIdr(const uint8_t* data, size_t size, uint32_t flags);
 
         // BOOTTIME→REALTIME offset for timestamp conversion
         int64_t mTimeOffsetNs = 0;

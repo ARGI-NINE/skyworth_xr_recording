@@ -62,8 +62,26 @@ message WifiInfo {
   uint32 channel = 3;
 }
 
+enum OperationMode {
+  MODE_IDLE = 0;
+  MODE_PHONE_PREVIEW = 1;
+  MODE_LOCAL_RECORD = 2;
+  MODE_LOCAL_RECORD_WITH_PREVIEW = 3;
+  MODE_PHONE_RECORD = 4;
+}
+
+enum OperationPhase {
+  PHASE_STABLE = 0;
+  PHASE_STARTING = 1;
+  PHASE_STOPPING = 2;
+  PHASE_ERROR = 3;
+}
+
 message DeviceState {
   DeviceWorkingState working = 1;
+  OperationMode operation_mode = 2;
+  OperationPhase operation_phase = 3;
+  uint64 state_revision = 4;
 
   enum DeviceWorkingState {
     IDLE = 0;

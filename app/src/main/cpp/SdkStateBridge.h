@@ -6,6 +6,11 @@
 namespace sdk_state_bridge {
 
 struct StateSnapshot {
+    // Authoritative business state. Resource booleans below are diagnostics
+    // only and must never be used to infer the operation mode.
+    uint32_t operationMode = 0;
+    uint32_t operationPhase = 0;
+    uint64_t stateRevision = 0;
     bool engineAvailable = false;
     bool isRecording = false;
     bool stopInProgress = false;

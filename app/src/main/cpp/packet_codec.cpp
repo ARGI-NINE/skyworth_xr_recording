@@ -265,9 +265,12 @@ std::string BuildWifiMessage(const WifiInfo& wifi) {
     return out;
 }
 
-std::string BuildDeviceStateMessage(WorkingState state) {
+std::string BuildDeviceStateMessage(const StatusMessage& status) {
     std::string out;
-    WriteUInt32Field(1, static_cast<uint32_t>(state), &out);
+    WriteUInt32Field(1, static_cast<uint32_t>(status.workingState), &out);
+    WriteUInt32Field(2, static_cast<uint32_t>(status.operationMode), &out);
+    WriteUInt32Field(3, static_cast<uint32_t>(status.operationPhase), &out);
+    WriteUInt64Field(4, status.stateRevision, &out);
     return out;
 }
 
@@ -299,7 +302,7 @@ std::string BuildStatusMessage(const StatusMessage& status) {
     if (!wifi.empty()) {
         WriteMessageField(2, wifi, &out);
     }
-    WriteMessageField(3, BuildDeviceStateMessage(status.workingState), &out);
+    WriteMessageField(3, BuildDeviceStateMessage(status), &out);
     const std::string storage = BuildStorageMessage(status.storage);
     if (!storage.empty()) {
         WriteMessageField(4, storage, &out);

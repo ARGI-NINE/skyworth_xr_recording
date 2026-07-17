@@ -92,6 +92,23 @@ enum class WorkingState : uint32_t {
     kFault = 4,
 };
 
+// Authoritative business mode reported in DeviceState.operation_mode (field 2).
+// Resource execution states are deliberately not exposed on the wire.
+enum class OperationMode : uint32_t {
+    kIdle = 0,
+    kPhonePreview = 1,
+    kLocalRecord = 2,
+    kLocalRecordWithPreview = 3,
+    kPhoneRecord = 4,
+};
+
+enum class OperationPhase : uint32_t {
+    kStable = 0,
+    kStarting = 1,
+    kStopping = 2,
+    kError = 3,
+};
+
 enum class FaultLevel : uint32_t {
     kInfo = 0,
     kWarn = 1,
@@ -146,6 +163,9 @@ struct StatusMessage {
     BatteryInfo battery;
     WifiInfo wifi;
     WorkingState workingState = WorkingState::kIdle;
+    OperationMode operationMode = OperationMode::kIdle;
+    OperationPhase operationPhase = OperationPhase::kStable;
+    uint64_t stateRevision = 0;
     StorageInfo storage;
     std::vector<PeripheralState> peripherals;
 };

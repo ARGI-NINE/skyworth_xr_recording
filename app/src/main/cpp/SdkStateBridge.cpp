@@ -203,6 +203,9 @@ std::string GetStateJson() {
         << ",\"provider_registered\":" << (providerRegistered ? "true" : "false")
         << ",\"engine_available\":" << (snapshot.engineAvailable ? "true" : "false")
         << ",\"capture_state\":\"" << EscapeJson(snapshot.captureState) << "\""
+        << ",\"operation_mode\":" << snapshot.operationMode
+        << ",\"operation_phase\":" << snapshot.operationPhase
+        << ",\"state_revision\":" << snapshot.stateRevision
         << ",\"is_recording\":" << (snapshot.isRecording ? "true" : "false")
         << ",\"stop_in_progress\":" << (snapshot.stopInProgress ? "true" : "false")
         << ",\"encoding_enabled\":" << (snapshot.encodingEnabled ? "true" : "false")

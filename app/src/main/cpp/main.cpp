@@ -70,6 +70,7 @@ namespace glext {
 #include "RawDateSave.h"
 #include "input.h"
 #include "DatasetRecorder.h"
+#include "OperationCoordinator.h"
 #include "DatasetExporter.h"
 #include "ControllerPoseSaver.h"
 #include "NativeLogger.h"
@@ -1753,27 +1754,30 @@ struct CameraAccessExtension{
         }
 
         // Create single SBS encoder (2W x H, 8Mbps, rgb.mp4)
-        rgbEncoder = new SXR::CameraEncoder(sbsWidth, height, 30, 8000000, "rgb.mp4", encoderBaseDir);
-        rgbEncoder->setTimeOffset(mCameraTimeOffsetNs);
-        if (!rgbEncoder->start()) {
+        // Build the encoder off to the side. Publishing rgbEncoder before
+        // start() completed let the recording worker observe mRunning=false
+        // and incorrectly treat writer arming as a timeout.
+        auto* encoder = new SXR::CameraEncoder(
+                sbsWidth, height, 30, 8000000, "rgb.mp4", encoderBaseDir);
+        encoder->setTimeOffset(mCameraTimeOffsetNs);
+        if (!encoder->start()) {
             LOGE("RGB encoder start failed");
-            delete rgbEncoder;
-            rgbEncoder = nullptr;
+            delete encoder;
             return;
         }
 
         // Create encoder surface
-        rgbEncoderSurface = new SXR::EncoderSurface();
-        ANativeWindow* window = rgbEncoder->getInputSurface();
-        if (!window || !rgbEncoderSurface->init(window, rgbCtx.display, rgbCtx.context)) {
+        auto* surface = new SXR::EncoderSurface();
+        ANativeWindow* window = encoder->getInputSurface();
+        if (!window || !surface->init(window, rgbCtx.display, rgbCtx.context)) {
             LOGE("RGB encoder surface init failed");
-            delete rgbEncoderSurface;
-            rgbEncoderSurface = nullptr;
-            rgbEncoder->stop();
-            delete rgbEncoder;
-            rgbEncoder = nullptr;
+            delete surface;
+            encoder->stop();
+            delete encoder;
             return;
         }
+        rgbEncoder = encoder;
+        rgbEncoderSurface = surface;
         protocol_adapter::OnRgbEncoderReady(rgbEncoder->getCodec());
         LOGI("RGB SBS encoder initialized: %dx%d", sbsWidth, height);
     }
@@ -2025,8 +2029,7 @@ struct CameraAccessExtension{
 
             // Lazy init recording encoder (only when dataset recording is active)
             if (!rgbEncoder &&
-                recordThisFrame &&
-                !encoderBaseDir.empty()) {
+                recordThisFrame) {
                 initEncodersAndSurfaces(frameWidth, frameHeight);
             }
         }
@@ -3072,6 +3075,10 @@ static bool FillSdkStateSnapshot(sdk_state_bridge::StateSnapshot* out) {
     }
 
     auto& camera = g_engine->mCameraAccessExtension;
+    const operation::Snapshot operationState = operation::Coordinator::Instance().GetSnapshot();
+    out->operationMode = static_cast<uint32_t>(operationState.mode);
+    out->operationPhase = static_cast<uint32_t>(operationState.phase);
+    out->stateRevision = operationState.revision;
     out->engineAvailable = true;
     out->isRecording = g_engine->mDatasetRecorder.isRecording();
     out->stopInProgress = camera.stopInProgress.load();
@@ -3596,54 +3603,10 @@ Java_com_ssnwt_helloxr_VrNativeActivity_nativeRequestSnapshot(JNIEnv *env, jobje
     }
 }
 
-// Unified async recording-stop path. Shared by intent, controller button,
-// and the 12h auto-stop guard. Tears down encoder → recorder → hand/controller
-// session off the render thread, then TTS + log. Ordering (encoder before
-// recorder) keeps head_pose/hand_tracking CSV rows 1:1 with metainfo.
+// Every stop source only posts to the authoritative serialized coordinator.
 static void stopRecordingAsync(struct engine* e, const char* reason, const char* ttsMsg) {
-    LOGI("Stopping dataset recording (%s, async)...", reason);
-    if (e->mCameraAccessExtension.stopInProgress.exchange(true)) {
-        LOGW("stopRecordingAsync: stop already in progress (%s)", reason);
-        return;
-    }
-    e->autoStopRequested = true;
-    e->mCameraAccessExtension.encodingEnabled = false;
-    {
-        std::lock_guard<std::mutex> lk(e->mCameraAccessExtension.callbackDrainMutex);
-        e->mCameraAccessExtension.callbackAdmissionClosed = true;
-    }
-    if (!e->useControllerMode) {
-        e->mDatasetRecorder.writeCaptureStatusJson(
-            "finalizing", e->mHandTrackerLogic.rawDateSave);
-    }
-    std::thread([e, ttsMsg, reason]() {
-        e->mCameraAccessExtension.stopEncoder();
-        {
-            std::unique_lock<std::mutex> lk(s_alignDrainMutex);
-            s_alignDrainCv.wait(lk, [] {
-                return s_alignTs.load(std::memory_order_acquire) < 0 &&
-                       s_alignInFlight.load(std::memory_order_acquire) == 0;
-            });
-        }
-        e->mCameraAccessExtension.encodingEnabled = false;
-        e->mCameraAccessExtension.encoderBaseDir.clear();
-
-        e->mDatasetRecorder.stop();
-        if (e->useControllerMode) {
-            e->mControllerPoseSaver.StopSession();
-        } else {
-            e->mHandTrackerLogic.rawDateSave->StopSession();
-            e->mDatasetRecorder.writeCaptureStatusJson(
-                "complete", e->mHandTrackerLogic.rawDateSave);
-        }
-        e->mCameraAccessExtension.stopInProgress = false;
-        {
-            std::lock_guard<std::mutex> lk(e->mCameraAccessExtension.callbackDrainMutex);
-            e->mCameraAccessExtension.callbackAdmissionClosed = false;
-        }
-        ttsSpeak(ttsMsg);
-        LOGI("%s: async encoder + recorder stop completed", reason);
-    }).detach();
+    (void)e; (void)ttsMsg;
+    operation::Coordinator::Instance().HandleRecordStop(reason);
 }
 
 extern "C" bool RequestDeviceReboot() {
@@ -3706,6 +3669,7 @@ static bool startDatasetRecordingSession(struct engine* e,
     if (e == nullptr || e->mDatasetRecorder.isRecording()) {
         return false;
     }
+    const bool encoderAlreadyRunning = e->mCameraAccessExtension.rgbEncoder != nullptr;
 
     // Storage guard: refuse to start below 1 GiB free.
     int64_t avail = getAvailableBytes(storagePath);
@@ -3724,10 +3688,29 @@ static bool startDatasetRecordingSession(struct engine* e,
         LOGE("%s: DatasetRecorder::start failed", startSource);
         return false;
     }
-    protocol_adapter::OnRecordingSessionStarted();
+    if (!encoderAlreadyRunning) protocol_adapter::OnRecordingSessionStarted();
     e->recordingStartTime = std::chrono::steady_clock::now();
     e->autoStopRequested = false;
     e->mCameraAccessExtension.encoderBaseDir = e->mDatasetRecorder.getDatasetDir();
+    if (encoderAlreadyRunning) {
+        auto& ext = e->mCameraAccessExtension;
+        {
+            std::unique_lock<std::mutex> lock(ext.callbackDrainMutex);
+            ext.callbackAdmissionClosed = true;
+            ext.callbackDrainCV.wait(lock, [&ext] { return ext.inFlightCallbacks.load() == 0; });
+        }
+        bool armed = ext.rgbEncoder->armWriter(ext.encoderBaseDir);
+        if (ext.trackingEncoder) armed = ext.trackingEncoder->armWriter(ext.encoderBaseDir) && armed;
+        if (ext.ctrlEncoder) armed = ext.ctrlEncoder->armWriter(ext.encoderBaseDir) && armed;
+        {
+            std::lock_guard<std::mutex> lock(ext.callbackDrainMutex);
+            ext.callbackAdmissionClosed = false;
+        }
+        if (!armed) {
+            LOGE("%s: failed to arm dynamic writer", startSource);
+            return false;
+        }
+    }
     // IMU calibration sidecar (device-global; no camera context needed)
     {
         auto& ext = e->mCameraAccessExtension;
@@ -3765,29 +3748,132 @@ static bool startDatasetRecordingSession(struct engine* e,
         e->mDatasetRecorder.writeCaptureStatusJson(
             "recording", e->mHandTrackerLogic.rawDateSave);
     }
-    ttsSpeak("开始录制");
+    for (int i = 0; i < 300 && e->mCameraAccessExtension.rgbEncoder == nullptr; ++i) usleep(10000);
+    auto& writerExt = e->mCameraAccessExtension;
+    bool writerReady = writerExt.rgbEncoder && writerExt.rgbEncoder->waitWriterArmed(2000);
+    if (writerExt.trackingEncoder) writerReady = writerExt.trackingEncoder->waitWriterArmed(2000) && writerReady;
+    if (writerExt.ctrlEncoder) writerReady = writerExt.ctrlEncoder->waitWriterArmed(2000) && writerReady;
+    if (!writerReady) {
+        LOGE("%s: verified IDR writer attach timed out", startSource);
+        if (writerExt.rgbEncoder) writerExt.rgbEncoder->finalizeWriter();
+        if (writerExt.trackingEncoder) writerExt.trackingEncoder->finalizeWriter();
+        if (writerExt.ctrlEncoder) writerExt.ctrlEncoder->finalizeWriter();
+        return false;
+    }
     return true;
+}
+
+static std::mutex gOperationMediaMutex;
+
+static bool coordinatorStartPreview(operation::Mode target, uint64_t revision) {
+    std::lock_guard<std::mutex> mediaLock(gOperationMediaMutex);
+    if (!g_engine) return false;
+    const operation::Snapshot s = operation::Coordinator::Instance().GetSnapshot();
+    if (s.revision + 1 != revision || s.phase != operation::Phase::STABLE) return false;
+    auto& ext = g_engine->mCameraAccessExtension;
+    if (target == operation::Mode::LOCAL_RECORD_WITH_PREVIEW) {
+        protocol_adapter::SetStreamingEnabled(true);
+        LOGI("event=local_record_preview_enabled revision=%llu encoder_reused=true",
+             (unsigned long long)revision);
+        return ext.rgbEncoder != nullptr;
+    }
+    protocol_adapter::OnRecordingSessionStarted();
+    protocol_adapter::SetStreamingEnabled(true);
+    ext.encoderBaseDir.clear();
+    ext.encodingEnabled = true;
+    ext.encodersStopped = false;
+    for (int i = 0; i < 300 && ext.rgbEncoder == nullptr; ++i) usleep(10000);
+    const bool ok = ext.rgbEncoder != nullptr;
+    LOGI("event=preview_encoder_start revision=%llu result=%s",
+         (unsigned long long)revision, ok ? "ok" : "failed");
+    return ok;
+}
+
+static void coordinatorStopPreview(operation::Mode target, uint64_t) {
+    std::lock_guard<std::mutex> mediaLock(gOperationMediaMutex);
+    if (!g_engine) return;
+    protocol_adapter::SetStreamingEnabled(false);
+    if (target == operation::Mode::LOCAL_RECORD) return;
+    auto& ext = g_engine->mCameraAccessExtension;
+    ext.encodingEnabled = false;
+    ext.stopEncoder();
+    ext.stopInProgress = false;
+    { std::lock_guard<std::mutex> lock(ext.callbackDrainMutex); ext.callbackAdmissionClosed = false; }
+}
+
+static bool coordinatorStartRecording(operation::Mode target, uint64_t revision) {
+    std::lock_guard<std::mutex> mediaLock(gOperationMediaMutex);
+    const operation::Snapshot before = operation::Coordinator::Instance().GetSnapshot();
+    if (!g_engine || before.revision != revision || before.phase != operation::Phase::STARTING) return false;
+    auto& ext = g_engine->mCameraAccessExtension;
+    const bool encoderWasRunning = ext.rgbEncoder != nullptr;
+    const bool ok = startDatasetRecordingSession(g_engine,
+            target == operation::Mode::PHONE_RECORD ? "phone" : "local",
+            "Starting authoritative dataset recording");
+    if (!ok) {
+        // Roll back every dataset-side component. The coordinator decides
+        // whether the already-running preview encoder is retained.
+        if (g_engine->useControllerMode) g_engine->mControllerPoseSaver.StopSession();
+        else g_engine->mHandTrackerLogic.rawDateSave->StopSession();
+        g_engine->mDatasetRecorder.stop();
+        ext.encoderBaseDir.clear();
+        if (!encoderWasRunning) {
+            protocol_adapter::SetStreamingEnabled(false);
+            ext.encodingEnabled = false; ext.stopEncoder(); ext.stopInProgress = false;
+            std::lock_guard<std::mutex> lock(ext.callbackDrainMutex); ext.callbackAdmissionClosed = false;
+        }
+    } else {
+        if (target == operation::Mode::PHONE_RECORD || target == operation::Mode::LOCAL_RECORD_WITH_PREVIEW)
+            protocol_adapter::SetStreamingEnabled(true);
+        LOGI("event=record_writer_idr_confirmed revision=%llu encoder_reused=%s",
+             (unsigned long long)revision,
+             target == operation::Mode::PHONE_RECORD || target == operation::Mode::LOCAL_RECORD_WITH_PREVIEW ? "true" : "false");
+        // Announce only after writer attach and verified-IDR acceptance. A Stop
+        // that wins during STARTING makes this revision stale and suppresses the
+        // misleading start prompt.
+        const operation::Snapshot completed = operation::Coordinator::Instance().GetSnapshot();
+        if (completed.revision == revision && completed.phase == operation::Phase::STARTING) {
+            ttsSpeak("开始录制");
+        }
+    }
+    return ok;
+}
+
+static void coordinatorStopRecording(uint64_t revision, const std::string& reason) {
+    std::lock_guard<std::mutex> mediaLock(gOperationMediaMutex);
+    if (!g_engine) return;
+    auto& ext = g_engine->mCameraAccessExtension;
+    protocol_adapter::SetStreamingEnabled(false);
+    ext.encodingEnabled = false;
+    { std::lock_guard<std::mutex> lock(ext.callbackDrainMutex); ext.callbackAdmissionClosed = true; }
+    if (g_engine->mDatasetRecorder.isRecording())
+        g_engine->mDatasetRecorder.writeCaptureStatusJson("finalizing", g_engine->mHandTrackerLogic.rawDateSave);
+    ext.stopEncoder();
+    // Writer finalize/EOS drain has completed, while the authoritative state
+    // intentionally remains STOPPING until all side-channel collectors stop.
+    protocol_adapter::NotifyAuthoritativeStateChanged();
+    g_engine->mDatasetRecorder.stop();
+    if (g_engine->useControllerMode) g_engine->mControllerPoseSaver.StopSession();
+    else g_engine->mHandTrackerLogic.rawDateSave->StopSession();
+    ext.encoderBaseDir.clear(); ext.stopInProgress = false;
+    { std::lock_guard<std::mutex> lock(ext.callbackDrainMutex); ext.callbackAdmissionClosed = false; }
+    LOGI("event=global_record_stop_complete revision=%llu", (unsigned long long)revision);
+    // The second physical press is a Stop. Speak only after EOS drain, writer
+    // finalize and all dataset-side collectors have stopped.
+    ttsSpeak(reason.find("low storage") != std::string::npos
+                     ? "存储空间已满，无法继续保存"
+                     : "录制已保存");
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartRecording(JNIEnv *env, jobject thiz) {
-    if (g_engine && !g_engine->mDatasetRecorder.isRecording()) {
-        startDatasetRecordingSession(
-            g_engine,
-            "nativeStartRecording",
-            "Start recording via intent");
-    }
+    operation::Coordinator::Instance().HandleRecordStart(
+            operation::RecordOrigin::ADB, "ADB START_RECORDING");
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_ssnwt_helloxr_VrNativeActivity_nativeStopRecording(JNIEnv *env, jobject thiz) {
-    if (g_engine && g_engine->mDatasetRecorder.isRecording()) {
-        // Stop encoder first, then stop recorder in the same async thread.
-        // This ordering guarantees that saveAlignedSensorData (called from the
-        // render thread during encoder submission) completes before the recorder
-        // is torn down, so head_pose / hand_tracking CSV rows stay 1:1 with mett.
-        stopRecordingAsync(g_engine, "intent", "录制已保存");
-    }
+    stopRecordingAsync(g_engine, "ADB STOP_RECORDING", nullptr);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -5194,7 +5280,8 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                 e->mCameraAccessExtension.snapshotRequested = true;
                 return 1;
             }
-            if (keyCode == AKEYCODE_DPAD_CENTER || keyCode == AKEYCODE_ENTER) {
+            if ((keyCode == AKEYCODE_DPAD_CENTER || keyCode == AKEYCODE_ENTER) &&
+                AKeyEvent_getRepeatCount(event) == 0) {
                 e->dpadCenterPressed = true;
                 return 1;
             }
@@ -5250,6 +5337,15 @@ void android_main(struct android_app *state)
         g_activity = ttsEnv->NewGlobalRef(activity);
     }
     NativeLoggerInit(storagePath);
+    operation::MediaActions operationActions;
+    operationActions.startRecording = &coordinatorStartRecording;
+    operationActions.stopRecording = &coordinatorStopRecording;
+    operationActions.startPreview = &coordinatorStartPreview;
+    operationActions.stopPreview = &coordinatorStopPreview;
+    operationActions.stateChanged = [](const operation::Snapshot&) {
+        protocol_adapter::NotifyAuthoritativeStateChanged();
+    };
+    operation::Coordinator::Instance().Start(std::move(operationActions));
     protocol_adapter::Start(storagePath);
 
     if (engine.mCameraAccessExtension.initCameras(vm, activity)) {
@@ -5511,17 +5607,7 @@ void android_main(struct android_app *state)
         bool curToggle = engine.inputPtr->mRightBPressed || engine.dpadCenterPressed;
         engine.dpadCenterPressed = false;
         if (curToggle && !engine.prevRecordingToggle) {
-            if (engine.mDatasetRecorder.isRecording()) {
-                stopRecordingAsync(&engine, "right B", "录制已保存");
-            } else {
-                if (!startDatasetRecordingSession(
-                        &engine,
-                        "Right B start",
-                        "Starting dataset recording (right B)...")) {
-                    engine.prevRecordingToggle = curToggle;
-                    continue;
-                }
-            }
+            operation::Coordinator::Instance().HandleRecordToggle("device record button");
         }
         engine.prevRecordingToggle = curToggle;
 
@@ -5699,6 +5785,7 @@ cleanup:
 
     // Stop image saver worker thread
     ImageSaver::Instance().shutdown();
+    operation::Coordinator::Instance().Stop();
     protocol_adapter::Stop();
     NativeLoggerShutdown();
 

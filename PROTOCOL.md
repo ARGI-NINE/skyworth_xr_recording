@@ -1,5 +1,116 @@
 # EgoCollect 通讯协议文档
 
+## 录制与预览统一状态机（权威规范）
+
+> 本节自 SDK 1.5.0 状态机拆分版本起生效，并取代本文后续章节中所有旧的录制/预览耦合语义。命令枚举值和既有 protobuf 字段号保持不变。
+
+### 三层职责与权威状态
+
+业务状态层是唯一权威状态；媒体资源层只能执行由业务状态派生的编码、落盘和推流目标；App UI 只消费 SDK 上报的 `operation_mode`、`operation_phase` 和 `state_revision`。App 不得用本地 socket、decoder、`videoActive` 或旧 `working` 推测业务模式。
+
+五个稳定模式及资源派生如下：
+
+| `OperationMode` | 业务含义 | 编码器 | 落盘 | TCP 8802 推流 |
+|---|---|---:|---:|---:|
+| `MODE_IDLE` | 空闲 | 关 | 关 | 关 |
+| `MODE_PHONE_PREVIEW` | 手机独立预览 | 开 | 关 | 开 |
+| `MODE_LOCAL_RECORD` | 设备按键或 ADB 本地录制 | 开 | 开 | 关 |
+| `MODE_LOCAL_RECORD_WITH_PREVIEW` | 本地录制并由手机另开预览 | 开 | 开 | 开 |
+| `MODE_PHONE_RECORD` | 手机发起录制；推流是录制固有部分 | 开 | 开 | 开 |
+
+`MODE_LOCAL_RECORD_WITH_PREVIEW` 与 `MODE_PHONE_RECORD` 的资源相同但业务语义不同，不能合并。设备按键和 ADB 在协议上统一为本地录制，不上报来源。
+
+### DeviceState wire 定义
+
+```protobuf
+enum OperationMode {
+  MODE_IDLE = 0;
+  MODE_PHONE_PREVIEW = 1;
+  MODE_LOCAL_RECORD = 2;
+  MODE_LOCAL_RECORD_WITH_PREVIEW = 3;
+  MODE_PHONE_RECORD = 4;
+}
+
+enum OperationPhase {
+  PHASE_STABLE = 0;
+  PHASE_STARTING = 1;
+  PHASE_STOPPING = 2;
+  PHASE_ERROR = 3;
+}
+
+message DeviceState {
+  DeviceWorkingState working = 1; // 兼容字段
+  OperationMode operation_mode = 2;
+  OperationPhase operation_phase = 3;
+  uint64 state_revision = 4;
+}
+```
+
+`working` 的兼容映射：`MODE_IDLE` 和 `MODE_PHONE_PREVIEW` 为 `IDLE`；三个录制模式为 `COLLECTING`；录制停止完成前即使处于 `PHASE_STOPPING` 仍为 `COLLECTING`，完成后才为 `IDLE`。新 App 必须以三个新字段为准，并丢弃 `state_revision` 小于当前已应用版本的 Status；Response 与 Status 允许乱序。
+
+每次进入 `STARTING`、稳定模式、`STOPPING`、最终 `IDLE` 或 `ERROR` 都递增 revision 并立即主动上报。预览进入/退出、动态 writer 成功、writer finalize、启动失败、编码器错误、自动停止和低存储停止同样必须立即上报相应权威状态。内部 encoder/disk/stream 状态、来源、session、socket 连接等不进入协议。
+
+### 串行状态转移表
+
+所有 TCP 命令、设备按键、ADB、自动/低存储/媒体错误及异步完成事件进入同一个串行协调队列。表中“幂等”表示返回成功并立即发送当前 Status；“忽略”不改变 mode/revision，命令响应不得暗示来源已切换。
+
+| 当前稳定 Mode | `START_COLLECT`（手机） | 本地 Start（按键/ADB） | `STOP_COLLECT`/本地 Stop | `START_VIDEO` | `STOP_VIDEO` |
+|---|---|---|---|---|---|
+| `IDLE` | `PHONE_RECORD/STARTING` | `LOCAL_RECORD/STARTING` | 幂等 | `PHONE_PREVIEW` | 幂等 |
+| `PHONE_PREVIEW` | `PHONE_RECORD/STARTING`，复用编码器/8802 | `LOCAL_RECORD_WITH_PREVIEW/STARTING`，复用编码器/8802 | 幂等，不结束预览 | 幂等 | `IDLE` |
+| `LOCAL_RECORD` | 幂等忽略 | 幂等忽略 | `STOPPING` | `LOCAL_RECORD_WITH_PREVIEW` | 幂等 |
+| `LOCAL_RECORD_WITH_PREVIEW` | 幂等忽略 | 幂等忽略 | `STOPPING` | 幂等 | `LOCAL_RECORD` |
+| `PHONE_RECORD` | 幂等忽略 | 幂等忽略 | `STOPPING` | 忽略 | 忽略 |
+| 任意 Mode + `STARTING` | 忽略 | 忽略 | 接受首个 Stop，转 `STOPPING` | 忽略 | 忽略 |
+| 任意 Mode + `STOPPING` | 忽略 | 忽略 | 复用当前停止过程 | 忽略 | 忽略 |
+| 任意 Mode + `ERROR` | 忽略 | 忽略 | 忽略 | 忽略 | 忽略 |
+
+设备录制键是统一 Toggle：`IDLE`/`PHONE_PREVIEW` 投递本地 Start；三个录制模式投递统一 Stop。特别地，`PHONE_RECORD` 按键必须停止当前录制，不能切换为本地来源。ADB START/STOP 遵循同一入口，不得直接创建或销毁 DatasetRecorder、writer 或编码器。
+
+统一入口为 `HandleRecordStart(origin)` 与 `HandleRecordStop(reason)`。`origin` 仅决定第一次有效 Start 的目标是 PHONE 还是 LOCAL；一旦任何录制存在或已经 `STARTING`，后续 Start 全部幂等忽略，不创建第二个线程、dataset、writer 或编码器。第一个有效 Stop 立即进入 `STOPPING`；后续所有 Stop 复用该停止过程，不重复 finalize、close、stop 或 delete。
+
+### 动态挂载 writer 与首帧定义
+
+`PHONE_PREVIEW -> PHONE_RECORD` 和 `PHONE_PREVIEW -> LOCAL_RECORD_WITH_PREVIEW` 禁止停止预览、断开 8802、销毁 decoder/MediaCodec 或重启编码器。接受 Start 后先上报目标 Mode + `STARTING`，创建 DatasetRecorder 和新 writer，然后在下一次提交 MediaCodec 输入前建立帧屏障，请求 HEVC sync frame，再恢复提交。
+
+编码输出线程必须同时依据 codec buffer flag 和 HEVC NAL unit type 验证真实 IDR。IDR 前的样本继续发往 8802，但不能写入文件；确认后的 IDR 是 MP4 与 `metainfo.csv` 的第一帧，文件 PTS 以该 IDR 为零点，缓存 VPS/SPS/PPS 用于生成 hvcC。writer 成功写入 IDR 后转 `PHASE_STABLE` 并上报。不能把 `requestKeyFrame()` 后的下一输出直接假定为 I 帧。
+
+若规定帧数/时间内没有 IDR，不生成损坏文件；关闭未完成 dataset/writer，回滚到 `PHONE_PREVIEW/STABLE`，保留原编码器、8802 和连续画面，并上报启动失败。IDR 等待或 writer `ARMING` 时收到 Stop，Stop 优先并进入统一停止过程。
+
+`LOCAL_RECORD -> LOCAL_RECORD_WITH_PREVIEW` 保留现有 writer 与 MP4 时间轴，启动 8802，先发送缓存 VPS/SPS/PPS，再请求新 IDR供手机起解；该 IDR仍正常写入原 MP4。反向转移只禁止新网络帧、清空网络队列并 shutdown 8802，不发送编码 EOS，不关闭 writer、DatasetRecorder 或编码器。
+
+### 全局停止、末帧与线程规则
+
+第一个有效 Stop 的严格顺序是：
+
+1. 串行协调器设置 `PHASE_STOPPING`，递增 revision 并立即上报；App 禁用全部按钮。
+2. 清除录制和预览/推流意图，禁止新帧进入网络队列，shutdown 8802 解除阻塞 send。
+3. 关闭新的相机帧编码提交入口，确定最后提交边界，然后向 MediaCodec 发送 EOS。
+4. 编码输出线程排空 EOS 之前的有效编码样本；这些样本仍写入当前 fMP4。
+5. 编码输出线程串行 finalize/close writer；停止 DatasetRecorder 的音频、IMU、Pose、手部/控制器数据。
+6. 销毁 EncoderSurface，停止并由唯一所有者销毁 MediaCodec，清空编码和网络队列。
+7. 设置 `MODE_IDLE/PHASE_STABLE`，再次递增 revision 并立即上报；`working` 此时切换为 `IDLE`。
+
+“末帧”定义为关闭编码提交入口后、EOS 之前由编码输出线程排空并成功提交给 writer 的最后一个有效编码样本；EOS 本身不是媒体帧。网络发送线程阻塞不得阻塞文件写入，文件 sink 不使用网络队列的丢旧帧策略。writer attach/write/finalize/close 仅由编码输出线程串行执行，同一个 MediaCodec 只能由一个线程 stop/delete。
+
+异步任务携带启动时 revision；完成时若 revision 已过期，不得覆盖当前状态。状态锁内禁止 join、socket send、codec drain、writer finalize、文件 flush 和 DatasetRecorder stop。
+
+### App 按钮与视频连接
+
+非 `PHASE_STABLE` 时四个按钮全部禁用。稳定态固定矩阵：
+
+| Mode | 开始录制 | 停止录制 | 开始预览 | 停止预览 |
+|---|---:|---:|---:|---:|
+| `IDLE` | 开 | 关 | 开 | 关 |
+| `PHONE_PREVIEW` | 开 | 关 | 关 | 开 |
+| `LOCAL_RECORD` | 关 | 开 | 开 | 关 |
+| `LOCAL_RECORD_WITH_PREVIEW` | 关 | 开 | 关 | 开 |
+| `PHONE_RECORD` | 关 | 开 | 关 | 关 |
+
+App 仅保留 `commandPending` 防重复点击。`PHONE_PREVIEW` 点击开始录制只发送 `CMD_START_COLLECT`，不发送 `CMD_STOP_VIDEO`，不关闭 8802/decoder。是否需要 8802 只由 `shouldStream = PHONE_PREVIEW || LOCAL_RECORD_WITH_PREVIEW || PHONE_RECORD` 派生；`PHONE_PREVIEW -> PHONE_RECORD` 保持连接和 decoder。任意录制停止到 `IDLE` 后无条件关闭 8802 并销毁 decoder。
+
+8802 意外断开只清理 App 本地连接状态，不伪造 SDK mode；只要当前 mode 仍要求推流就允许重连。Surface 销毁只清理本地 Surface/decoder，不能发送终止本地录制的命令；`PHONE_RECORD` 中不得发送 `CMD_STOP_VIDEO`。
+
 > 版本：v1.4  
 > 日期：2026-07-14  
 > 适用：当前 SDK 1.5.0 设备端 / 手机端联调
@@ -1196,7 +1307,7 @@ message Response {
 说明：
 
 - `stream_state = "active"` 表示“设备已打开视频发送开关并可向 :8802 推流”，不是“首帧已经送达”的确认。
-- `CMD_START_VIDEO` 会在需要时顺带拉起录制；若录制无法启动，会直接返回错误而不是进入 `armed` 之类的中间态。
+- `CMD_START_VIDEO` 只请求独立手机预览：`IDLE -> PHONE_PREVIEW`，不会创建 dataset 或开启落盘；录制只能由统一 `HandleRecordStart(origin)` 入口启动。
 
 ### 4.2 编码格式
 
@@ -1274,7 +1385,7 @@ message Response {
 
 视频子状态:
   ┌───────┐  CMD_START_VIDEO  ┌──────────┐
-  │ IDLE  │ ─────────────────→ │ STREAMING│ (TCP :8802，RGB HEVC)
+  │ IDLE  │ ─────────────────→ │ PHONE_PREVIEW │ (TCP :8802，RGB HEVC，不落盘)
   │       │ ←───────────────── │          │
   └───────┘  CMD_STOP_VIDEO    └──────────┘
 ```

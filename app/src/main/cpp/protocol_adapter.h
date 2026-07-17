@@ -16,4 +16,8 @@ void OnRgbEncoderReady(AMediaCodec* codec);
 
 void OnRecordingSessionStopped();
 
+// Media sink controls used only by the authoritative operation coordinator.
+void SetStreamingEnabled(bool enabled);
+void NotifyAuthoritativeStateChanged();
+
 }  // namespace protocol_adapter

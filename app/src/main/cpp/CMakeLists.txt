@@ -108,6 +108,7 @@ list(APPEND main_src
         ${CMAKE_CURRENT_SOURCE_DIR}/packet_codec.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/platform_state_bridge.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/protocol_adapter.cpp)
+list(APPEND main_src ${CMAKE_CURRENT_SOURCE_DIR}/OperationCoordinator.cpp)
 add_library(mixedreality SHARED ${main_src})
 target_include_directories(mixedreality PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set(LINKED_LIBRARIES

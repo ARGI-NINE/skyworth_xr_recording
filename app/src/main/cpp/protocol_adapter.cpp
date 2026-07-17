@@ -1,6 +1,7 @@
 #include "protocol_adapter.h"
 
 #include "CameraEncoder.h"
+#include "OperationCoordinator.h"
 #include "NativeLogger.h"
 #include "SdkStateBridge.h"
 #include "packet_codec.h"
@@ -56,12 +57,6 @@ constexpr std::size_t kMaxVideoQueueFrames = 24;
 #define MSG_NOSIGNAL 0
 #endif
 
-extern "C" void Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartRecording(
-        JNIEnv* env,
-        jobject thiz);
-extern "C" void Java_com_ssnwt_helloxr_VrNativeActivity_nativeStopRecording(
-        JNIEnv* env,
-        jobject thiz);
 extern "C" bool RequestDeviceReboot();
 
 int64_t CurrentRealtimeMs() {
@@ -836,6 +831,7 @@ private:
 
 class ProtocolAdapterService final : public SXR::IEncoderOutputListener {
 public:
+    enum class StreamState { DISABLED, STARTING, STREAMING, STOPPING };
     explicit ProtocolAdapterService(const std::string& externalFilesDir)
         : externalFilesDir_(externalFilesDir) {}
 
@@ -913,6 +909,31 @@ public:
         replayConfigPending_ = false;
         ClearVideoQueue();
     }
+
+    void SetStreamingEnabled(bool enabled) {
+        const StreamState current = streamState_.load();
+        if ((enabled && current == StreamState::STREAMING) ||
+            (!enabled && current == StreamState::DISABLED)) return;
+        streamState_ = enabled ? StreamState::STARTING : StreamState::STOPPING;
+        videoRequested_ = enabled;
+        if (!enabled) {
+            {
+                std::lock_guard<std::mutex> lock(videoSessionMutex_);
+                replayConfigPending_ = false;
+            }
+            CloseVideoClient();
+            streamState_ = StreamState::DISABLED;
+            return;
+        }
+        std::lock_guard<std::mutex> lock(videoSessionMutex_);
+        if (recordingSessionActive_ && GetVideoClientFd() >= 0) {
+            replayConfigPending_ = true;
+            MaybeReplayVideoConfigLocked();
+        }
+        streamState_ = StreamState::STREAMING;
+    }
+
+    void NotifyAuthoritativeStateChanged() { SendStatusSnapshot(); }
 
     void onEncodedFrame(const char* group,
                         const uint8_t* data,
@@ -1221,6 +1242,7 @@ private:
             if (!SendAll(fd, frame)) {
                 NATIVE_LOGW(kLogTag, "event=video_send_failed errno=%d", errno);
                 CloseVideoClient();
+                operation::Coordinator::Instance().HandleNetworkError("TCP 8802 send failure");
             }
         }
     }
@@ -1411,10 +1433,15 @@ private:
 
         BuildStorageInfo(&status.storage);
 
-        const bool hasActiveFault = HasAnyActiveFault();
-        if (hasActiveFault) {
-            status.workingState = egocollect::WorkingState::kFault;
-        } else if (hasSdkState && (sdkState.isRecording || sdkState.stopInProgress)) {
+        if (hasSdkState) {
+            status.operationMode = static_cast<egocollect::OperationMode>(sdkState.operationMode);
+            status.operationPhase = static_cast<egocollect::OperationPhase>(sdkState.operationPhase);
+            status.stateRevision = sdkState.stateRevision;
+        }
+        const bool operationRecording = hasSdkState &&
+                (sdkState.operationMode == 2U || sdkState.operationMode == 3U ||
+                 sdkState.operationMode == 4U || sdkState.operationPhase == 2U);
+        if (operationRecording) {
             status.workingState = egocollect::WorkingState::kCollecting;
         } else {
             status.workingState = egocollect::WorkingState::kIdle;
@@ -1630,111 +1657,18 @@ private:
         }
     }
 
-    enum class RecordingStartResult {
-        kStarted,
-        kAlreadyRecording,
-        kSdkUnavailable,
-        kStorageFull,
-        kFailed,
-    };
-
-    RecordingStartResult EnsureRecordingStarted(std::string* errorMessage) {
-        sdk_state_bridge::StateSnapshot state;
-        const bool hasState = sdk_state_bridge::ReadStateSnapshot(&state);
-        if (hasState && state.isRecording) {
-            return RecordingStartResult::kAlreadyRecording;
-        }
-        if (!hasState || !state.engineAvailable) {
-            if (errorMessage != nullptr) {
-                *errorMessage = "sdk engine unavailable";
-            }
-            return RecordingStartResult::kSdkUnavailable;
-        }
-        if (state.storageKnown && state.storageLow) {
-            if (errorMessage != nullptr) {
-                *errorMessage = "storage below recording threshold";
-            }
-            return RecordingStartResult::kStorageFull;
-        }
-
-        const uint64_t errorSeq = sdk_state_bridge::PeekError().sequence;
-        Java_com_ssnwt_helloxr_VrNativeActivity_nativeStartRecording(nullptr, nullptr);
-
-        for (int i = 0; i < 30; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            sdk_state_bridge::StateSnapshot latest;
-            if (sdk_state_bridge::ReadStateSnapshot(&latest) && latest.isRecording) {
-                return RecordingStartResult::kStarted;
-            }
-            const sdk_state_bridge::ErrorSnapshot error = sdk_state_bridge::PeekError();
-            if (error.hasPending && error.sequence != errorSeq) {
-                break;
-            }
-        }
-
-        const sdk_state_bridge::ErrorSnapshot error = sdk_state_bridge::PeekError();
-        if (error.hasPending && error.sequence != errorSeq) {
-            if (errorMessage != nullptr) {
-                *errorMessage = error.message.empty() ? "collect start failed" : error.message;
-            }
-            return error.code.find("storage") != std::string::npos
-                           ? RecordingStartResult::kStorageFull
-                           : RecordingStartResult::kFailed;
-        }
-        if (errorMessage != nullptr) {
-            *errorMessage = "collect start failed";
-        }
-        return RecordingStartResult::kFailed;
-    }
-
     void HandleStartCollect(const egocollect::CommandPacket& command) {
-        std::string errorMessage;
-        switch (EnsureRecordingStarted(&errorMessage)) {
-            case RecordingStartResult::kStarted:
-                SendResponse(command.seq,
-                             egocollect::ResultCode::kOk,
-                             "collect started",
-                             std::map<std::string, std::string>());
-                SendStatusSnapshot();
-                return;
-            case RecordingStartResult::kAlreadyRecording:
-                SendResponse(command.seq,
-                             egocollect::ResultCode::kOk,
-                             "collect already active",
-                             std::map<std::string, std::string>());
-                return;
-            case RecordingStartResult::kSdkUnavailable:
-                SendResponse(command.seq,
-                             egocollect::ResultCode::kInternal,
-                             errorMessage,
-                             std::map<std::string, std::string>());
-                return;
-            case RecordingStartResult::kStorageFull:
-                SendResponse(command.seq,
-                             egocollect::ResultCode::kStorageFull,
-                             errorMessage,
-                             std::map<std::string, std::string>());
-                return;
-            case RecordingStartResult::kFailed:
-                break;
-        }
+        operation::Coordinator::Instance().HandleRecordStart(
+                operation::RecordOrigin::PHONE, "phone CMD_START_COLLECT");
         SendResponse(command.seq,
-                     egocollect::ResultCode::kInternal,
-                     errorMessage,
+                     egocollect::ResultCode::kOk,
+                     "collect request accepted",
                      std::map<std::string, std::string>());
+        SendStatusSnapshot();
     }
 
     void HandleStopCollect(const egocollect::CommandPacket& command) {
-        sdk_state_bridge::StateSnapshot state;
-        if (!sdk_state_bridge::ReadStateSnapshot(&state) ||
-            (!state.isRecording && !state.stopInProgress)) {
-            SendResponse(command.seq,
-                         egocollect::ResultCode::kOk,
-                         "collect already idle",
-                         std::map<std::string, std::string>());
-            return;
-        }
-        Java_com_ssnwt_helloxr_VrNativeActivity_nativeStopRecording(nullptr, nullptr);
+        operation::Coordinator::Instance().HandleRecordStop("phone CMD_STOP_COLLECT");
         SendResponse(command.seq,
                      egocollect::ResultCode::kOk,
                      "collect stopping",
@@ -1743,32 +1677,7 @@ private:
     }
 
     void HandleStartVideo(const egocollect::CommandPacket& command) {
-        std::string errorMessage;
-        RecordingStartResult startResult = RecordingStartResult::kAlreadyRecording;
-        videoRequested_ = true;
-        startResult = EnsureRecordingStarted(&errorMessage);
-        if (startResult != RecordingStartResult::kStarted &&
-            startResult != RecordingStartResult::kAlreadyRecording) {
-            videoRequested_ = false;
-            {
-                std::lock_guard<std::mutex> lock(videoSessionMutex_);
-                replayConfigPending_ = false;
-            }
-            SendResponse(command.seq,
-                         startResult == RecordingStartResult::kStorageFull
-                                 ? egocollect::ResultCode::kStorageFull
-                                 : egocollect::ResultCode::kInternal,
-                         errorMessage,
-                         std::map<std::string, std::string>());
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(videoSessionMutex_);
-            if (recordingSessionActive_ && GetVideoClientFd() >= 0) {
-                replayConfigPending_ = true;
-                MaybeReplayVideoConfigLocked();
-            }
-        }
+        operation::Coordinator::Instance().HandlePreviewStart();
         std::map<std::string, std::string> data;
         data["port"] = "8802";
         data["stream_state"] = "active";
@@ -1778,18 +1687,11 @@ private:
                      egocollect::ResultCode::kOk,
                      "video stream enabled",
                      data);
-        if (startResult == RecordingStartResult::kStarted) {
-            SendStatusSnapshot();
-        }
+        SendStatusSnapshot();
     }
 
     void HandleStopVideo(const egocollect::CommandPacket& command) {
-        videoRequested_ = false;
-        {
-            std::lock_guard<std::mutex> lock(videoSessionMutex_);
-            replayConfigPending_ = false;
-        }
-        CloseVideoClient();
+        operation::Coordinator::Instance().HandlePreviewStop();
         SendResponse(command.seq,
                      egocollect::ResultCode::kOk,
                      "video stream disabled",
@@ -1892,6 +1794,7 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<uint32_t> nextOutboundSeq_{1U};
     std::atomic<bool> videoRequested_{false};
+    std::atomic<StreamState> streamState_{StreamState::DISABLED};
     std::atomic<uint64_t> lastHeartbeatMs_{0U};
 
     mutable std::mutex controlMutex_;
@@ -1978,6 +1881,16 @@ void OnRecordingSessionStopped() {
         return;
     }
     ServiceInstance()->OnRecordingSessionStopped();
+}
+
+void SetStreamingEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(ServiceMutex());
+    if (ServiceInstance()) ServiceInstance()->SetStreamingEnabled(enabled);
+}
+
+void NotifyAuthoritativeStateChanged() {
+    std::lock_guard<std::mutex> lock(ServiceMutex());
+    if (ServiceInstance()) ServiceInstance()->NotifyAuthoritativeStateChanged();
 }
 
 }  // namespace protocol_adapter
