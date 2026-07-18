@@ -2,9 +2,11 @@ syntax = "proto3";
 
 package egocollect;
 
-option java_package = "com.ssnwt.helloxr.protocol";
+option java_package = "com.egocollect.app.proto";
 option java_multiple_files = true;
+option java_outer_classname = "EgoCollectProto";
 
+// EgoCollect control protocol v1.4 (TCP :8801).
 message Packet {
   uint32 seq = 1;
   uint64 timestamp_ms = 2;
@@ -32,12 +34,10 @@ message Command {
     CMD_GET_PARAM = 10;
     CMD_SET_PARAM = 11;
     CMD_REBOOT = 20;
-    // Legacy values kept only for wire compatibility. Not part of the current
-    // PROTOCOL.md command surface.
-    CMD_FACTORY_RESET = 21 [deprecated = true];
-    CMD_OTA_START = 30 [deprecated = true];
-    CMD_OTA_DATA = 31 [deprecated = true];
-    CMD_OTA_END = 32 [deprecated = true];
+
+    // Removed command values must never be reused.
+    reserved 21;       // deprecated factory reset
+    reserved 30 to 32; // deprecated OTA start/data/end
   }
 }
 
@@ -78,18 +78,10 @@ enum OperationPhase {
 }
 
 message DeviceState {
-  DeviceWorkingState working = 1;
+  reserved 1; // removed working field
   OperationMode operation_mode = 2;
   OperationPhase operation_phase = 3;
   uint64 state_revision = 4;
-
-  enum DeviceWorkingState {
-    IDLE = 0;
-    COLLECTING = 1;
-    UPLOADING = 2;
-    SLEEPING = 3;
-    FAULT = 4;
-  }
 }
 
 message StorageInfo {
@@ -156,8 +148,8 @@ message Response {
     ERR_CAMERA_FAILED = 400;
     ERR_MICROPHONE_FAILED = 401;
     ERR_INTERNAL = 500;
-    // Legacy value kept only for wire compatibility. Not part of the current
-    // PROTOCOL.md result-code surface.
-    ERR_OTA_CHECK_FAILED = 501 [deprecated = true];
+
+    // Removed result-code values must never be reused.
+    reserved 501; // deprecated OTA result code
   }
 }

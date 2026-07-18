@@ -1016,6 +1016,7 @@ static void saveAlignedSensorData(int64_t rgbTimestampNs);
 static void feedOverlayCameraParams(const SXR::FrameData* data);
 static void renderHandOverlayToEncoder(int texWidth, int texHeight);
 static void renderControllerAxesToEncoder(int texWidth, int texHeight);
+static bool isDatasetRecording();
 
 struct CameraAccessExtension{
     const AppCommon::base_engine* engine;
@@ -1122,12 +1123,9 @@ struct CameraAccessExtension{
     GLuint rgbDisplayFBOs[2] = {0, 0};      // FBOs for YUV->RGBA conversion
 
     // 编码器停止标志（防止停止后立即重新初始化）
-    std::atomic<bool> encodersStopped{true};//default do not encode
-    std::atomic<bool> stopInProgress{false};//true while async stopEncoder() is running
     // Hand-overlay snapshot at RGB frame time (populated by saveAlignedSensorData
     // in camera callback, used by renderHandOverlayToEncoder direct encode path).
     OverlaySnapshot overlaySnap;
-    std::atomic<bool> encodingEnabled{false};//用户按键切换编码状态
     std::atomic<bool> snapshotRequested{false};//快照请求标志（intent或按键触发）
 
     // Dataset recording: encoder output directory (set when recording starts)
@@ -1732,7 +1730,6 @@ struct CameraAccessExtension{
     }
 
     void restartGrayscaleEncoders() {
-        encodersStopped = true;
         if (trackingEncoder) { trackingEncoder->stop(); delete trackingEncoder; trackingEncoder = nullptr; }
         if (trackingEncoderSurface) { trackingEncoderSurface->release(); delete trackingEncoderSurface; trackingEncoderSurface = nullptr; }
         if (ctrlEncoder) { ctrlEncoder->stop(); delete ctrlEncoder; ctrlEncoder = nullptr; }
@@ -1741,6 +1738,7 @@ struct CameraAccessExtension{
 
     // Initialize encoders and surfaces (called in RGB callback with rgbCtx current)
     void initEncodersAndSurfaces(int width, int height) {
+        std::unique_lock<std::mutex> encoderInitLock(callbackDrainMutex);
         if (rgbEncoder) {
             return;  // Already initialized
         }
@@ -1758,13 +1756,17 @@ struct CameraAccessExtension{
         // start() completed let the recording worker observe mRunning=false
         // and incorrectly treat writer arming as a timeout.
         auto* encoder = new SXR::CameraEncoder(
-                sbsWidth, height, 30, 8000000, "rgb.mp4", encoderBaseDir);
+                sbsWidth, height, 30, 8000000, "rgb.mp4", encoderBaseDir,
+                protocol_adapter::GetRgbEncodedSink());
         encoder->setTimeOffset(mCameraTimeOffsetNs);
         if (!encoder->start()) {
             LOGE("RGB encoder start failed");
             delete encoder;
             return;
         }
+        // Enable this concrete RGB resource as the sink source before codec
+        // config can be emitted by its output thread.
+        protocol_adapter::OnRgbEncoderReady(encoder->getCodec());
 
         // Create encoder surface
         auto* surface = new SXR::EncoderSurface();
@@ -1772,13 +1774,14 @@ struct CameraAccessExtension{
         if (!window || !surface->init(window, rgbCtx.display, rgbCtx.context)) {
             LOGE("RGB encoder surface init failed");
             delete surface;
+            protocol_adapter::OnRgbEncoderStopping();
             encoder->stop();
+            protocol_adapter::OnRgbEncoderStopped();
             delete encoder;
             return;
         }
         rgbEncoder = encoder;
         rgbEncoderSurface = surface;
-        protocol_adapter::OnRgbEncoderReady(rgbEncoder->getCodec());
         LOGI("RGB SBS encoder initialized: %dx%d", sbsWidth, height);
     }
 
@@ -1789,9 +1792,7 @@ struct CameraAccessExtension{
 
         {
             std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
-            if (ext->isPaused.load() ||
-                ext->stopInProgress.load() ||
-                ext->callbackAdmissionClosed) {
+            if (ext->isPaused.load() || ext->callbackAdmissionClosed) {
                 return;
             }
             ext->inFlightCallbacks.fetch_add(1);
@@ -1804,8 +1805,8 @@ struct CameraAccessExtension{
             }
             return;
         }
-        const bool recordThisFrame =
-            ext->encodingEnabled.load() && !ext->encodersStopped.load();
+        const operation::Mode mode = operation::Coordinator::Instance().GetSnapshot().mode;
+        const bool recordThisFrame = mode != operation::Mode::IDLE;
         const int64_t startUtcTime = getCurrentUtcNs();
         const int64_t startBootTime = getCurrentBootNs();
 
@@ -1864,9 +1865,7 @@ struct CameraAccessExtension{
 
         {
             std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
-            if (ext->isPaused.load() ||
-                ext->stopInProgress.load() ||
-                ext->callbackAdmissionClosed) {
+            if (ext->isPaused.load() || ext->callbackAdmissionClosed) {
                 return;
             }
             ext->inFlightCallbacks.fetch_add(1);
@@ -1879,8 +1878,7 @@ struct CameraAccessExtension{
             }
             return;
         }
-        const bool recordThisFrame =
-            ext->encodingEnabled.load() && !ext->encodersStopped.load();
+        const bool recordThisFrame = isDatasetRecording();
 
         auto t0 = std::chrono::steady_clock::now();
 
@@ -1937,9 +1935,7 @@ struct CameraAccessExtension{
 
         {
             std::lock_guard<std::mutex> lk(ext->callbackDrainMutex);
-            if (ext->isPaused.load() ||
-                ext->stopInProgress.load() ||
-                ext->callbackAdmissionClosed) {
+            if (ext->isPaused.load() || ext->callbackAdmissionClosed) {
                 return;
             }
             ext->inFlightCallbacks.fetch_add(1);
@@ -1952,8 +1948,7 @@ struct CameraAccessExtension{
             }
             return;
         }
-        const bool recordThisFrame =
-            ext->encodingEnabled.load() && !ext->encodersStopped.load();
+        const bool recordThisFrame = isDatasetRecording();
 
         auto t0 = std::chrono::steady_clock::now();
 
@@ -2248,6 +2243,11 @@ struct CameraAccessExtension{
 
     // Initialize grayscale encoder with Surface mode
     void initGrayscaleEncoder(SXR::CameraGroup group, int width, int height, CameraGLContext& ctx) {
+        std::unique_lock<std::mutex> encoderInitLock(callbackDrainMutex);
+        if ((group == SXR::CameraGroup::TRACKING && trackingEncoder) ||
+            (group == SXR::CameraGroup::CTRL && ctrlEncoder)) {
+            return;
+        }
         const char* groupName = (group == SXR::CameraGroup::TRACKING) ? "tracking" : "ctrl";
         int combinedWidth = width * 2;  // Side-by-side layout
         LOGI("Initializing grayscale encoder for %s: %dx%d @ 60fps (Surface mode)",
@@ -2298,7 +2298,8 @@ struct CameraAccessExtension{
         glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
         LOGI("Created Y8 texture %u for %s encoder", y8Texture, groupName);
 
-        // Store references
+        // Publish resources under the callback barrier mutex so coordinator
+        // polling observes a complete encoder/surface pair.
         if (group == SXR::CameraGroup::TRACKING) {
             trackingEncoder = encoder;
             trackingEncoderSurface = surface;
@@ -2439,8 +2440,7 @@ struct CameraAccessExtension{
         uint32_t height = data->frames[0].height;
 
         // Lazy initialize encoder on first frame
-        if (!*targetEncoder &&
-            recordThisFrame) {
+        if (recordThisFrame) {
             initGrayscaleEncoder(group, width, height, ctx);
         }
 
@@ -2797,8 +2797,6 @@ struct CameraAccessExtension{
             }
         }
 
-        encodersStopped = true;
-
         LOGI("All encoders stopped");
     }
 
@@ -2813,23 +2811,59 @@ struct CameraAccessExtension{
         LOGI("Encoders ready to start");
     }
 
-    void stopEncoder() {
-        // Mark stop in progress to block new recording starts
-        stopInProgress = true;
-        // Set flag first to prevent camera thread from entering SBS block
-        encodersStopped = true;
-        protocol_adapter::OnRecordingSessionStopped();
-        LOGI("stopEncoder: setting encodersStopped=true");
+    bool hasRgbEncoder() {
+        std::lock_guard<std::mutex> lock(callbackDrainMutex);
+        return rgbEncoder != nullptr;
+    }
 
-        {
-            std::unique_lock<std::mutex> lk(callbackDrainMutex);
-            callbackAdmissionClosed = true;
-            callbackDrainCV.wait(lk, [this] { return inFlightCallbacks.load() == 0; });
+    bool waitForRecordingWriters(int attempts, int writerTimeoutMs) {
+        for (int i = 0; i < attempts; ++i) {
+            SXR::CameraEncoder* rgb = nullptr;
+            SXR::CameraEncoder* tracking = nullptr;
+            SXR::CameraEncoder* ctrl = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(callbackDrainMutex);
+                if (rgbEncoder) {
+                    rgb = rgbEncoder;
+                    tracking = trackingEncoder;
+                    ctrl = ctrlEncoder;
+                }
+            }
+            // Writer arming requires subsequent camera frames to enter the
+            // callbacks and render an IDR. Never wait while holding the callback
+            // admission mutex, otherwise those callbacks cannot make progress.
+            if (rgb) {
+                bool ready = rgb->waitWriterArmed(writerTimeoutMs);
+                // Match the last known-good recording behavior: RGB is the
+                // required stream. Tracking/ctrl are verified when their
+                // resources already exist; otherwise their lazy constructors
+                // attach writers from encoderBaseDir on their first frame.
+                if (tracking) ready = tracking->waitWriterArmed(writerTimeoutMs) && ready;
+                if (ctrl) ready = ctrl->waitWriterArmed(writerTimeoutMs) && ready;
+                return ready;
+            }
+            usleep(10000);
         }
+        return false;
+    }
+
+    void finalizeRecordingWriters() {
+        std::lock_guard<std::mutex> lock(callbackDrainMutex);
+        if (rgbEncoder) rgbEncoder->finalizeWriter();
+        if (trackingEncoder) trackingEncoder->finalizeWriter();
+        if (ctrlEncoder) ctrlEncoder->finalizeWriter();
+    }
+
+    void stopEncoder() {
+        std::unique_lock<std::mutex> resourceLock(callbackDrainMutex);
+        callbackAdmissionClosed = true;
+        callbackDrainCV.wait(resourceLock, [this] { return inFlightCallbacks.load() == 0; });
 
         // Stop RGB encoder first (signal EOS + join output thread), then release surface
         if (rgbEncoder) {
+            protocol_adapter::OnRgbEncoderStopping();
             rgbEncoder->stop();
+            protocol_adapter::OnRgbEncoderStopped();
             delete rgbEncoder;
             rgbEncoder = nullptr;
         }
@@ -2925,8 +2959,6 @@ struct CameraAccessExtension{
 
         // Cleanup encoders
         stopEncoder();
-        stopInProgress = false;
-
         // Cleanup shared EGL context (including displayTextures and encoder surfaces)
         cleanupAllGLContexts();
 
@@ -3069,6 +3101,10 @@ struct engine : public AppCommon::base_engine {
     }
 };
 
+static bool isDatasetRecording() {
+    return g_engine != nullptr && g_engine->mDatasetRecorder.isRecording();
+}
+
 static bool FillSdkStateSnapshot(sdk_state_bridge::StateSnapshot* out) {
     if (out == nullptr || g_engine == nullptr) {
         return false;
@@ -3081,9 +3117,6 @@ static bool FillSdkStateSnapshot(sdk_state_bridge::StateSnapshot* out) {
     out->stateRevision = operationState.revision;
     out->engineAvailable = true;
     out->isRecording = g_engine->mDatasetRecorder.isRecording();
-    out->stopInProgress = camera.stopInProgress.load();
-    out->encodingEnabled = camera.encodingEnabled.load();
-    out->encodersStopped = camera.encodersStopped.load();
     out->autoStopRequested = g_engine->autoStopRequested.load();
     out->useControllerMode = g_engine->useControllerMode;
     out->cameraContextAvailable = camera.cameraContext != nullptr;
@@ -3113,7 +3146,7 @@ static bool FillSdkStateSnapshot(sdk_state_bridge::StateSnapshot* out) {
     out->storageLow = out->storageKnown &&
                       out->storageAvailableBytes < out->storageThresholdBytes;
 
-    if (out->stopInProgress) {
+    if (operationState.phase == operation::Phase::STOPPING) {
         out->captureState = "finalizing";
     } else if (out->isRecording) {
         out->captureState = "recording";
@@ -3647,67 +3680,47 @@ extern "C" bool RequestDeviceReboot() {
     return scheduled;
 }
 
-static bool waitForRecordingStopDrain(struct engine* e, const char* startSource) {
-    int waitCount = 0;
-    while (e->mCameraAccessExtension.stopInProgress.load() ||
-           e->mDatasetRecorder.isRecording()) {
-        usleep(10000); // 10ms
-        if (++waitCount % 100 == 0) {
-            LOGW("%s: waiting for stopEncoder (%d ms)", startSource, waitCount * 10);
-        }
-        if (waitCount > 300) {
-            LOGE("%s: timed out waiting for stopEncoder", startSource);
-            return false;
-        }
-    }
-    return true;
-}
-
 static bool startDatasetRecordingSession(struct engine* e,
                                          const char* startSource,
                                          const char* startLogMessage) {
     if (e == nullptr || e->mDatasetRecorder.isRecording()) {
         return false;
     }
-    const bool encoderAlreadyRunning = e->mCameraAccessExtension.rgbEncoder != nullptr;
+    auto& ext = e->mCameraAccessExtension;
+    std::unique_lock<std::mutex> barrierLock(ext.callbackDrainMutex);
+    ext.callbackAdmissionClosed = true;
+    ext.callbackDrainCV.wait(barrierLock, [&ext] { return ext.inFlightCallbacks.load() == 0; });
+    const bool encoderAlreadyRunning = ext.rgbEncoder != nullptr;
 
     // Storage guard: refuse to start below 1 GiB free.
     int64_t avail = getAvailableBytes(storagePath);
     if (avail >= 0 && avail < MIN_FREE_BYTES) {
         LOGW("%s: insufficient storage (%lld bytes free)", startSource, (long long)avail);
         ttsSpeak("存储空间已满，无法录制");
+        ext.callbackAdmissionClosed = false;
+        barrierLock.unlock();
         return false;
     }
 
-    if (!waitForRecordingStopDrain(e, startSource)) {
-        return false;
-    }
-
+    // Close callback admission before DatasetRecorder flips isRecording(). This
+    // makes the recorder flag safe as the sole tracking/ctrl save gate: no
+    // callback can observe it until all session paths and offsets are ready.
     LOGI("%s", startLogMessage);
     if (!e->mDatasetRecorder.start()) {
         LOGE("%s: DatasetRecorder::start failed", startSource);
+        ext.callbackAdmissionClosed = false;
+        barrierLock.unlock();
         return false;
     }
-    if (!encoderAlreadyRunning) protocol_adapter::OnRecordingSessionStarted();
     e->recordingStartTime = std::chrono::steady_clock::now();
     e->autoStopRequested = false;
-    e->mCameraAccessExtension.encoderBaseDir = e->mDatasetRecorder.getDatasetDir();
+    ext.encoderBaseDir = e->mDatasetRecorder.getDatasetDir();
     if (encoderAlreadyRunning) {
-        auto& ext = e->mCameraAccessExtension;
-        {
-            std::unique_lock<std::mutex> lock(ext.callbackDrainMutex);
-            ext.callbackAdmissionClosed = true;
-            ext.callbackDrainCV.wait(lock, [&ext] { return ext.inFlightCallbacks.load() == 0; });
-        }
         bool armed = ext.rgbEncoder->armWriter(ext.encoderBaseDir);
-        if (ext.trackingEncoder) armed = ext.trackingEncoder->armWriter(ext.encoderBaseDir) && armed;
-        if (ext.ctrlEncoder) armed = ext.ctrlEncoder->armWriter(ext.encoderBaseDir) && armed;
-        {
-            std::lock_guard<std::mutex> lock(ext.callbackDrainMutex);
-            ext.callbackAdmissionClosed = false;
-        }
         if (!armed) {
             LOGE("%s: failed to arm dynamic writer", startSource);
+            ext.callbackAdmissionClosed = false;
+            barrierLock.unlock();
             return false;
         }
     }
@@ -3723,11 +3736,9 @@ static bool startDatasetRecordingSession(struct engine* e,
             }
         }
     }
-    e->mCameraAccessExtension.encodingEnabled = true;
-    e->mCameraAccessExtension.encodersStopped = false;
-    e->mCameraAccessExtension.cameraParamsSavedRgb = false;
-    e->mCameraAccessExtension.cameraParamsSavedTracking = false;
-    e->mCameraAccessExtension.cameraParamsSavedCtrl = false;
+    ext.cameraParamsSavedRgb = false;
+    ext.cameraParamsSavedTracking = false;
+    ext.cameraParamsSavedCtrl = false;
     {
         std::lock_guard<std::mutex> lock(e->alignedSnapshot.mutex);
         e->alignedSnapshot.headPose.valid = false;
@@ -3748,16 +3759,12 @@ static bool startDatasetRecordingSession(struct engine* e,
         e->mDatasetRecorder.writeCaptureStatusJson(
             "recording", e->mHandTrackerLogic.rawDateSave);
     }
-    for (int i = 0; i < 300 && e->mCameraAccessExtension.rgbEncoder == nullptr; ++i) usleep(10000);
-    auto& writerExt = e->mCameraAccessExtension;
-    bool writerReady = writerExt.rgbEncoder && writerExt.rgbEncoder->waitWriterArmed(2000);
-    if (writerExt.trackingEncoder) writerReady = writerExt.trackingEncoder->waitWriterArmed(2000) && writerReady;
-    if (writerExt.ctrlEncoder) writerReady = writerExt.ctrlEncoder->waitWriterArmed(2000) && writerReady;
+    ext.callbackAdmissionClosed = false;
+    barrierLock.unlock();
+    const bool writerReady = ext.waitForRecordingWriters(300, 2000);
     if (!writerReady) {
         LOGE("%s: verified IDR writer attach timed out", startSource);
-        if (writerExt.rgbEncoder) writerExt.rgbEncoder->finalizeWriter();
-        if (writerExt.trackingEncoder) writerExt.trackingEncoder->finalizeWriter();
-        if (writerExt.ctrlEncoder) writerExt.ctrlEncoder->finalizeWriter();
+        ext.finalizeRecordingWriters();
         return false;
     }
     return true;
@@ -3769,21 +3776,16 @@ static bool coordinatorStartPreview(operation::Mode target, uint64_t revision) {
     std::lock_guard<std::mutex> mediaLock(gOperationMediaMutex);
     if (!g_engine) return false;
     const operation::Snapshot s = operation::Coordinator::Instance().GetSnapshot();
-    if (s.revision + 1 != revision || s.phase != operation::Phase::STABLE) return false;
+    if (s.revision != revision || s.phase != operation::Phase::STARTING) return false;
     auto& ext = g_engine->mCameraAccessExtension;
     if (target == operation::Mode::LOCAL_RECORD_WITH_PREVIEW) {
-        protocol_adapter::SetStreamingEnabled(true);
         LOGI("event=local_record_preview_enabled revision=%llu encoder_reused=true",
              (unsigned long long)revision);
-        return ext.rgbEncoder != nullptr;
+        return ext.hasRgbEncoder();
     }
-    protocol_adapter::OnRecordingSessionStarted();
-    protocol_adapter::SetStreamingEnabled(true);
     ext.encoderBaseDir.clear();
-    ext.encodingEnabled = true;
-    ext.encodersStopped = false;
-    for (int i = 0; i < 300 && ext.rgbEncoder == nullptr; ++i) usleep(10000);
-    const bool ok = ext.rgbEncoder != nullptr;
+    bool ok = false;
+    for (int i = 0; i < 300 && !(ok = ext.hasRgbEncoder()); ++i) usleep(10000);
     LOGI("event=preview_encoder_start revision=%llu result=%s",
          (unsigned long long)revision, ok ? "ok" : "failed");
     return ok;
@@ -3792,21 +3794,18 @@ static bool coordinatorStartPreview(operation::Mode target, uint64_t revision) {
 static void coordinatorStopPreview(operation::Mode target, uint64_t) {
     std::lock_guard<std::mutex> mediaLock(gOperationMediaMutex);
     if (!g_engine) return;
-    protocol_adapter::SetStreamingEnabled(false);
     if (target == operation::Mode::LOCAL_RECORD) return;
     auto& ext = g_engine->mCameraAccessExtension;
-    ext.encodingEnabled = false;
     ext.stopEncoder();
-    ext.stopInProgress = false;
     { std::lock_guard<std::mutex> lock(ext.callbackDrainMutex); ext.callbackAdmissionClosed = false; }
 }
 
-static bool coordinatorStartRecording(operation::Mode target, uint64_t revision) {
+static bool coordinatorStartRecording(operation::Mode target, uint64_t revision,
+                                      bool keepPreviewOnFailure) {
     std::lock_guard<std::mutex> mediaLock(gOperationMediaMutex);
     const operation::Snapshot before = operation::Coordinator::Instance().GetSnapshot();
     if (!g_engine || before.revision != revision || before.phase != operation::Phase::STARTING) return false;
     auto& ext = g_engine->mCameraAccessExtension;
-    const bool encoderWasRunning = ext.rgbEncoder != nullptr;
     const bool ok = startDatasetRecordingSession(g_engine,
             target == operation::Mode::PHONE_RECORD ? "phone" : "local",
             "Starting authoritative dataset recording");
@@ -3817,14 +3816,11 @@ static bool coordinatorStartRecording(operation::Mode target, uint64_t revision)
         else g_engine->mHandTrackerLogic.rawDateSave->StopSession();
         g_engine->mDatasetRecorder.stop();
         ext.encoderBaseDir.clear();
-        if (!encoderWasRunning) {
-            protocol_adapter::SetStreamingEnabled(false);
-            ext.encodingEnabled = false; ext.stopEncoder(); ext.stopInProgress = false;
+        if (!keepPreviewOnFailure) {
+            ext.stopEncoder();
             std::lock_guard<std::mutex> lock(ext.callbackDrainMutex); ext.callbackAdmissionClosed = false;
         }
     } else {
-        if (target == operation::Mode::PHONE_RECORD || target == operation::Mode::LOCAL_RECORD_WITH_PREVIEW)
-            protocol_adapter::SetStreamingEnabled(true);
         LOGI("event=record_writer_idr_confirmed revision=%llu encoder_reused=%s",
              (unsigned long long)revision,
              target == operation::Mode::PHONE_RECORD || target == operation::Mode::LOCAL_RECORD_WITH_PREVIEW ? "true" : "false");
@@ -3843,8 +3839,6 @@ static void coordinatorStopRecording(uint64_t revision, const std::string& reaso
     std::lock_guard<std::mutex> mediaLock(gOperationMediaMutex);
     if (!g_engine) return;
     auto& ext = g_engine->mCameraAccessExtension;
-    protocol_adapter::SetStreamingEnabled(false);
-    ext.encodingEnabled = false;
     { std::lock_guard<std::mutex> lock(ext.callbackDrainMutex); ext.callbackAdmissionClosed = true; }
     if (g_engine->mDatasetRecorder.isRecording())
         g_engine->mDatasetRecorder.writeCaptureStatusJson("finalizing", g_engine->mHandTrackerLogic.rawDateSave);
@@ -3855,7 +3849,7 @@ static void coordinatorStopRecording(uint64_t revision, const std::string& reaso
     g_engine->mDatasetRecorder.stop();
     if (g_engine->useControllerMode) g_engine->mControllerPoseSaver.StopSession();
     else g_engine->mHandTrackerLogic.rawDateSave->StopSession();
-    ext.encoderBaseDir.clear(); ext.stopInProgress = false;
+    ext.encoderBaseDir.clear();
     { std::lock_guard<std::mutex> lock(ext.callbackDrainMutex); ext.callbackAdmissionClosed = false; }
     LOGI("event=global_record_stop_complete revision=%llu", (unsigned long long)revision);
     // The second physical press is a Stop. Speak only after EOS drain, writer
@@ -5342,6 +5336,7 @@ void android_main(struct android_app *state)
     operationActions.stopRecording = &coordinatorStopRecording;
     operationActions.startPreview = &coordinatorStartPreview;
     operationActions.stopPreview = &coordinatorStopPreview;
+    operationActions.isControlConnected = &protocol_adapter::IsControlClientConnected;
     operationActions.stateChanged = [](const operation::Snapshot&) {
         protocol_adapter::NotifyAuthoritativeStateChanged();
     };

@@ -7,13 +7,6 @@
 #include "OperationCoordinator.h"
 #include "SdkStateBridge.h"
 
-// ======== Global output listener (class-level singleton) ========
-static SXR::IEncoderOutputListener* s_listener = nullptr;
-
-void SXR::CameraEncoder::setOutputListener(IEncoderOutputListener* listener) {
-    s_listener = listener;
-}
-
 void SXR::CameraEncoder::requestKeyFrame(AMediaCodec* codec, const std::string& group) {
     if (!codec) return;
     AMediaFormat* params = AMediaFormat_new();
@@ -30,10 +23,11 @@ void SXR::CameraEncoder::requestKeyFrame(AMediaCodec* codec, const std::string& 
 namespace SXR {
     // Constructor for RGB cameras (Surface mode)
     CameraEncoder::CameraEncoder(int width, int height, int frameRate, int bitRate,
-                                  const std::string& outputName, const std::string& baseDir)
+                                  const std::string& outputName, const std::string& baseDir,
+                                  IRgbEncodedSink* rgbSink)
         : mCameraId(-1), mWidth(width), mHeight(height), mFrameRate(frameRate),
           mBitRate(bitRate), mType(EncoderType::RGB), mMode(EncoderMode::SURFACE),
-          mGroupName("rgb"), mOutputName(outputName), mBaseDir(baseDir) {
+          mGroupName("rgb"), mOutputName(outputName), mBaseDir(baseDir), mRgbSink(rgbSink) {
     }
 
     // Constructor for grayscale cameras (Buffer mode)
@@ -474,8 +468,8 @@ namespace SXR {
 
             // === Streaming: forward codec config (VPS/SPS/PPS) to listener ===
             if (isConfig && outBuf && info.size > 0) {
-                if (s_listener) {
-                    s_listener->onEncodedFrame(mGroupName.c_str(),
+                if (mRgbSink) {
+                    mRgbSink->onRgbEncodedFrame(
                         outBuf + info.offset, info.size, info.presentationTimeUs, true);
                 }
             }
@@ -526,8 +520,8 @@ namespace SXR {
 
             // === Streaming: forward non-config frames to listener ===
             if (outBuf && !isConfig && info.size > 0) {
-                if (s_listener) {
-                    s_listener->onEncodedFrame(mGroupName.c_str(),
+                if (mRgbSink) {
+                    mRgbSink->onRgbEncodedFrame(
                         outBuf + info.offset, info.size, info.presentationTimeUs, false);
                 }
             }

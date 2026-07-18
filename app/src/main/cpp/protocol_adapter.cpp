@@ -829,9 +829,8 @@ private:
     uint32_t syncSampleCount_ = 0U;
 };
 
-class ProtocolAdapterService final : public SXR::IEncoderOutputListener {
+class ProtocolAdapterService final : public SXR::IRgbEncodedSink {
 public:
-    enum class StreamState { DISABLED, STARTING, STREAMING, STOPPING };
     explicit ProtocolAdapterService(const std::string& externalFilesDir)
         : externalFilesDir_(externalFilesDir) {}
 
@@ -845,7 +844,6 @@ public:
             return;
         }
 
-        SXR::CameraEncoder::setOutputListener(this);
         controlThread_ = std::thread(&ProtocolAdapterService::RunControlServer, this);
         statusThread_ = std::thread(&ProtocolAdapterService::RunStatusLoop, this);
         videoAcceptThread_ = std::thread(&ProtocolAdapterService::RunVideoServer, this);
@@ -859,7 +857,6 @@ public:
         }
 
         ntpController_.Stop();
-        SXR::CameraEncoder::setOutputListener(nullptr);
         CloseFd(&controlListenFd_);
         CloseControlClient();
         CloseFd(&videoListenFd_);
@@ -880,102 +877,64 @@ public:
         }
     }
 
-    void OnRecordingSessionStarted() {
-        std::lock_guard<std::mutex> lock(videoSessionMutex_);
-        recordingSessionActive_ = true;
-        activeVideoCodec_ = nullptr;
-        rgbConfigAnnexB_.clear();
-        replayConfigPending_ = videoRequested_.load() && GetVideoClientFd() >= 0;
-        ClearVideoQueue();
-    }
-
     void OnRgbEncoderReady(AMediaCodec* codec) {
         std::lock_guard<std::mutex> lock(videoSessionMutex_);
-        if (!recordingSessionActive_) {
-            return;
-        }
-        activeVideoCodec_ = codec;
-        if (videoRequested_.load() && GetVideoClientFd() >= 0) {
-            replayConfigPending_ = true;
+        activeRgbCodec_ = codec;
+        if (CoordinatorRequestsStreaming() && GetVideoClientFd() >= 0) {
+            clientNeedsBootstrap_ = true;
         }
         MaybeReplayVideoConfigLocked();
     }
 
-    void OnRecordingSessionStopped() {
+    void OnRgbEncoderStopping() {
         std::lock_guard<std::mutex> lock(videoSessionMutex_);
-        recordingSessionActive_ = false;
-        activeVideoCodec_ = nullptr;
-        rgbConfigAnnexB_.clear();
-        replayConfigPending_ = false;
-        ClearVideoQueue();
+        activeRgbCodec_ = nullptr;
     }
 
-    void SetStreamingEnabled(bool enabled) {
-        const StreamState current = streamState_.load();
-        if ((enabled && current == StreamState::STREAMING) ||
-            (!enabled && current == StreamState::DISABLED)) return;
-        streamState_ = enabled ? StreamState::STARTING : StreamState::STOPPING;
-        videoRequested_ = enabled;
-        if (!enabled) {
-            {
-                std::lock_guard<std::mutex> lock(videoSessionMutex_);
-                replayConfigPending_ = false;
-            }
-            CloseVideoClient();
-            streamState_ = StreamState::DISABLED;
-            return;
-        }
+    void OnRgbEncoderStopped() {
         std::lock_guard<std::mutex> lock(videoSessionMutex_);
-        if (recordingSessionActive_ && GetVideoClientFd() >= 0) {
-            replayConfigPending_ = true;
-            MaybeReplayVideoConfigLocked();
-        }
-        streamState_ = StreamState::STREAMING;
+        rgbConfigAnnexB_.clear();
+        clientNeedsBootstrap_ = CoordinatorRequestsStreaming() && GetVideoClientFd() >= 0;
+        ClearVideoQueue();
     }
 
     void NotifyAuthoritativeStateChanged() { SendStatusSnapshot(); }
 
-    void onEncodedFrame(const char* group,
-                        const uint8_t* data,
+    bool IsControlClientConnected() const { return GetControlClientFd() >= 0; }
+
+    void onRgbEncodedFrame(const uint8_t* data,
                         size_t size,
                         int64_t /*ptsUs*/,
                         bool isConfig) override {
         if (!running_.load() ||
-            group == nullptr ||
-            std::strcmp(group, "rgb") != 0 ||
             data == nullptr ||
             size == 0U) {
             return;
         }
 
-        std::string annexB;
-        if (!egocollect::TryConvertLengthPrefixedToAnnexB(data, size, &annexB)) {
-            annexB.assign(reinterpret_cast<const char*>(data), size);
-        }
-
         if (isConfig) {
             std::lock_guard<std::mutex> lock(videoSessionMutex_);
-            if (!recordingSessionActive_) {
-                return;
+            if (activeRgbCodec_ == nullptr) return;
+            std::string annexB;
+            if (!egocollect::TryConvertLengthPrefixedToAnnexB(data, size, &annexB)) {
+                annexB.assign(reinterpret_cast<const char*>(data), size);
             }
             rgbConfigAnnexB_ = std::move(annexB);
             MaybeReplayVideoConfigLocked();
             return;
         }
 
-        if (!videoRequested_.load()) {
-            return;
-        }
-
+        // Check authoritative business state and concrete resources before the
+        // only full-frame network copy.
+        if (!CoordinatorRequestsStreaming() || GetVideoClientFd() < 0) return;
         {
             std::lock_guard<std::mutex> lock(videoSessionMutex_);
-            if (!recordingSessionActive_ || activeVideoCodec_ == nullptr) {
-                return;
-            }
+            if (activeRgbCodec_ == nullptr || clientNeedsBootstrap_) return;
         }
 
-        if (GetVideoClientFd() < 0) {
-            return;
+        std::string annexB;
+        if (!egocollect::TryConvertLengthPrefixedToAnnexB(data, size, &annexB)) {
+            annexB.assign(reinterpret_cast<const char*>(data), size);
         }
 
         std::lock_guard<std::mutex> lock(videoQueueMutex_);
@@ -987,6 +946,15 @@ public:
     }
 
 private:
+    static bool CoordinatorRequestsStreaming() {
+        const operation::Snapshot s = operation::Coordinator::Instance().GetSnapshot();
+        if (s.phase == operation::Phase::STOPPING || s.phase == operation::Phase::ERROR) {
+            return false;
+        }
+        return s.mode == operation::Mode::PHONE_PREVIEW ||
+               s.mode == operation::Mode::LOCAL_RECORD_WITH_PREVIEW ||
+               s.mode == operation::Mode::PHONE_RECORD;
+    }
     struct FaultRecord {
         egocollect::FaultEvent event;
         bool clearsAutomatically = false;
@@ -1063,9 +1031,12 @@ private:
             HandleControlClient(clientFd);
             CloseControlClient();
             CloseVideoClient();
-            videoRequested_ = false;
-            std::lock_guard<std::mutex> lock(videoSessionMutex_);
-            replayConfigPending_ = false;
+            {
+                std::lock_guard<std::mutex> lock(videoSessionMutex_);
+                clientNeedsBootstrap_ = false;
+            }
+            operation::Coordinator::Instance().HandleControlDisconnected(
+                    "TCP 8801 disconnected");
         }
     }
 
@@ -1204,10 +1175,8 @@ private:
             }
             NATIVE_LOGI(kLogTag, "event=video_client_connected port=%u", kVideoPort);
             std::lock_guard<std::mutex> lock(videoSessionMutex_);
-            if (recordingSessionActive_ && videoRequested_.load()) {
-                replayConfigPending_ = true;
-                MaybeReplayVideoConfigLocked();
-            }
+            clientNeedsBootstrap_ = true;
+            MaybeReplayVideoConfigLocked();
         }
     }
 
@@ -1236,7 +1205,7 @@ private:
                 std::lock_guard<std::mutex> lock(videoMutex_);
                 fd = videoClientFd_;
             }
-            if (fd < 0 || !videoRequested_.load()) {
+            if (fd < 0 || !CoordinatorRequestsStreaming()) {
                 continue;
             }
             if (!SendAll(fd, frame)) {
@@ -1277,10 +1246,9 @@ private:
     }
 
     void MaybeReplayVideoConfigLocked() {
-        if (!replayConfigPending_ ||
-            !recordingSessionActive_ ||
-            !videoRequested_.load() ||
-            activeVideoCodec_ == nullptr ||
+        if (!clientNeedsBootstrap_ ||
+            !CoordinatorRequestsStreaming() ||
+            activeRgbCodec_ == nullptr ||
             rgbConfigAnnexB_.empty() ||
             GetVideoClientFd() < 0) {
             return;
@@ -1291,9 +1259,9 @@ private:
             videoQueue_.clear();
             videoQueue_.push_back(rgbConfigAnnexB_);
         }
-        replayConfigPending_ = false;
+        clientNeedsBootstrap_ = false;
         videoQueueCv_.notify_one();
-        SXR::CameraEncoder::requestKeyFrame(activeVideoCodec_, "rgb");
+        SXR::CameraEncoder::requestKeyFrame(activeRgbCodec_, "rgb");
     }
 
     bool SendControlBytes(const std::string& bytes) {
@@ -1438,15 +1406,6 @@ private:
             status.operationPhase = static_cast<egocollect::OperationPhase>(sdkState.operationPhase);
             status.stateRevision = sdkState.stateRevision;
         }
-        const bool operationRecording = hasSdkState &&
-                (sdkState.operationMode == 2U || sdkState.operationMode == 3U ||
-                 sdkState.operationMode == 4U || sdkState.operationPhase == 2U);
-        if (operationRecording) {
-            status.workingState = egocollect::WorkingState::kCollecting;
-        } else {
-            status.workingState = egocollect::WorkingState::kIdle;
-        }
-
         const bool cameraConnected = hasSdkState && sdkState.cameraContextAvailable;
         const bool cameraHealthy =
                 cameraConnected &&
@@ -1793,8 +1752,6 @@ private:
     const std::string externalFilesDir_;
     std::atomic<bool> running_{false};
     std::atomic<uint32_t> nextOutboundSeq_{1U};
-    std::atomic<bool> videoRequested_{false};
-    std::atomic<StreamState> streamState_{StreamState::DISABLED};
     std::atomic<uint64_t> lastHeartbeatMs_{0U};
 
     mutable std::mutex controlMutex_;
@@ -1818,10 +1775,9 @@ private:
     std::mutex videoQueueMutex_;
     std::condition_variable videoQueueCv_;
     std::deque<std::string> videoQueue_;
-    AMediaCodec* activeVideoCodec_ = nullptr;
+    AMediaCodec* activeRgbCodec_ = nullptr;
     std::string rgbConfigAnnexB_;
-    bool recordingSessionActive_ = false;
-    bool replayConfigPending_ = false;
+    bool clientNeedsBootstrap_ = false;
 
     std::thread statusThread_;
     std::atomic<uint64_t> lastStatusSentMs_{0U};
@@ -1859,14 +1815,6 @@ void Stop() {
     ServiceInstance().reset();
 }
 
-void OnRecordingSessionStarted() {
-    std::lock_guard<std::mutex> lock(ServiceMutex());
-    if (ServiceInstance() == nullptr) {
-        return;
-    }
-    ServiceInstance()->OnRecordingSessionStarted();
-}
-
 void OnRgbEncoderReady(AMediaCodec* codec) {
     std::lock_guard<std::mutex> lock(ServiceMutex());
     if (ServiceInstance() == nullptr) {
@@ -1875,17 +1823,31 @@ void OnRgbEncoderReady(AMediaCodec* codec) {
     ServiceInstance()->OnRgbEncoderReady(codec);
 }
 
-void OnRecordingSessionStopped() {
+void OnRgbEncoderStopping() {
     std::lock_guard<std::mutex> lock(ServiceMutex());
     if (ServiceInstance() == nullptr) {
         return;
     }
-    ServiceInstance()->OnRecordingSessionStopped();
+    ServiceInstance()->OnRgbEncoderStopping();
 }
 
-void SetStreamingEnabled(bool enabled) {
+void OnRgbEncoderStopped() {
     std::lock_guard<std::mutex> lock(ServiceMutex());
-    if (ServiceInstance()) ServiceInstance()->SetStreamingEnabled(enabled);
+    if (ServiceInstance() == nullptr) {
+        return;
+    }
+    ServiceInstance()->OnRgbEncoderStopped();
+}
+
+SXR::IRgbEncodedSink* GetRgbEncodedSink() {
+    std::lock_guard<std::mutex> lock(ServiceMutex());
+    return ServiceInstance().get();
+}
+
+bool IsControlClientConnected() {
+    std::lock_guard<std::mutex> lock(ServiceMutex());
+    return ServiceInstance() != nullptr &&
+           ServiceInstance()->IsControlClientConnected();
 }
 
 void NotifyAuthoritativeStateChanged() {

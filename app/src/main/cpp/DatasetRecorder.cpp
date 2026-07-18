@@ -54,17 +54,10 @@ std::string DatasetRecorder::generateDatasetDirName() {
 }
 
 bool DatasetRecorder::start() {
-    SessionState expected = SessionState::IDLE;
-    if (!mSessionState.compare_exchange_strong(expected, SessionState::STARTING)) {
-        LOGW("Dataset session start ignored: state=%d", static_cast<int>(expected));
-        return false;
-    }
-
     std::lock_guard<std::mutex> lock(mMutex);
 
     if (mRecording.load()) {
         LOGW("Already recording");
-        mSessionState = SessionState::RECORDING;
         return false;
     }
 
@@ -75,7 +68,6 @@ bool DatasetRecorder::start() {
     mDatasetDir = datasetBase + "/" + dirName;
     if (mkdir(mDatasetDir.c_str(), 0777) != 0) {
         LOGE("Failed to create dataset directory: %s", mDatasetDir.c_str());
-        mSessionState = SessionState::IDLE;
         return false;
     }
 
@@ -126,22 +118,13 @@ bool DatasetRecorder::start() {
     }
 
     mRecording = true;
-    SessionState starting = SessionState::STARTING;
-    mSessionState.compare_exchange_strong(starting, SessionState::RECORDING);
     return true;
 }
 
 void DatasetRecorder::stop() {
-    SessionState state = mSessionState.load();
-    for (;;) {
-        if (state == SessionState::IDLE || state == SessionState::STOPPING) return;
-        if (mSessionState.compare_exchange_weak(state, SessionState::STOPPING)) break;
-    }
-
     std::lock_guard<std::mutex> lock(mMutex);
 
     if (!mRecording.load()) {
-        mSessionState = SessionState::IDLE;
         return;
     }
 
@@ -175,7 +158,6 @@ void DatasetRecorder::stop() {
     mPoseWriterFinished = true;
 
     mRecording = false;
-    mSessionState = SessionState::IDLE;
     LOGI("Dataset recording stopped. Poses: %lu", (unsigned long)mPoseCount.load());
     NativeLoggerStopDataset();
 }

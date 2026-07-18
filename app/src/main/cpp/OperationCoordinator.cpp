@@ -43,6 +43,10 @@ void Coordinator::HandleNetworkError(const char* reason) {
     Enqueue({EventType::NETWORK_ERROR, RecordOrigin::PHONE,
              reason ? reason : "network error"});
 }
+void Coordinator::HandleControlDisconnected(const char* reason) {
+    Enqueue({EventType::CONTROL_DISCONNECTED, RecordOrigin::PHONE,
+             reason ? reason : "control disconnected"});
+}
 
 void Coordinator::Enqueue(Event event) {
     {
@@ -94,16 +98,85 @@ void Coordinator::Process(const Event& event) {
     if (event.type == EventType::NETWORK_ERROR) { Notify(current); return; }
     if (event.type == EventType::RECORD_START_DONE) {
         if (current.revision != event.revision || current.phase != Phase::STARTING) return;
-        if (event.success) Notify(Commit(event.target, Phase::STABLE));
+        if (event.success) {
+            Notify(Commit(event.target, Phase::STABLE));
+            if (actions_.isControlConnected && !actions_.isControlConnected()) {
+                HandleControlDisconnected("control disconnected during record start");
+            }
+        }
         else {
             Notify(Commit(event.rollback, Phase::ERROR));
             Notify(Commit(event.rollback, Phase::STABLE));
+            if (actions_.isControlConnected && !actions_.isControlConnected()) {
+                HandleControlDisconnected("control disconnected during failed record start");
+            }
         }
         return;
     }
     if (event.type == EventType::RECORD_STOP_DONE) {
         if (current.revision == event.revision && current.phase == Phase::STOPPING)
             Notify(Commit(Mode::IDLE, Phase::STABLE));
+        return;
+    }
+    if (event.type == EventType::PREVIEW_START_DONE) {
+        if (current.revision != event.revision || current.phase != Phase::STARTING) return;
+        if (event.success) {
+            Notify(Commit(event.target, Phase::STABLE));
+            if (actions_.isControlConnected && !actions_.isControlConnected()) {
+                HandleControlDisconnected("control disconnected during preview start");
+            }
+        }
+        else {
+            Notify(Commit(event.rollback, Phase::ERROR));
+            Notify(Commit(event.rollback, Phase::STABLE));
+            if (actions_.isControlConnected && !actions_.isControlConnected()) {
+                HandleControlDisconnected("control disconnected during failed preview start");
+            }
+        }
+        return;
+    }
+    if (event.type == EventType::PREVIEW_STOP_DONE) {
+        if (current.revision == event.revision && current.phase == Phase::STOPPING)
+            Notify(Commit(event.target, Phase::STABLE));
+        return;
+    }
+    if (event.type == EventType::CONTROL_DISCONNECTED) {
+        const MediaActions actions = actions_;
+        // Do not invalidate an in-flight media action. Its completion handler
+        // rechecks the control socket and queues this transition if still needed.
+        if (current.phase != Phase::STABLE) {
+            Notify(current);
+            return;
+        }
+
+        if (current.mode == Mode::PHONE_RECORD ||
+            current.mode == Mode::LOCAL_RECORD_WITH_PREVIEW) {
+            // A control disconnect must never put an active recording into a
+            // stopping phase: recorder, writers and encoders remain untouched,
+            // and a following device-button/App stop must still be accepted.
+            if (current.mode == Mode::PHONE_RECORD) {
+                Notify(Commit(Mode::LOCAL_RECORD_WITH_PREVIEW, Phase::STABLE));
+            }
+            const Snapshot local = Commit(Mode::LOCAL_RECORD, Phase::STABLE);
+            if (actions.stopPreview) actions.stopPreview(Mode::LOCAL_RECORD, local.revision);
+            Notify(local);
+            return;
+        }
+        if (current.mode != Mode::PHONE_PREVIEW) {
+            Notify(current);
+            return;
+        }
+
+        // Pure phone preview owns no recording session, so disconnect closes
+        // the RGB encoder/surface as a normal preview stop.
+        Snapshot stopping = Commit(Mode::PHONE_PREVIEW, Phase::STOPPING);
+        Notify(stopping);
+        RunAsync([this, actions, stopping] {
+            if (actions.stopPreview) actions.stopPreview(Mode::IDLE, stopping.revision);
+            Enqueue({EventType::PREVIEW_STOP_DONE, RecordOrigin::PHONE,
+                     "control disconnect preview stop done",
+                     stopping.revision, true, Mode::IDLE});
+        });
         return;
     }
     if (current.phase == Phase::STOPPING) { Notify(current); return; }
@@ -131,7 +204,8 @@ void Coordinator::Process(const Event& event) {
         Snapshot starting = Commit(target, Phase::STARTING); Notify(starting);
         const MediaActions actions = actions_;
         RunAsync([this, actions, target, starting, keepPreview] {
-            const bool ok = actions.startRecording && actions.startRecording(target, starting.revision);
+            const bool ok = actions.startRecording &&
+                    actions.startRecording(target, starting.revision, keepPreview);
             Enqueue({EventType::RECORD_START_DONE, RecordOrigin::PHONE, "start done",
                      starting.revision, ok, target,
                      keepPreview ? Mode::PHONE_PREVIEW : Mode::IDLE});
@@ -155,14 +229,24 @@ void Coordinator::Process(const Event& event) {
     if (event.type == EventType::PREVIEW_START) {
         if (current.mode == Mode::IDLE || current.mode == Mode::LOCAL_RECORD) {
             const Mode target = current.mode == Mode::IDLE ? Mode::PHONE_PREVIEW : Mode::LOCAL_RECORD_WITH_PREVIEW;
-            if (actions_.startPreview && actions_.startPreview(target, current.revision + 1)) Notify(Commit(target, Phase::STABLE));
-            else Notify(current);
+            Snapshot starting = Commit(target, Phase::STARTING); Notify(starting);
+            const MediaActions actions = actions_;
+            RunAsync([this, actions, target, starting, current] {
+                const bool ok = actions.startPreview && actions.startPreview(target, starting.revision);
+                Enqueue({EventType::PREVIEW_START_DONE, RecordOrigin::PHONE, "preview start done",
+                         starting.revision, ok, target, current.mode});
+            });
         } else Notify(current);
     } else if (event.type == EventType::PREVIEW_STOP) {
         if (current.mode == Mode::PHONE_PREVIEW || current.mode == Mode::LOCAL_RECORD_WITH_PREVIEW) {
             const Mode target = current.mode == Mode::PHONE_PREVIEW ? Mode::IDLE : Mode::LOCAL_RECORD;
-            if (actions_.stopPreview) actions_.stopPreview(target, current.revision + 1);
-            Notify(Commit(target, Phase::STABLE));
+            Snapshot stopping = Commit(current.mode, Phase::STOPPING); Notify(stopping);
+            const MediaActions actions = actions_;
+            RunAsync([this, actions, target, stopping] {
+                if (actions.stopPreview) actions.stopPreview(target, stopping.revision);
+                Enqueue({EventType::PREVIEW_STOP_DONE, RecordOrigin::PHONE, "preview stop done",
+                         stopping.revision, true, target});
+            });
         } else Notify(current);
     }
 }

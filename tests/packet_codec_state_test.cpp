@@ -126,7 +126,6 @@ int main() {
                   "CMD_STOP_VIDEO wire value changed");
 
     egocollect::StatusMessage status;
-    status.workingState = egocollect::WorkingState::kCollecting;
     status.operationMode = egocollect::OperationMode::kPhoneRecord;
     status.operationPhase = egocollect::OperationPhase::kStopping;
     status.stateRevision = 0x102030405ULL;
@@ -149,7 +148,7 @@ int main() {
 
     std::vector<Field> deviceFields;
     if (!ParseFields(deviceField->bytes, &deviceFields)) return 6;
-    if (!ExpectVarint(deviceFields, 1, 1) ||
+    if (Find(deviceFields, 1) != nullptr ||
         !ExpectVarint(deviceFields, 2, 4) ||
         !ExpectVarint(deviceFields, 3, 2) ||
         !ExpectVarint(deviceFields, 4, 0x102030405ULL)) {
@@ -173,6 +172,18 @@ int main() {
         }
     }
 
-    std::puts("PASS packet codec DeviceState fields 1/2/3/4 and command values 1/2/3/4");
+    const uint32_t retiredCommands[] = {21, 30, 31, 32};
+    for (uint32_t value : retiredCommands) {
+        egocollect::CommandPacket parsed;
+        std::string error;
+        if (!egocollect::ParseCommandPacket(BuildCommandPacket(value), &parsed, &error) ||
+            parsed.command != egocollect::CommandType::kUnknown) {
+            std::fprintf(stderr, "retired command %u was accepted: %s\n",
+                         value, error.c_str());
+            return 9;
+        }
+    }
+
+    std::puts("PASS packet codec DeviceState fields 2/3/4 and reserved command values");
     return 0;
 }

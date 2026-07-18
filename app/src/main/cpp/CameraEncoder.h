@@ -27,18 +27,15 @@
 
 namespace SXR {
 
-    // Interface for receiving encoded frame output from all CameraEncoder instances.
-    // Register via CameraEncoder::setOutputListener(); called on each encoder's
-    // output thread for both codec-config (VPS/SPS/PPS) and data frames.
-    class IEncoderOutputListener {
+    // RGB-only encoded output. Grayscale encoders deliberately have no network sink.
+    class IRgbEncodedSink {
     public:
-        virtual ~IEncoderOutputListener() = default;
-        // group:  camera group name ("rgb" / "tracking" / "ctrl")
+        virtual ~IRgbEncodedSink() = default;
         // data:   H.265 encoded sample data (AVCC format)
         // size:   byte length of data
         // ptsUs:  absolute presentation timestamp (CLOCK_BOOTTIME, microseconds)
         // isConfig: true for VPS/SPS/PPS (codec config) frames
-        virtual void onEncodedFrame(const char* group,
+        virtual void onRgbEncodedFrame(
             const uint8_t* data, size_t size, int64_t ptsUs, bool isConfig) = 0;
     };
 
@@ -74,7 +71,8 @@ namespace SXR {
         enum class EncoderState { STOPPED, STARTING, RUNNING, STOPPING };
         // Constructor for RGB cameras with Surface mode
         CameraEncoder(int width, int height, int frameRate, int bitRate,
-                      const std::string& outputName, const std::string& baseDir = "");
+                      const std::string& outputName, const std::string& baseDir,
+                      IRgbEncodedSink* rgbSink);
 
         // Constructor for grayscale cameras with group name (Buffer mode)
         CameraEncoder(const std::string& groupName, int width, int height, int frameRate = 60, const std::string& baseDir = "");
@@ -120,12 +118,6 @@ namespace SXR {
         // Set BOOTTIME→REALTIME offset for timestamp conversion (called once per recording session)
         void setTimeOffset(int64_t offsetNs) { mTimeOffsetNs = offsetNs; }
 
-        // --- Global output listener (class-level, shared by all instances) ---
-
-        // Register the listener that receives every encoded frame from all
-        // CameraEncoder instances. Pass nullptr to unregister.
-        static void setOutputListener(IEncoderOutputListener* listener);
-
         // Request an IDR keyframe (SPS/PPS + IDR) on the given codec. Used after
         // switching camera groups so consumers get fresh codec config.
         static void requestKeyFrame(AMediaCodec* codec, const std::string& group);
@@ -156,6 +148,7 @@ namespace SXR {
         std::string mOutputName; // Output filename (e.g. "rgb.mp4")
         std::string mBaseDir;    // Output directory (empty = use default path)
         std::string mOutputPath;
+        IRgbEncodedSink* mRgbSink = nullptr; // non-owning; RGB encoder is stopped before sink
 
         AMediaCodec *mCodec = nullptr;
         ANativeWindow *mInputSurface = nullptr;  // Input surface for zero-copy

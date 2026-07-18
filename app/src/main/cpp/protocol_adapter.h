@@ -3,6 +3,7 @@
 #include <string>
 
 struct AMediaCodec;
+namespace SXR { class IRgbEncodedSink; }
 
 namespace protocol_adapter {
 
@@ -10,14 +11,16 @@ void Start(const std::string& externalFilesDir);
 
 void Stop();
 
-void OnRecordingSessionStarted();
-
 void OnRgbEncoderReady(AMediaCodec* codec);
 
-void OnRecordingSessionStopped();
+void OnRgbEncoderStopping();
 
-// Media sink controls used only by the authoritative operation coordinator.
-void SetStreamingEnabled(bool enabled);
+void OnRgbEncoderStopped();
+
+SXR::IRgbEncodedSink* GetRgbEncodedSink();
+
+bool IsControlClientConnected();
+
 void NotifyAuthoritativeStateChanged();
 
 }  // namespace protocol_adapter

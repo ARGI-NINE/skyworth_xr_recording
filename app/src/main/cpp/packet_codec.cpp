@@ -267,7 +267,6 @@ std::string BuildWifiMessage(const WifiInfo& wifi) {
 
 std::string BuildDeviceStateMessage(const StatusMessage& status) {
     std::string out;
-    WriteUInt32Field(1, static_cast<uint32_t>(status.workingState), &out);
     WriteUInt32Field(2, static_cast<uint32_t>(status.operationMode), &out);
     WriteUInt32Field(3, static_cast<uint32_t>(status.operationPhase), &out);
     WriteUInt64Field(4, status.stateRevision, &out);

@@ -48,13 +48,10 @@ public:
     void saveHeadPose(int64_t boottimeNs, const XrPosef& pose);
 
 private:
-    enum class SessionState { IDLE, STARTING, RECORDING, STOPPING };
-
     void poseWriterThreadFunc();
 
     std::string mBasePath;
     std::string mDatasetDir;
-    std::atomic<SessionState> mSessionState{SessionState::IDLE};
     std::atomic<bool> mRecording{false};
     std::mutex mMutex;
 

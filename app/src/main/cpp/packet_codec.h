@@ -22,12 +22,6 @@ enum class CommandType : uint32_t {
     kGetParam = 10,
     kSetParam = 11,
     kReboot = 20,
-    // Legacy values kept only for wire compatibility. They are not part of the
-    // current PROTOCOL.md command surface and should decode as unknown.
-    kFactoryReset = 21,
-    kOtaStart = 30,
-    kOtaData = 31,
-    kOtaEnd = 32,
 };
 
 enum class ResultCode : uint32_t {
@@ -40,9 +34,6 @@ enum class ResultCode : uint32_t {
     kCameraFailed = 400,
     kMicrophoneFailed = 401,
     kInternal = 500,
-    // Legacy value kept only for wire compatibility. It should not be emitted
-    // on the current protocol surface.
-    kOtaCheckFailed = 501,
 };
 
 inline bool IsSupportedCommandType(CommandType type) {
@@ -57,10 +48,6 @@ inline bool IsSupportedCommandType(CommandType type) {
         case CommandType::kReboot:
             return true;
         case CommandType::kUnknown:
-        case CommandType::kFactoryReset:
-        case CommandType::kOtaStart:
-        case CommandType::kOtaData:
-        case CommandType::kOtaEnd:
             return false;
     }
     return false;
@@ -78,19 +65,9 @@ inline bool IsSupportedResultCode(ResultCode code) {
         case ResultCode::kMicrophoneFailed:
         case ResultCode::kInternal:
             return true;
-        case ResultCode::kOtaCheckFailed:
-            return false;
     }
     return false;
 }
-
-enum class WorkingState : uint32_t {
-    kIdle = 0,
-    kCollecting = 1,
-    kUploading = 2,
-    kSleeping = 3,
-    kFault = 4,
-};
 
 // Authoritative business mode reported in DeviceState.operation_mode (field 2).
 // Resource execution states are deliberately not exposed on the wire.
@@ -162,7 +139,6 @@ struct PeripheralState {
 struct StatusMessage {
     BatteryInfo battery;
     WifiInfo wifi;
-    WorkingState workingState = WorkingState::kIdle;
     OperationMode operationMode = OperationMode::kIdle;
     OperationPhase operationPhase = OperationPhase::kStable;
     uint64_t stateRevision = 0;

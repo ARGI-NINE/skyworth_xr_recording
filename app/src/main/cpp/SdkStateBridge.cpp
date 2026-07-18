@@ -184,12 +184,12 @@ std::string GetStateJson() {
     StateSnapshot snapshot;
     const StateProvider provider = GetStateRegistry().GetProvider();
     const bool providerRegistered = provider != nullptr;
-    const bool engineAvailable = ReadStateSnapshot(&snapshot);
+    ReadStateSnapshot(&snapshot);
 
     if (snapshot.engineAvailable) {
         snapshot.canStartRecording =
                 !snapshot.isRecording &&
-                !snapshot.stopInProgress &&
+                snapshot.operationPhase == 0 &&
                 (!snapshot.storageKnown || !snapshot.storageLow);
     } else {
         snapshot.canStartRecording = false;
@@ -207,9 +207,6 @@ std::string GetStateJson() {
         << ",\"operation_phase\":" << snapshot.operationPhase
         << ",\"state_revision\":" << snapshot.stateRevision
         << ",\"is_recording\":" << (snapshot.isRecording ? "true" : "false")
-        << ",\"stop_in_progress\":" << (snapshot.stopInProgress ? "true" : "false")
-        << ",\"encoding_enabled\":" << (snapshot.encodingEnabled ? "true" : "false")
-        << ",\"encoders_stopped\":" << (snapshot.encodersStopped ? "true" : "false")
         << ",\"auto_stop_requested\":" << (snapshot.autoStopRequested ? "true" : "false")
         << ",\"use_controller_mode\":" << (snapshot.useControllerMode ? "true" : "false")
         << ",\"can_start_recording\":" << (snapshot.canStartRecording ? "true" : "false")

@@ -39,14 +39,14 @@ enum OperationPhase {
 }
 
 message DeviceState {
-  DeviceWorkingState working = 1; // 兼容字段
+  reserved 1; // 原 working 字段，不得复用
   OperationMode operation_mode = 2;
   OperationPhase operation_phase = 3;
   uint64 state_revision = 4;
 }
 ```
 
-`working` 的兼容映射：`MODE_IDLE` 和 `MODE_PHONE_PREVIEW` 为 `IDLE`；三个录制模式为 `COLLECTING`；录制停止完成前即使处于 `PHASE_STOPPING` 仍为 `COLLECTING`，完成后才为 `IDLE`。新 App 必须以三个新字段为准，并丢弃 `state_revision` 小于当前已应用版本的 Status；Response 与 Status 允许乱序。
+App 必须以 `operation_mode`、`operation_phase` 和 `state_revision` 为准，并丢弃 `state_revision` 小于当前已应用版本的 Status；Response 与 Status 允许乱序。字段 1 已删除并永久保留，不再输出旧状态兼容值。
 
 每次进入 `STARTING`、稳定模式、`STOPPING`、最终 `IDLE` 或 `ERROR` 都递增 revision 并立即主动上报。预览进入/退出、动态 writer 成功、writer finalize、启动失败、编码器错误、自动停止和低存储停止同样必须立即上报相应权威状态。内部 encoder/disk/stream 状态、来源、session、socket 连接等不进入协议。
 
@@ -89,7 +89,7 @@ message DeviceState {
 4. 编码输出线程排空 EOS 之前的有效编码样本；这些样本仍写入当前 fMP4。
 5. 编码输出线程串行 finalize/close writer；停止 DatasetRecorder 的音频、IMU、Pose、手部/控制器数据。
 6. 销毁 EncoderSurface，停止并由唯一所有者销毁 MediaCodec，清空编码和网络队列。
-7. 设置 `MODE_IDLE/PHASE_STABLE`，再次递增 revision 并立即上报；`working` 此时切换为 `IDLE`。
+7. 设置 `MODE_IDLE/PHASE_STABLE`，再次递增 revision 并立即上报。
 
 “末帧”定义为关闭编码提交入口后、EOS 之前由编码输出线程排空并成功提交给 writer 的最后一个有效编码样本；EOS 本身不是媒体帧。网络发送线程阻塞不得阻塞文件写入，文件 sink 不使用网络队列的丢旧帧策略。writer attach/write/finalize/close 仅由编码输出线程串行执行，同一个 MediaCodec 只能由一个线程 stop/delete。
 
@@ -1019,14 +1019,10 @@ message WifiInfo {
 }
 
 message DeviceState {
-  DeviceWorkingState working = 1;
-  enum DeviceWorkingState {
-    IDLE = 0;
-    COLLECTING = 1;
-    UPLOADING = 2;
-    SLEEPING = 3;
-    FAULT = 4;
-  }
+  reserved 1; // 原 working 字段，不得复用
+  OperationMode operation_mode = 2;
+  OperationPhase operation_phase = 3;
+  uint64 state_revision = 4;
 }
 
 message StorageInfo {
@@ -1049,25 +1045,7 @@ message PeripheralState {
 - `peripherals`：当前 SDK 现有聚合项为 `camera`、`imu`、`mic`。
 - `BLE`：当前 SDK 内部存在 BLE 配网 / 连接状态，但控制通道 `Status` 里没有单独 protobuf 字段；因此本版本只把 BLE 视为设备基础连接状态的一部分，不额外扩展字段，不伪称控制包里已有独立 `ble` 字段。
 
-当前 SDK 的 `state.working` 使用约束：
-
-- 当前实际使用值以 `IDLE`、`COLLECTING`、`FAULT` 为主。
-- `UPLOADING`、`SLEEPING` 在当前版本中不作为控制通道必须上报的状态。
-
-采集状态请沿用 `capture_status` 的状态类型，但要区分“实时控制状态”和“本地落盘最终态”：
-
-| 口径 | 状态 | 当前语义 | 与 `state.working` 的关系 |
-|------|------|----------|---------------------------|
-| 实时控制状态 | `recording` | 正在采集中 | 映射为 `COLLECTING` |
-| 实时控制状态 | `finalizing` | 已停止采集请求，正在收尾写盘 | 仍映射为 `COLLECTING` |
-| 实时控制状态 | `idle` | 当前未在采集 / 收尾 | 映射为 `IDLE` |
-| 本地文件最终态 | `complete` | `capture_status.json` 最终写盘完成后的文件侧状态 | 不作为实时控制状态单独上报 |
-
-补充说明：
-
-- 手机端如需展示实时采集状态，应优先沿用 `recording / finalizing / idle` 这组口径。
-- `complete` 当前只用于本地 `capture_status.json` 最终态，不应当成实时控制通道状态来理解。
-- 控制通道当前不会为了此事再扩展新的 `working` 枚举。
+控制通道的实时业务状态只由 `operation_mode`、`operation_phase` 和 `state_revision` 表示。`capture_status.json` 的 `recording`、`finalizing`、`idle`、`complete` 是本地落盘生命周期，不映射为另一套 wire 状态。
 - 状态推送周期以当前 SDK 行为为准；当前控制连接建立后会先推送一次快照，随后按秒级周期刷新。
 
 #### 3.2.5 事件字段约定 (设备 → 手机)
@@ -1185,7 +1163,8 @@ message Response {
  │                                        │
  │  Packet{ seq: 3, status: {             │
  │    battery: { level: 85 },             │
- │    state: { working: COLLECTING }      │
+ │    state: { operation_mode: MODE_PHONE_RECORD, │
+ │             operation_phase: PHASE_STABLE }    │
  │  }}                                    │
  │←────────────────────────────────────── │
 ```

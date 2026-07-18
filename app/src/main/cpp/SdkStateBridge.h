@@ -13,9 +13,6 @@ struct StateSnapshot {
     uint64_t stateRevision = 0;
     bool engineAvailable = false;
     bool isRecording = false;
-    bool stopInProgress = false;
-    bool encodingEnabled = false;
-    bool encodersStopped = true;
     bool autoStopRequested = false;
     bool useControllerMode = false;
     bool cameraContextAvailable = false;

@@ -36,10 +36,11 @@ struct Snapshot {
 struct MediaActions {
     // Blocking media work. These callbacks run on the coordinator worker, never
     // while the state mutex is held.
-    std::function<bool(Mode, uint64_t)> startRecording;
+    std::function<bool(Mode, uint64_t, bool)> startRecording;
     std::function<void(uint64_t, const std::string&)> stopRecording;
     std::function<bool(Mode, uint64_t)> startPreview;
     std::function<void(Mode, uint64_t)> stopPreview;
+    std::function<bool()> isControlConnected;
     std::function<void(const Snapshot&)> stateChanged;
 };
 
@@ -55,11 +56,14 @@ public:
     void HandlePreviewStop();
     void HandleRecordToggle(const char* reason);
     void HandleNetworkError(const char* reason);
+    void HandleControlDisconnected(const char* reason);
     Snapshot GetSnapshot() const;
 
 private:
     enum class EventType { RECORD_START, RECORD_STOP, PREVIEW_START, PREVIEW_STOP, TOGGLE,
-                           RECORD_START_DONE, RECORD_STOP_DONE, NETWORK_ERROR };
+                           RECORD_START_DONE, RECORD_STOP_DONE,
+                           PREVIEW_START_DONE, PREVIEW_STOP_DONE,
+                           NETWORK_ERROR, CONTROL_DISCONNECTED };
     struct Event {
         EventType type;
         RecordOrigin origin;
