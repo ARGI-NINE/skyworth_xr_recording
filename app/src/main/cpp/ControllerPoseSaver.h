@@ -35,6 +35,7 @@ public:
     bool StartSession(const std::string& csvPath);
     void StopSession();
     bool IsSessionActive() const { return m_sessionActive.load(); }
+    bool IsFinished() const { return m_finished.load(); }
 
     bool SaveFrame(const ControllerPoseRecord& record);
     void Pause();
@@ -57,6 +58,8 @@ private:
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_paused{false};
     std::atomic<bool> m_sessionActive{false};
+    std::atomic<bool> m_finished{true};
+    bool m_isSaving{false}; // guarded by m_queueMutex
     std::atomic<uint32_t> m_savedCount{0};
 
     std::ofstream m_csvFile;

@@ -3750,14 +3750,17 @@ static bool startDatasetRecordingSession(struct engine* e,
     e->controllerPoseRing.clear();
     // Propagate BOOTTIME→REALTIME offset to non-lazy-init components
     e->propagateTimeOffset();
-    if (e->useControllerMode) {
-        e->mControllerPoseSaver.StartSession(
-            e->mDatasetRecorder.getControllerPoseCsvPath());
-    } else {
-        e->mHandTrackerLogic.rawDateSave->StartNewSession(
-            e->mDatasetRecorder.getHandTrackingCsvPath());
-        e->mDatasetRecorder.writeCaptureStatusJson(
-            "recording", e->mHandTrackerLogic.rawDateSave);
+    const bool auxiliaryStarted = e->useControllerMode
+        ? e->mControllerPoseSaver.StartSession(
+              e->mDatasetRecorder.getControllerPoseCsvPath())
+        : e->mHandTrackerLogic.rawDateSave->StartNewSession(
+              e->mDatasetRecorder.getHandTrackingCsvPath());
+    if (!auxiliaryStarted ||
+        !e->mDatasetRecorder.writeCaptureStatusJson("recording", false)) {
+        LOGE("%s: failed to initialize dataset sidecar/status", startSource);
+        ext.callbackAdmissionClosed = false;
+        barrierLock.unlock();
+        return false;
     }
     ext.callbackAdmissionClosed = false;
     barrierLock.unlock();
@@ -3841,14 +3844,24 @@ static void coordinatorStopRecording(uint64_t revision, const std::string& reaso
     auto& ext = g_engine->mCameraAccessExtension;
     { std::lock_guard<std::mutex> lock(ext.callbackDrainMutex); ext.callbackAdmissionClosed = true; }
     if (g_engine->mDatasetRecorder.isRecording())
-        g_engine->mDatasetRecorder.writeCaptureStatusJson("finalizing", g_engine->mHandTrackerLogic.rawDateSave);
+        g_engine->mDatasetRecorder.writeCaptureStatusJson("finalizing", false);
     ext.stopEncoder();
     // Writer finalize/EOS drain has completed, while the authoritative state
     // intentionally remains STOPPING until all side-channel collectors stop.
     protocol_adapter::NotifyAuthoritativeStateChanged();
     g_engine->mDatasetRecorder.stop();
-    if (g_engine->useControllerMode) g_engine->mControllerPoseSaver.StopSession();
-    else g_engine->mHandTrackerLogic.rawDateSave->StopSession();
+    bool auxiliaryFinished = false;
+    if (g_engine->useControllerMode) {
+        g_engine->mControllerPoseSaver.StopSession();
+        auxiliaryFinished = g_engine->mControllerPoseSaver.IsFinished();
+    } else {
+        g_engine->mHandTrackerLogic.rawDateSave->StopSession();
+        auxiliaryFinished = g_engine->mHandTrackerLogic.rawDateSave->IsFinished();
+    }
+    if (!g_engine->mDatasetRecorder.writeCaptureStatusJson("complete", auxiliaryFinished)) {
+        LOGE("event=capture_status_finalize_failed revision=%llu",
+             (unsigned long long)revision);
+    }
     ext.encoderBaseDir.clear();
     { std::lock_guard<std::mutex> lock(ext.callbackDrainMutex); ext.callbackAdmissionClosed = false; }
     LOGI("event=global_record_stop_complete revision=%llu", (unsigned long long)revision);

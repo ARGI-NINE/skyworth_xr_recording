@@ -35,7 +35,9 @@ public:
     std::string getHandTrackingCsvPath() const;
     std::string getControllerPoseCsvPath() const;
     std::string getAudioPath() const;
-    bool writeCaptureStatusJson(const std::string& state, const RawDateSave* handSaver) const;
+    // auxiliaryFinished represents the active hand/controller pose writer.
+    // Keeping this mode-agnostic lets capture completion cover both modes.
+    bool writeCaptureStatusJson(const std::string& state, bool auxiliaryFinished) const;
 
     // Get BOOTTIME→REALTIME offset captured at recording start
     int64_t getTimeOffset() const { return mBoottimeToRealtimeOffsetNs; }

@@ -177,7 +177,7 @@ std::string DatasetRecorder::getAudioPath() const {
     return mDatasetDir + "/audio.m4a";
 }
 
-bool DatasetRecorder::writeCaptureStatusJson(const std::string& state, const RawDateSave* handSaver) const {
+bool DatasetRecorder::writeCaptureStatusJson(const std::string& state, bool auxiliaryFinished) const {
     if (mDatasetDir.empty()) {
         LOGE("writeCaptureStatusJson: dataset dir is empty");
         return false;
@@ -186,13 +186,11 @@ bool DatasetRecorder::writeCaptureStatusJson(const std::string& state, const Raw
     const bool audioFinished = mAudioEncoder.isFinished();
     const bool imuFinished = mImuCollector.isFinished();
     const bool headPoseFinished = mPoseWriterFinished.load();
-    const bool handTrackingFinished = handSaver && handSaver->IsFinished();
-
     const bool allChainsFinished =
         audioFinished &&
         imuFinished &&
         headPoseFinished &&
-        handTrackingFinished;
+        auxiliaryFinished;
 
     std::string captureState;
     if (state == "recording") {
