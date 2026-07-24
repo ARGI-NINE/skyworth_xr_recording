@@ -18,7 +18,8 @@ local.properties
 docs
 !docs/
 docs/*
-!docs/SXR_头环数据采集系统_1.0_发版说明.md
+!docs/SXR_头环数据采集系统_1.0.0_使用说明.md
+!docs/SXR_头环数据采集系统_1.0.0_发版说明.md
 !docs/LINUX_PORTING_PLAN.md
 !docs/LINUX_NATIVE_REIMPLEMENTATION_PLAN.md
 dataset*

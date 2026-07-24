@@ -257,16 +257,9 @@ namespace SXR {
         const std::string csvPath = mOutputPath.substr(0, mOutputPath.size()-4) + "_metainfo.csv";
         mMetaFile = fopen(csvPath.c_str(), "w");
         if (!mMetaFile) { mFmp4.close(); return false; }
-        if (mType == EncoderType::RGB) {
-            fprintf(mMetaFile,
-                    "frame_index,frame_id,pts_us,exposure_start_utc_ns,"
-                    "exposure_duration_ns,gain,mid_exposure_utc_ns,"
-                    "app_boottime_utc_ns,app_realtime_utc_ns\n");
-        } else {
-            fprintf(mMetaFile,
-                    "frame_index,frame_id,pts_us,exposure_start_utc_ns,"
-                    "exposure_duration_ns,gain,mid_exposure_utc_ns\n");
-        }
+        fprintf(mMetaFile,
+                "frame_index,frame_id,pts_us,exposure_start_utc_ns,"
+                "exposure_duration_ns,gain,mid_exposure_utc_ns\n");
         mFmp4Started = false; mFirstPtsUs = -1; mFrameIndex = 0;
         return true;
     }
@@ -515,28 +508,14 @@ namespace SXR {
                     // exactly). Preserve the original driver-timestamp CSV
                     // semantics introduced with the fMP4 writer: convert the
                     // camera driver's BOOTTIME exposure timestamps to UTC using
-                    // the recording-session offset. The RGB schema additionally
-                    // records the callback BOOTTIME converted with that same
-                    // offset and the directly sampled CLOCK_REALTIME value.
+                    // the recording-session offset.
                     const int64_t startUtc = fm.exposureStartBootNs + mTimeOffsetNs;
                     const int64_t midUtc   = fm.midExposureBootNs + mTimeOffsetNs;
-                    if (mType == EncoderType::RGB) {
-                        const int64_t appBootUtc = fm.bootTime + mTimeOffsetNs;
-                        fprintf(mMetaFile,
-                                "%llu,%u,%lld,%lld,%u,%u,%lld,%lld,%lld\n",
-                                (unsigned long long)mFrameIndex, fm.frameId,
-                                (long long)ptsRel,
-                                (long long)startUtc, fm.exposure, fm.gain,
-                                (long long)midUtc,
-                                (long long)appBootUtc,
-                                (long long)fm.utcTime);
-                    } else {
-                        fprintf(mMetaFile, "%llu,%u,%lld,%lld,%u,%u,%lld\n",
-                                (unsigned long long)mFrameIndex, fm.frameId,
-                                (long long)ptsRel,
-                                (long long)startUtc, fm.exposure, fm.gain,
-                                (long long)midUtc);
-                    }
+                    fprintf(mMetaFile, "%llu,%u,%lld,%lld,%u,%u,%lld\n",
+                            (unsigned long long)mFrameIndex, fm.frameId,
+                            (long long)ptsRel,
+                            (long long)startUtc, fm.exposure, fm.gain,
+                            (long long)midUtc);
                     fflush(mMetaFile);
                     ++mFrameIndex;
                 }

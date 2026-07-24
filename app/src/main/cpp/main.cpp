@@ -1807,8 +1807,12 @@ struct CameraAccessExtension{
         }
         const operation::Mode mode = operation::Coordinator::Instance().GetSnapshot().mode;
         const bool recordThisFrame = mode != operation::Mode::IDLE;
+        // Keep the application-side clock sampling point available for diagnostics,
+        // but do not transport or persist these values in rgb_metainfo.csv.
         const int64_t startUtcTime = getCurrentUtcNs();
         const int64_t startBootTime = getCurrentBootNs();
+        (void)startUtcTime;
+        (void)startBootTime;
 
         auto t0 = std::chrono::steady_clock::now();
 
@@ -1837,7 +1841,7 @@ struct CameraAccessExtension{
             return;
         }
 
-        ext->handleRGBFrame(data, recordThisFrame, startUtcTime, startBootTime);
+        ext->handleRGBFrame(data, recordThisFrame);
 
         ext->rgbCtx.releaseCurrent();
 
@@ -2000,7 +2004,7 @@ struct CameraAccessExtension{
 
     // Handle RGB camera frame (render directly in callback, release hwBuffer immediately)
     // Caller ensures rgbCtx is current, no mutex needed
-    void handleRGBFrame(const SXR::FrameData* data, bool recordThisFrame, int64_t utcTime, int64_t bootTime) {
+    void handleRGBFrame(const SXR::FrameData* data, bool recordThisFrame) {
         // Save camera params on first frame of recording session
         saveCameraParams(data, "rgb", cameraParamsSavedRgb);
 
@@ -2159,9 +2163,6 @@ struct CameraAccessExtension{
                 fm.gain                = data->frames[0].gain;
                 fm.frameId             = data->frames[0].frameId;
                 fm.midExposureBootNs   = midExposureNs;
-                fm.callbackBootNs      = bootTime;
-                fm.utcTime             = utcTime;
-                fm.bootTime            = bootTime;
                 rgbEncoder->submitFrameMeta(fm);
             }
             rgbEncoderSurface->swapBuffers();
@@ -2447,6 +2448,41 @@ struct CameraAccessExtension{
 
         if (!data->hwBuffer[0]) return;
 
+        // Shared by both the display-texture path and direct encoder path.
+        if (grayscaleEncoderShaderProgram == 0) {
+            std::lock_guard<std::mutex> lock(shaderInitMutex);
+            if (grayscaleEncoderShaderProgram == 0) {
+                initGrayscaleEncoderShader();
+            }
+        }
+        if (grayscaleEncoderShaderProgram == 0) return;
+
+        // Match the RGB direct-encode path: when the encoder is available,
+        // avoid the extra per-eye display-texture pass.
+        const bool encodedDirect =
+                recordThisFrame &&
+                targetSurface &&
+                targetEncoder &&
+                *targetEncoder &&
+                targetY8Texture;
+
+        if (encodedDirect) {
+            int64_t frameTimestampNs = data->frames[0].timestamp;
+            SXR::FrameMeta fm{};
+            fm.exposureStartBootNs = (int64_t)data->frames[0].timestamp;
+            fm.exposure            = data->frames[0].exposure;
+            fm.gain                = data->frames[0].gain;
+            fm.frameId             = data->frames[0].frameId;
+            fm.midExposureBootNs   =
+                    (int64_t)(data->frames[0].timestamp + data->frames[0].exposure / 2);
+            (*targetEncoder)->submitFrameMeta(fm);
+            renderGrayscaleToEncoder(targetSurface, targetY8Texture,
+                                     data->hwBuffer[0],
+                                     width * 2, height, ctx.display,
+                                     frameTimestampNs);
+            return;
+        }
+
         // Lazy create VBO for CV rendering (per-group to avoid cross-thread glBufferSubData)
         if (cvDisplayVBOs[gi] == 0) {
             glGenBuffers(1, &cvDisplayVBOs[gi]);
@@ -2460,15 +2496,6 @@ struct CameraAccessExtension{
             glBufferData(GL_ARRAY_BUFFER, sizeof(defaultVerts), defaultVerts, GL_DYNAMIC_DRAW);
             glBindBuffer(GL_ARRAY_BUFFER, 0);
         }
-
-        // Initialize grayscale display shader if needed (mutex-protected: called from tracking + ctrl threads)
-        if (grayscaleEncoderShaderProgram == 0) {
-            std::lock_guard<std::mutex> lock(shaderInitMutex);
-            if (grayscaleEncoderShaderProgram == 0) {
-                initGrayscaleEncoderShader();
-            }
-        }
-        if (grayscaleEncoderShaderProgram == 0) return;  // shader init failed
 
         // Reuse persistent external OES texture — create once per group, rebind per frame
         if (cvPersistentExtTex[gi] == 0) {
@@ -2582,25 +2609,6 @@ struct CameraAccessExtension{
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
         }
 
-        // Render to encoder surface (for recording)
-        // NOTE: This does context switch to encoder surface and back — main overhead
-        if (recordThisFrame &&
-            targetSurface &&
-            *targetEncoder &&
-            targetY8Texture) {
-            int64_t frameTimestampNs = data->frames[0].timestamp;
-            SXR::FrameMeta fm{};
-            fm.exposureStartBootNs = (int64_t)data->frames[0].timestamp;
-            fm.exposure            = data->frames[0].exposure;
-            fm.gain                = data->frames[0].gain;
-            fm.frameId             = data->frames[0].frameId;
-            fm.midExposureBootNs   = (int64_t)(data->frames[0].timestamp + data->frames[0].exposure / 2);
-            (*targetEncoder)->submitFrameMeta(fm);
-            renderGrayscaleToEncoder(targetSurface, targetY8Texture,
-                                     data->hwBuffer[0],
-                                     width * 2, height, ctx.display,
-                                     frameTimestampNs);
-        }
     }
 
     // Initialize cameras using dynamic loading API
