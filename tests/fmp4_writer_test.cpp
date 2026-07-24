@@ -20,6 +20,32 @@ static int ffprobe_streams(const std::string& f, const char* sel) {
     return run(c.c_str()).empty() ? 0 : 1;          // 1 if a stream exists
 }
 
+static uint32_t readBe32(const std::vector<uint8_t>& b, size_t off) {
+    return (uint32_t(b[off]) << 24) | (uint32_t(b[off + 1]) << 16) |
+           (uint32_t(b[off + 2]) << 8) | uint32_t(b[off + 3]);
+}
+
+static uint64_t readBe64(const std::vector<uint8_t>& b, size_t off) {
+    return (uint64_t(readBe32(b, off)) << 32) | readBe32(b, off + 4);
+}
+
+static std::vector<uint8_t> readFile(const std::string& path) {
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) return {};
+    fseek(fp, 0, SEEK_END); long size = ftell(fp); rewind(fp);
+    std::vector<uint8_t> data(size > 0 ? static_cast<size_t>(size) : 0);
+    if (!data.empty() && fread(data.data(), 1, data.size(), fp) != data.size()) data.clear();
+    fclose(fp);
+    return data;
+}
+
+static std::vector<size_t> findTypes(const std::vector<uint8_t>& b, const char type[5]) {
+    std::vector<size_t> offsets;
+    for (size_t i = 4; i + 4 <= b.size(); ++i)
+        if (memcmp(b.data() + i, type, 4) == 0) offsets.push_back(i);
+    return offsets;
+}
+
 int main() {
     std::string f = "out_empty.mp4";
     // Annex-B HEVC csd: 1 NALU (fake VPS, nalType 32) prefixed with a
@@ -240,6 +266,47 @@ int main() {
         if (mdatCount != 3) { fprintf(stderr,"FAIL task6: found %d mdat boxes (want 3)\n", mdatCount); allOk = false; }
         if (!allOk) return 57;
         printf("PASS task6: Annex-B converted to length-prefixed (3 mdat, each 00 00 00 04)\n");
+    }
+
+    // ---- Task 7: fragmented timeline metadata and VFR duration ownership ----
+    {
+        std::string f = "out_timeline.mp4";
+        uint8_t csd[] = {0,0,0,1, 0x40,0x01,0x0c,0x01,0xff,0xff,0x01,0x60,0x00,0x00,0x00,0x00,0x00,0x00,0x90,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x96,0xac,0x09};
+        uint8_t frame[8] = {0,0,0,4, 0x26,0x01,0xAA,0xBB};
+        const int64_t pts[] = {0, 10000, 40000};
+        FMP4Writer w;
+        if (!w.open(f)) return 61;
+        w.setVideoTrack(640, 480, 1000000, csd, sizeof(csd), 16667);
+        if (!w.start()) return 62;
+        for (int i = 0; i < 3; ++i)
+            if (!w.writeSample(frame, sizeof(frame), pts[i], true)) return 63;
+        if (!w.close()) return 64;
+
+        std::vector<uint8_t> b = readFile(f);
+        auto one = [&](const char type[5], size_t fieldOffset, uint32_t expected) {
+            std::vector<size_t> p = findTypes(b, type);
+            return p.size() == 1 && p[0] + fieldOffset + 4 <= b.size() &&
+                   readBe32(b, p[0] + fieldOffset) == expected;
+        };
+        // Offsets are relative to the fourcc position (box start + 4).
+        if (!one("mvhd", 20, 0) || !one("tkhd", 24, 0) || !one("mdhd", 20, 0) ||
+            !one("stts", 8, 0) || !one("stsc", 8, 0) ||
+            !one("stsz", 12, 0) || !one("stco", 8, 0)) {
+            fprintf(stderr, "FAIL task7: non-empty initialization duration/sample table\n");
+            return 65;
+        }
+        std::vector<size_t> tfdt = findTypes(b, "tfdt");
+        std::vector<size_t> trun = findTypes(b, "trun");
+        const uint32_t expectedDur[] = {10000, 30000, 30000};
+        if (tfdt.size() != 3 || trun.size() != 3) return 66;
+        for (size_t i = 0; i < 3; ++i) {
+            if (readBe64(b, tfdt[i] + 8) != static_cast<uint64_t>(pts[i]) ||
+                readBe32(b, trun[i] + 16) != expectedDur[i]) {
+                fprintf(stderr, "FAIL task7: sample %zu tfdt/trun duration mismatch\n", i);
+                return 67;
+            }
+        }
+        printf("PASS task7: empty init timeline, VFR durations owned by preceding sample\n");
     }
 
     return 0;

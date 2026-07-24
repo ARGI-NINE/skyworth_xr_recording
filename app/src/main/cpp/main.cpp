@@ -2153,12 +2153,13 @@ struct CameraAccessExtension{
 
             rgbEncoderSurface->setPresentationTime((uint64_t)midExposureNs);
             if (rgbEncoder) {
-                SXR::FrameMeta fm;
+                SXR::FrameMeta fm{};
                 fm.exposureStartBootNs = (int64_t)data->frames[0].timestamp;
                 fm.exposure            = data->frames[0].exposure;
                 fm.gain                = data->frames[0].gain;
                 fm.frameId             = data->frames[0].frameId;
                 fm.midExposureBootNs   = midExposureNs;
+                fm.callbackBootNs      = bootTime;
                 fm.utcTime             = utcTime;
                 fm.bootTime            = bootTime;
                 rgbEncoder->submitFrameMeta(fm);
@@ -2588,7 +2589,7 @@ struct CameraAccessExtension{
             *targetEncoder &&
             targetY8Texture) {
             int64_t frameTimestampNs = data->frames[0].timestamp;
-            SXR::FrameMeta fm;
+            SXR::FrameMeta fm{};
             fm.exposureStartBootNs = (int64_t)data->frames[0].timestamp;
             fm.exposure            = data->frames[0].exposure;
             fm.gain                = data->frames[0].gain;

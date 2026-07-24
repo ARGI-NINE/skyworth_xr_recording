@@ -26,7 +26,8 @@ public:
     // Writes ftyp + moov (up front). Exactly one track must be set.
     bool start();
 
-    // One encoded sample -> one styp+moof+mdat fragment.
+    // One encoded sample -> one styp+moof+mdat fragment. Video retains one
+    // sample until the next PTS (or close()) determines its duration.
     // ptsUs: presentation time, in the track's own timescale (video: µs since
     //        timescale=1e6; audio: sampleRate units, caller converts). isSync: true for I-frame.
     bool writeSample(const uint8_t* data, size_t size, int64_t ptsUs, bool isSync);

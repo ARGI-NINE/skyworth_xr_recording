@@ -320,17 +320,20 @@ struct FMP4Writer::Impl {
     bool isAudio = false;   // true after setAudioTrack: track kind this file carries
     int width = 0, height = 0;
     int32_t timescale = 1000000;
-    int32_t sampleIntervalUs = 0;   // stts placeholder delta (0 = empty, backward compat)
-    int64_t firstPtsUs = -1;    // first video sample PTS (track timescale)
-    int64_t lastPtsUs = 0;      // last video sample PTS
+    int32_t sampleIntervalUs = 0;   // configured video-frame duration fallback
     int32_t totalSamples = 0;   // video sample count
-    off_t moovFilePos = 0;      // file offset where moov starts
-    size_t moovSize = 0;        // moov total byte size
     std::vector<uint8_t> csd0;
     int sampleRate = 0, channels = 0;
 
     uint32_t seqNumber = 0;   // mfhd sequence number, ++ per fragment (first fragment = 1)
     int64_t prevPtsUs = -1;   // previous sample PTS (timescale units) for duration delta
+    uint32_t lastVideoDuration = 0;
+    std::vector<uint8_t> pendingVideoSample;
+    int64_t pendingVideoPts = -1;
+    bool pendingVideoSync = false;
+
+    bool writeFragment(const uint8_t* data, size_t size, int64_t pts,
+                       uint32_t duration, bool isSync);
 
     bool writeAll(const void* p, size_t n) {
         const uint8_t* q = static_cast<const uint8_t*>(p);
@@ -412,13 +415,14 @@ static std::vector<uint8_t> buildMvhd(int64_t durationMs) {
     return fullbox("mvhd", 0, 0, std::move(b));
 }
 
-static std::vector<uint8_t> buildTkhd(int width, int height, int64_t durationUs) {
+static std::vector<uint8_t> buildTkhd(int width, int height, int64_t durationMs) {
     std::vector<uint8_t> b;
     be32(b, 0);            // creation_time
     be32(b, 0);            // modification_time
     be32(b, 1);            // track_ID
     be32(b, 0);            // reserved
-    be32(b, static_cast<uint32_t>(durationUs)); // duration
+    // tkhd.duration uses the movie timescale (1000), not the media timescale.
+    be32(b, static_cast<uint32_t>(durationMs)); // duration
     be32(b, 0); be32(b, 0);// reserved
     be16(b, 0);            // layer
     be16(b, 0);            // alternate_group
@@ -622,25 +626,17 @@ static std::vector<uint8_t> buildSmhd() {
 
 static std::vector<uint8_t> buildStbl(const uint8_t* csd, size_t csdLen,
                                       int width, int height, int32_t timescale,
-                                      bool isAudio, int sampleRate, int channels,
-                                      int32_t sampleIntervalUs) {
+                                      bool isAudio, int sampleRate, int channels) {
     std::vector<uint8_t> stbl;
     auto append = [&](const std::vector<uint8_t>& v) { stbl.insert(stbl.end(), v.begin(), v.end()); };
     if (isAudio)
         append(buildAudioStsd(csd, csdLen, sampleRate, channels));
     else
         append(buildStsd(csd, csdLen, width, height, timescale));
-    // stts: for video, write a placeholder entry with the target frame interval
-    // so tools that only read moov (e.g. Windows Explorer/Media Foundation) can
-    // compute a reasonable frame rate. For audio, leave empty as before.
+    // All media samples live in fragments. The initialization sample tables must
+    // therefore agree that they contain zero samples.
     std::vector<uint8_t> sttsP;
-    if (!isAudio && sampleIntervalUs > 0) {
-        be32(sttsP, 1);                                     // entry_count = 1
-        be32(sttsP, 1);                                     // sample_count = 1
-        be32(sttsP, static_cast<uint32_t>(sampleIntervalUs)); // sample_delta
-    } else {
-        be32(sttsP, 0);                                     // entry_count = 0
-    }
+    be32(sttsP, 0);                                         // entry_count = 0
     append(fullbox("stts", 0, 0, std::move(sttsP)));
     std::vector<uint8_t> stscP; be32(stscP, 0);
     append(fullbox("stsc", 0, 0, std::move(stscP)));
@@ -653,37 +649,37 @@ static std::vector<uint8_t> buildStbl(const uint8_t* csd, size_t csdLen,
 
 static std::vector<uint8_t> buildMinf(const uint8_t* csd, size_t csdLen,
                                       int width, int height, int32_t timescale,
-                                      bool isAudio, int sampleRate, int channels,
-                                      int32_t sampleIntervalUs) {
+                                      bool isAudio, int sampleRate, int channels) {
     std::vector<uint8_t> minf;
     auto append = [&](const std::vector<uint8_t>& v) { minf.insert(minf.end(), v.begin(), v.end()); };
     append(isAudio ? buildSmhd() : buildVmhd());
     append(buildDinf());
-    append(buildStbl(csd, csdLen, width, height, timescale, isAudio, sampleRate, channels, sampleIntervalUs));
+    append(buildStbl(csd, csdLen, width, height, timescale, isAudio, sampleRate, channels));
     return box("minf", std::move(minf));
 }
 
 static std::vector<uint8_t> buildMdia(const uint8_t* csd, size_t csdLen,
                                       int width, int height, int32_t timescale,
                                       bool isAudio, int sampleRate, int channels,
-                                      int32_t sampleIntervalUs, int64_t durationUs) {
+                                      int64_t durationTs) {
     std::vector<uint8_t> mdia;
     auto append = [&](const std::vector<uint8_t>& v) { mdia.insert(mdia.end(), v.begin(), v.end()); };
-    append(buildMdhd(timescale, durationUs));
+    append(buildMdhd(timescale, durationTs));
     append(buildHdlr(isAudio ? "soun" : "vide"));
-    append(buildMinf(csd, csdLen, width, height, timescale, isAudio, sampleRate, channels, sampleIntervalUs));
+    append(buildMinf(csd, csdLen, width, height, timescale, isAudio, sampleRate, channels));
     return box("mdia", std::move(mdia));
 }
 
 static std::vector<uint8_t> buildTrak(const uint8_t* csd, size_t csdLen,
                                       int width, int height, int32_t timescale,
                                       bool isAudio, int sampleRate, int channels,
-                                      int32_t sampleIntervalUs, int64_t durationUs) {
+                                      int64_t durationTs) {
     std::vector<uint8_t> trak;
     auto append = [&](const std::vector<uint8_t>& v) { trak.insert(trak.end(), v.begin(), v.end()); };
     // tkhd width/height are video-only fields; pass 0 for audio.
-    append(buildTkhd(isAudio ? 0 : width, isAudio ? 0 : height, durationUs));
-    append(buildMdia(csd, csdLen, width, height, timescale, isAudio, sampleRate, channels, sampleIntervalUs, durationUs));
+    const int64_t durationMs = timescale > 0 ? durationTs * 1000 / timescale : 0;
+    append(buildTkhd(isAudio ? 0 : width, isAudio ? 0 : height, durationMs));
+    append(buildMdia(csd, csdLen, width, height, timescale, isAudio, sampleRate, channels, durationTs));
     return box("trak", std::move(trak));
 }
 
@@ -704,11 +700,12 @@ static std::vector<uint8_t> buildMvex() {
 static std::vector<uint8_t> buildMoov(const uint8_t* csd, size_t csdLen,
                                       int width, int height, int32_t timescale,
                                       bool isAudio, int sampleRate, int channels,
-                                      int32_t sampleIntervalUs, int64_t durationUs) {
+                                      int64_t durationTs) {
     std::vector<uint8_t> moov;
     auto append = [&](const std::vector<uint8_t>& v) { moov.insert(moov.end(), v.begin(), v.end()); };
-    append(buildMvhd(durationUs / 1000));  // mvhd timescale=1000, convert us→ms
-    append(buildTrak(csd, csdLen, width, height, timescale, isAudio, sampleRate, channels, sampleIntervalUs, durationUs));
+    const int64_t durationMs = timescale > 0 ? durationTs * 1000 / timescale : 0;
+    append(buildMvhd(durationMs));
+    append(buildTrak(csd, csdLen, width, height, timescale, isAudio, sampleRate, channels, durationTs));
     append(buildMvex());
     return box("moov", std::move(moov));
 }
@@ -719,12 +716,10 @@ bool FMP4Writer::start() {
     if (!m->hasVideo && !m->hasAudio) { FMP4_LOGE("start: no track set"); return false; }
 
     if (!m->writeBuf(buildFtyp())) return false;
-    m->moovFilePos = static_cast<off_t>(::lseek(m->fd, 0, SEEK_CUR));
     auto moov = buildMoov(m->csd0.data(), m->csd0.size(),
                            m->width, m->height, m->timescale,
                            m->isAudio, m->sampleRate, m->channels,
-                           m->sampleIntervalUs, 0);
-    m->moovSize = moov.size();
+                           0);
     if (!m->writeBuf(moov)) return false;
     m->started = true;
     return true;
@@ -794,53 +789,8 @@ static std::vector<uint8_t> buildTrun(uint32_t sampleDuration, uint32_t sampleSi
     return box("trun", std::move(body));
 }
 
-bool FMP4Writer::writeSample(const uint8_t* data, size_t size, int64_t ptsUs, bool isSync) {
-    if (!m->started) { FMP4_LOGE("writeSample: not started"); return false; }
-    if (m->fd < 0) { FMP4_LOGE("writeSample: no file"); return false; }
-    if (size == 0) { FMP4_LOGE("writeSample: empty sample"); return false; }
-
-    // On-device HEVC MediaCodec emits Annex-B (start-code-delimited) NALUs, but
-    // an MP4 with an hvcC requires 4-byte-length-prefixed NALUs. Convert VIDEO
-    // samples here (audio has no start codes and passes through unchanged). The
-    // converted bytes/size are used for BOTH the trun sample size and the mdat
-    // payload, so trun and mdat stay consistent.
-    std::vector<uint8_t> converted;
-    const uint8_t* sampleData = data;
-    size_t sampleSize = size;
-    if (!m->isAudio) {
-        if (annexBToLengthPrefixed(data, size, converted)) {
-            sampleData = converted.data();
-            sampleSize = converted.size();
-        }
-    }
-
-    // PTS is already expressed in the track timescale (video: µs == timescale 1e6).
-    int64_t pts = ptsUs;
-
-    // Non-monotonic-PTS guard. With B-frames disabled, decode order == DTS == PTS,
-    // so PTS must be strictly increasing. A regression here (pts < prevPtsUs)
-    // signals B-frame leakage at the encoder: a non-sync sample would then carry
-    // a tfdt base that is less than the previous sample's, corrupting decode order.
-    // We warn and keep recording (the caller is expected to disable B-frames).
-    if (m->prevPtsUs >= 0 && pts < m->prevPtsUs) {
-        FMP4_LOGW("non-monotonic PTS: prev=%lld us < cur=%lld us (delta=%lld); "
-                  "check encoder B-frame setting",
-                  static_cast<long long>(m->prevPtsUs),
-                  static_cast<long long>(pts),
-                  static_cast<long long>(pts - m->prevPtsUs));
-    }
-
-    // Duration: for audio, every AAC packet carries 1024 samples (constant);
-    // for video, derive from the PTS delta (first sample gets a 33333 default).
-    uint32_t duration;
-    if (m->isAudio) {
-        duration = 1024u;
-    } else {
-        duration = (m->prevPtsUs < 0 || pts <= m->prevPtsUs)
-                       ? 33333u
-                       : static_cast<uint32_t>(pts - m->prevPtsUs);
-    }
-
+bool FMP4Writer::Impl::writeFragment(const uint8_t* data, size_t size, int64_t pts,
+                                     uint32_t duration, bool isSync) {
     // trun per-sample flags (ISO 14496-12 §8.8.3.1), 32-bit word layout:
     //   [31-28] reserved | [27-26] is_leading | [25-24] sample_depends_on
     //   [23-22] sample_is_depended_on | [21-20] sample_has_redundancy
@@ -853,7 +803,7 @@ bool FMP4Writer::writeSample(const uint8_t* data, size_t size, int64_t ptsUs, bo
 
     // Build moof children, then the moof box, patching data_offset afterwards.
     size_t trunDataOffsetPos = 0;
-    std::vector<uint8_t> trun = buildTrun(duration, static_cast<uint32_t>(sampleSize),
+    std::vector<uint8_t> trun = buildTrun(duration, static_cast<uint32_t>(size),
                                           sampleFlags, trunDataOffsetPos);
 
     std::vector<uint8_t> traf;
@@ -869,7 +819,7 @@ bool FMP4Writer::writeSample(const uint8_t* data, size_t size, int64_t ptsUs, bo
     auto appendM = [&](const std::vector<uint8_t>& v) {
         moofPayload.insert(moofPayload.end(), v.begin(), v.end());
     };
-    appendM(buildMfhd(++m->seqNumber));
+    appendM(buildMfhd(++seqNumber));
     appendM(traf);
 
     // moof total size (including the 8-byte box header). data_offset is measured
@@ -895,62 +845,92 @@ bool FMP4Writer::writeSample(const uint8_t* data, size_t size, int64_t ptsUs, bo
     }
 
     // Emit: styp, moof, mdat(sample bytes).
-    if (!m->writeBuf(buildStyp())) return false;
+    if (!writeBuf(buildStyp())) return false;
     // Write moof header + patched payload directly.
     std::vector<uint8_t> moofHdr;
     be32(moofHdr, moofTotalSize);
     fourcc(moofHdr, "moof");
-    if (!m->writeBuf(moofHdr)) return false;
-    if (!m->writeBuf(moofPayload)) return false;
+    if (!writeBuf(moofHdr)) return false;
+    if (!writeBuf(moofPayload)) return false;
     // mdat
     std::vector<uint8_t> mdatHdr;
-    be32(mdatHdr, static_cast<uint32_t>(8 + sampleSize));
+    be32(mdatHdr, static_cast<uint32_t>(8 + size));
     fourcc(mdatHdr, "mdat");
-    if (!m->writeBuf(mdatHdr)) return false;
-    if (!m->writeAll(sampleData, sampleSize)) return false;
+    if (!writeBuf(mdatHdr)) return false;
+    return writeAll(data, size);
+}
 
-    if (!m->isAudio) {
-        if (m->totalSamples == 0) m->firstPtsUs = pts;
-        m->lastPtsUs = pts;
-        m->totalSamples++;
+bool FMP4Writer::writeSample(const uint8_t* data, size_t size, int64_t ptsUs, bool isSync) {
+    if (!m->started) { FMP4_LOGE("writeSample: not started"); return false; }
+    if (m->fd < 0) { FMP4_LOGE("writeSample: no file"); return false; }
+    if (size == 0) { FMP4_LOGE("writeSample: empty sample"); return false; }
+
+    const int64_t pts = ptsUs;  // already expressed in the track timescale
+    if (m->prevPtsUs >= 0 && pts <= m->prevPtsUs) {
+        FMP4_LOGW("non-increasing PTS: prev=%lld cur=%lld (delta=%lld); "
+                  "check encoder B-frame setting",
+                  static_cast<long long>(m->prevPtsUs),
+                  static_cast<long long>(pts),
+                  static_cast<long long>(pts - m->prevPtsUs));
     }
+
+    // AAC duration is known without looking ahead.
+    if (m->isAudio) {
+        if (!m->writeFragment(data, size, pts, 1024u, isSync)) return false;
+        m->prevPtsUs = pts;
+        return true;
+    }
+
+    // A video sample's duration is the interval from its PTS to the following
+    // PTS, so retain one sample rather than assigning that delta to the new one.
+    std::vector<uint8_t> converted;
+    if (!annexBToLengthPrefixed(data, size, converted))
+        converted.assign(data, data + size);
+
+    if (!m->pendingVideoSample.empty()) {
+        uint32_t duration = m->sampleIntervalUs > 0
+                                ? static_cast<uint32_t>(m->sampleIntervalUs)
+                                : 33333u;
+        if (pts > m->pendingVideoPts) {
+            const uint64_t delta = static_cast<uint64_t>(pts - m->pendingVideoPts);
+            duration = delta > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(delta);
+        }
+        if (!m->writeFragment(m->pendingVideoSample.data(),
+                              m->pendingVideoSample.size(),
+                              m->pendingVideoPts, duration,
+                              m->pendingVideoSync)) {
+            return false;
+        }
+        m->lastVideoDuration = duration;
+    }
+
+    m->pendingVideoSample = std::move(converted);
+    m->pendingVideoPts = pts;
+    m->pendingVideoSync = isSync;
+    ++m->totalSamples;
     m->prevPtsUs = pts;
     return true;
 }
 
 bool FMP4Writer::close() {
     if (m->closed) return true;
-    // Back-patch moov with real average frame interval and duration so tools
-    // that only read moov (e.g. Windows Explorer/Media Foundation) show
-    // accurate values. Only video tracks are patched; audio has no stts.
-    if (!m->isAudio && m->totalSamples >= 1 && m->moovFilePos > 0 && m->moovSize > 0) {
-        int32_t realIntervalUs = m->sampleIntervalUs;  // fallback to constructor hint
-        if (m->totalSamples >= 2) {
-            int64_t spanUs = m->lastPtsUs - m->firstPtsUs;
-            if (spanUs > 0)
-                realIntervalUs = static_cast<int32_t>(spanUs / (m->totalSamples - 1));
+    bool ok = true;
+    if (!m->isAudio && !m->pendingVideoSample.empty() && m->fd >= 0) {
+        uint32_t duration = m->lastVideoDuration;
+        if (duration == 0) {
+            duration = m->sampleIntervalUs > 0
+                           ? static_cast<uint32_t>(m->sampleIntervalUs)
+                           : 33333u;
         }
-        int64_t durationUs = m->lastPtsUs;
-        auto rebuilt = buildMoov(m->csd0.data(), m->csd0.size(),
-                                  m->width, m->height, m->timescale,
-                                  m->isAudio, m->sampleRate, m->channels,
-                                  realIntervalUs, durationUs);
-        if (rebuilt.size() == m->moovSize) {
-            ::lseek(m->fd, m->moovFilePos, SEEK_SET);
-            m->writeBuf(rebuilt);
-            FMP4_LOGI("moov back-patched: avgInterval=%d us, duration=%lld us, "
-                      "samples=%d",
-                      realIntervalUs, static_cast<long long>(durationUs),
-                      m->totalSamples);
-        } else {
-            FMP4_LOGW("moov size mismatch on close (old=%zu new=%zu); "
-                      "skipping patch",
-                      m->moovSize, rebuilt.size());
-        }
+        ok = m->writeFragment(m->pendingVideoSample.data(),
+                              m->pendingVideoSample.size(),
+                              m->pendingVideoPts, duration,
+                              m->pendingVideoSync);
+        m->pendingVideoSample.clear();
     }
     if (m->fd >= 0) { ::close(m->fd); m->fd = -1; }
     m->closed = true;
-    return true;
+    return ok;
 }
 
 } // namespace SXR

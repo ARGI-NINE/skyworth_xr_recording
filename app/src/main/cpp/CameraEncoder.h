@@ -40,9 +40,10 @@ namespace SXR {
     };
 
     // Per-frame metadata carried alongside each encoded sample.
-    // callbackBootNs is captured at app-side callback entry (CLOCK_BOOTTIME, ns).
-    // BOOTTIME fields are converted to UTC at CSV-write time by adding
-    // mTimeOffsetNs (BOOTTIME→REALTIME offset).
+    // Driver BOOTTIME exposure fields are converted to UTC for the compatibility
+    // CSV by adding mTimeOffsetNs (BOOTTIME→REALTIME offset). For RGB, both
+    // application-side callback clocks are also retained in the CSV so their
+    // relationship to the driver exposure timestamp can be diagnosed.
     struct FrameMeta {
         int64_t callbackBootNs;
         int64_t midExposureBootNs;

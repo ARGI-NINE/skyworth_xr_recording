@@ -6,6 +6,7 @@ add_executable(fmp4_writer_test
     fmp4_writer_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/cpp/FMP4Writer.cpp)
 target_include_directories(fmp4_writer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/cpp)
+add_test(NAME fmp4_writer_regression COMMAND fmp4_writer_test)
 
 add_executable(packet_codec_state_test
     packet_codec_state_test.cpp

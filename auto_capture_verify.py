@@ -8,7 +8,7 @@ import json
 
 
 ADB = "adb"
-ADB_DEVICE = "192.168.2.147:5555"
+ADB_DEVICE = "192.168.2.140:5555"
 
 PACKAGE = "com.ssnwt.helloxr"
 ACTIVITY = "com.ssnwt.helloxr.VrNativeActivity"
