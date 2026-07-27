@@ -24,16 +24,19 @@ public class BleAidlImpl extends IBleService.Stub {
     private final BleServerManager bleServerManager;
     private final WifiConnector wifiConnector;
     private final BleControlListener bleControlListener;
+    private final Runnable onWifiProvisioned;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final CopyOnWriteArrayList<IBleCallback> callbacks = new CopyOnWriteArrayList<>();
 
     public BleAidlImpl(
             BleServerManager bleServerManager,
             WifiConnector wifiConnector,
-            BleControlListener bleControlListener) {
+            BleControlListener bleControlListener,
+            Runnable onWifiProvisioned) {
         this.bleServerManager = bleServerManager;
         this.wifiConnector = wifiConnector;
         this.bleControlListener = bleControlListener;
+        this.onWifiProvisioned = onWifiProvisioned;
         setupListeners();
     }
 
@@ -115,6 +118,9 @@ public class BleAidlImpl extends IBleService.Stub {
                                                                             "WiFi connected without IP notification payload");
                                                                 }
                                                                 notifyWifiConnected(ipAddress);
+                                                                if (onWifiProvisioned != null) {
+                                                                    onWifiProvisioned.run();
+                                                                }
                                                                 mainHandler.postDelayed(
                                                                         bleServerManager
                                                                                 ::finishProvisioningSession,

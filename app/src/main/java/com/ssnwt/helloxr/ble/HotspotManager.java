@@ -17,6 +17,7 @@ final class HotspotManager {
     private static final String HOTSPOT_PASSWORD = "12345678";
     private static final long RETRY_DELAY_MS = 5000L;
     private static final long CHECK_INTERVAL_MS = 15000L;
+    private static final long RESTART_DELAY_MS = 1000L;
 
     private final Application application;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -88,6 +89,42 @@ final class HotspotManager {
         // Do not stop the hotspot here. It is a device-level service and should
         // remain available if this foreground service is recreated by Android.
         wifiUtils = null;
+    }
+
+    /**
+     * Recreate the device hotspot after STA provisioning has completed. The manager remains
+     * running, so the normal periodic ensure logic continues to keep BOARD available.
+     */
+    void restartAfterWifiProvisioning() {
+        if (!running) {
+            return;
+        }
+        Log.i(TAG, "Restarting hotspot after WiFi provisioning");
+        mainHandler.removeCallbacks(ensureRunnable);
+        configurationApplied = false;
+        mainHandler.post(
+                () -> {
+                    if (!running) {
+                        return;
+                    }
+                    try {
+                        if (wifiUtils == null) {
+                            AndroidInterface androidInterface = AndroidInterface.getInstance();
+                            if (androidInterface.isInitialized()) {
+                                wifiUtils = androidInterface.getWifiUtils();
+                            }
+                        }
+                        if (wifiUtils != null) {
+                            boolean stopped = wifiUtils.stopHotspot();
+                            Log.i(TAG, "Hotspot stop requested before restart: " + stopped);
+                        } else {
+                            Log.w(TAG, "WifiUtils is not available for hotspot restart");
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "Failed to stop hotspot before restart", e);
+                    }
+                    scheduleEnsure(RESTART_DELAY_MS);
+                });
     }
 
     private void requestApiInitialization() {

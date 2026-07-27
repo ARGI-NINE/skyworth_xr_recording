@@ -245,7 +245,16 @@ public class BleService extends Service implements BleAidlImpl.BleControlListene
         bleServerManager.setOnControlChannelReadyListener(this::onControlChannelReady);
         bleServerManager.setOnDeviceDisconnectedListener(this::releaseTimeSyncHandle);
         nativeInitBleService(getFilesDir().getAbsolutePath());
-        bleAidlImpl = new BleAidlImpl(bleServerManager, wifiConnector, this);
+        bleAidlImpl =
+                new BleAidlImpl(
+                        bleServerManager,
+                        wifiConnector,
+                        this,
+                        () -> {
+                            if (hotspotManager != null) {
+                                hotspotManager.restartAfterWifiProvisioning();
+                            }
+                        });
         startBleAdvertising();
     }
 
