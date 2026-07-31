@@ -1,2616 +1,1742 @@
-# SXR EGO Linux 原生等功能重建框架设计
+# SXR EGO Linux 原生采集系统方案
 
-> 本文基于当前 SDK 1.5.0 的源码、`Readme.md`、`PROTOCOL.md` 和数据产物重新制定。  
-> 本方案不是 Android 到 Linux 的移植方案，不追求复用 Android 工程结构，也不讨论 Java/JNI/AIDL 如何逐项替换。目标是在 Linux 上从零建立一个功能兼容的原生采集服务。
+## 1. 方案目标和边界
 
-## 1. 文档目标
+当前 SDK 运行在 Android。Linux 版本的目标是保留相同的采集、记录、控制和导出能力，但重新建立一套 Linux 原生数据链路。
 
-本文直接回答以下问题：
+Linux 版本必须支持：
 
-1. Linux 版本需要实现哪些功能，哪些行为必须与当前 SDK 一致；
-2. 建议建立什么进程、模块、目录和代码文件；
-3. 每个 `.h/.cpp` 负责什么，暴露什么接口，由谁调用；
-4. 哪些模块开线程，线程由谁创建和停止；
-5. 哪些通路使用队列、环形缓冲区或内存池；
-6. 相机、IMU、音频、Head Pose、Hand、Controller 如何进入统一时间轴；
-7. 视频编码、落盘、实时预览和动态挂载 writer 如何协同；
-8. 程序启动、状态转移、故障、停止和恢复如何实现；
-9. 如何验证 Linux 新系统与当前 SDK 功能一致。
+- RGB 双目相机；
+- Tracking 双目灰度相机；
+- Ctrl 双目灰度相机；
+- 加速度计和陀螺仪；
+- Head Pose；
+- 左右手关节；
+- 麦克风和 AAC；
+- RGB、Tracking、Ctrl 三路 HEVC；
+- 相机曝光时刻与 Head Pose、双手、IMU 对齐；
+- fMP4、CSV、JSON 数据集；
+- TCP 8801 控制；
+- TCP 8802 RGB 实时视频；
+- BLE 配网和时间同步；
+- Wi-Fi 管理；
+- U 盘导出；
+- 日志、故障恢复和 systemd 托管。
 
-本文给的是可以直接拆分研发任务的框架设计，不包含真实函数实现。
+本方案有三个明确边界：
 
----
+1. **Linux 完全不使用 OpenXR。**
+2. 不移植 Android Activity、JNI、`AHardwareBuffer`、AAudio、MediaCodec、ASensorManager、Android BLE/Wi-Fi Service。
+3. 本文只设计外设链路、线程、关键 API、线程间数据和内存生命周期，不规定 `.h/.cpp` 文件如何组织。
 
-## 2. 重建结论
+Head Pose 和双手必须来自以下二者之一：
 
-### 2.1 新系统不沿用 Android 应用框架
+- 厂商提供的 Linux 原生定位与手势 SDK；
+- 自研 Linux 原生 VIO/SLAM 和 Hand Tracking 算法。
 
-新系统不保留：
-
-- APK、Gradle、Activity、Service、BroadcastReceiver；
-- Java、JNI、AIDL、Binder；
-- `android_main`、`native_app_glue`；
-- Android system property、Android storage path；
-- `AHardwareBuffer`、`ANativeWindow`、MediaCodec、AAudio、ASensor；
-- 当前 `main.cpp` 中把相机、OpenXR、渲染、编码、协议和录制混合在一起的结构。
-
-新系统采用：
-
-- 一个由 systemd 托管的 Linux daemon；
-- 普通 C++20 executable；
-- 明确的 Camera、Tracking、Audio、IMU、Clock、Encoder、Dataset 接口；
-- POSIX fd、epoll/eventfd/timerfd/signalfd；
-- dma-buf 和 sync fence；
-- V4L2/libcamera/自有相机 SDK；
-- Vulkan、硬件 ISP 或 CPU 图像处理；
-- V4L2 M2M/厂商硬编码；
-- ALSA、IIO/自有 IMU SDK；
-- BlueZ、NetworkManager 或 wpa_supplicant；
-- journald、udev、sysfs。
-
-### 2.2 功能一致，不要求内部实现一致
-
-Linux 版必须保持的外部能力：
-
-- BLE 配网和 BLE 四时间戳同步；
-- Wi-Fi STA 连接、IP、SSID、RSSI、channel 和断网事件；
-- TCP `8801` 控制、状态、故障和 custom NTP；
-- TCP `8802` RGB HEVC Annex-B 预览；
-- 五种权威业务模式和 `state_revision`；
-- 本地录制、手机录制、预览、录制中动态开关预览；
-- 快照；
-- RGB、tracking、ctrl 视频；
-- AAC 音频；
-- accel、gyro；
-- head pose；
-- hand tracking 或 controller poses；
-- 相机参数、IMU 标定；
-- 当前数据集文件名、CSV/JSON schema 和时间语义；
-- fragmented MP4；
-- 磁盘不足、相机失败、麦克风失败、Wi-Fi 丢失、过热和系统故障。
-
-Linux 版不要求：
-
-- 使用 Qualcomm Android 相机库；
-- 使用当前相机数量和物理拓扑；
-- 使用 Android OpenXR runtime；
-- 显示 XR 场景或头显相机预览；
-- 保持当前类名和线程结构；
-- 新相机的分辨率、FOV、内参和画质数值等于旧相机。
-
-### 2.3 OpenXR 和渲染的定位
-
-Head Pose、Hand、Controller 功能必须保留，但不应继续控制整个程序。
-
-建议将其收敛为独立 `TrackingService`：
-
-- 首选 backend 可以是 Linux OpenXR；
-- 也允许自研 VIO/SLAM、手势算法或其他 tracking SDK；
-- 上层只依赖 `ITrackingBackend`；
-- XR 场景、cube、quad layer、头显相机预览、XR swapchain 渲染全部取消；
-- 如果 OpenXR runtime 要求 graphics binding，则保留一个最小无画面 graphics context；
-- 如果 runtime 支持 headless session，则不创建 graphics context；
-- 图像 SBS、灰度转换和手势叠加属于媒体处理，不属于 XR 场景渲染。
+如果当前厂商只有 OpenXR 能输出 Head Pose 或 Hand Joints，则“提供 Linux 原生 Tracking SDK”是移植前置条件。不能在 Linux 服务中重新引入 OpenXR 作为替代。
 
 ---
 
-## 3. 当前 SDK 的兼容基线
-
-### 3.1 权威业务状态
-
-以当前 `PROTOCOL.md` 顶部“录制与预览统一状态机”为准：
-
-| OperationMode | 编码器 | 落盘 | TCP 8802 |
-|---|---:|---:|---:|
-| `MODE_IDLE` | 关 | 关 | 关 |
-| `MODE_PHONE_PREVIEW` | 开 | 关 | 开 |
-| `MODE_LOCAL_RECORD` | 开 | 开 | 关 |
-| `MODE_LOCAL_RECORD_WITH_PREVIEW` | 开 | 开 | 开 |
-| `MODE_PHONE_RECORD` | 开 | 开 | 开 |
-
-阶段：
-
-- `PHASE_STABLE`
-- `PHASE_STARTING`
-- `PHASE_STOPPING`
-- `PHASE_ERROR`
-
-每次关键状态变化递增 `state_revision`。所有 TCP 命令、本地按键、自动停止、低存储、网络故障和媒体异步完成事件都必须进入同一个串行协调队列。
-
-### 3.2 兼容数据集
+## 2. 总体数据链路
 
 ```text
-dataset/<YYYYMMDD_HHMMSS>/
-├── rgb.mp4
-├── rgb_metainfo.csv
-├── tracking.mp4
-├── tracking_metainfo.csv
-├── ctrl.mp4
-├── ctrl_metainfo.csv
-├── audio.m4a
-├── audio_metainfo.csv
-├── accel.csv
-├── gyro.csv
-├── head_pose.csv
-├── hand_tracking.csv              # hand 模式
-├── controller_poses.csv           # controller 模式
-├── camera_params_rgb.json
-├── camera_params_tracking.json
-├── camera_params_ctrl.json
-├── imu_calibration.json
-└── capture_status.json
+RGB / Tracking / Ctrl Camera
+  → Camera IO
+  → 三条 CameraIngressQueue
+  → Camera Sync & Router
+  ├→ ImageProcessQueue
+  │   → GPU/CPU Image Process
+  │   → 三条 EncoderInputQueue
+  │   → RGB / Tracking / Ctrl HEVC Encoder
+  │   ├→ fMP4 + camera metadata
+  │   └→ RGB PreviewQueue → TCP 8802
+  │
+  ├→ TrackingImageQueue
+  │   → Linux Native Tracking
+  │   → TrackingRing
+  │
+  └→ FrameAnchorQueue
+      → Sensor Aligner
+      → AlignedSensorQueue
+      → Sensor Writer
+
+IMU
+  → IMU Capture
+  ├→ ImuRing
+  ├→ TrackingImuQueue → Linux Native Tracking
+  └→ ImuRecordQueue → Sensor Writer
+
+Microphone
+  → ALSA Capture
+  → PcmQueue
+  → AAC Encoder
+  → audio.m4a + audio metadata
 ```
 
-视频 metadata：
+这几条链路互相通过时间戳和 `FrameId` 对齐，不把所有传感器数据塞入一个万能队列。
 
-```text
-frame_index,frame_id,pts_us,exposure_start_utc_ns,
-exposure_duration_ns,gain,mid_exposure_utc_ns
-```
+视频编码不等待 Head Pose 或双手结果。相机图像立即进入图像处理和编码；Sensor Aligner 稍后使用同一个 `FrameId` 生成对齐记录。这样 Tracking 算法的延迟不会长时间占用相机驱动 buffer，也不会阻塞视频。
 
-音频 metadata：
-
-```text
-packet_index,pts_us,capture_utc_ns
-```
-
-### 3.3 编码基线
-
-| 流 | 编码 | 布局 | 默认帧率 | 默认码率 |
-|---|---|---|---:|---:|
-| RGB | HEVC | 左右眼 SBS，2W×H | 30 | 8 Mbps |
-| Tracking | HEVC | 左右灰度兼容布局 | 60 | 4 Mbps |
-| Ctrl | HEVC | 左右灰度兼容布局 | 60 | 4 Mbps |
-| Audio | AAC-LC | 44.1 kHz mono | — | 96 kbps |
-
-约束：
-
-- 视频关闭 B-frame；
-- decode order 等于 presentation order；
-- fMP4 每个 sample 一个 fragment；
-- 文件 PTS 从确认后的第一帧 IDR 开始归零；
-- TCP 8802 使用 RGB HEVC Annex-B；
-- 文件 writer 和 TCP preview 可以同时消费同一个编码 access unit；
-- 网络阻塞不得影响文件写入。
+文中的 `CameraGroupBlock`、`ImuBatch`、`ProcessedFrame` 等名称只表示“队列中传递的数据字段和内存所有权”，不是要求建立同名头文件或 C++ 类。
 
 ---
 
-## 4. 总体架构
+## 3. 进程和线程
 
-### 4.1 进程模型
+第一版使用一个 `egocollectd` 进程。大图像使用 dma-buf 或进程内内存池，避免跨进程传 fd 和 fence。
 
-第一版只使用一个主进程：
+### 3.1 应用线程总表
 
-```text
-egocollectd
-├── Main/EventLoop
-├── OperationCoordinator
-├── CameraService
-├── TrackingService
-├── ImuService
-├── AudioService
-├── TimeService
-├── MediaPipeline
-├── DatasetService
-├── ControlServer :8801
-├── VideoServer :8802
-├── BleService
-├── WifiService
-└── HealthService
-```
+全功能版本固定创建 18 个应用线程：
 
-辅助程序：
+| ID | 线程 | 数量 | 主要职责 |
+|---:|---|---:|---|
+| T00 | Main EventLoop | 1 | TCP 8801、BLE D-Bus、Wi-Fi D-Bus、udev、signal、timer |
+| T01 | Operation Coordinator | 1 | 唯一业务状态机，决定开始、停止、预览、录制、导出 |
+| T02 | Camera IO Owner | 1 | 相机 start/stop、V4L2 DQBUF/QBUF，或厂商 SDK buffer return |
+| T03 | Camera Sync & Router | 1 | 双目 group 校验、三组 cadence 同步、图像和锚点分发 |
+| T04 | IMU Capture | 1 | IIO/厂商 IMU 读取、时间转换、校准、分发 |
+| T05 | Native Tracking | 1 | 唯一调用 Linux 定位/手势算法，产生 Head Pose 和 Hand Joints |
+| T06 | Sensor Aligner | 1 | 按 RGB 曝光时刻查询 TrackingRing 和 ImuRing |
+| T07 | Image Processor | 1 | dma-buf import、SBS/灰度/旋转等 GPU 或 CPU 处理 |
+| T08 | RGB Encoder Owner | 1 | RGB V4L2 M2M、RGB fMP4、RGB metadata、预览分发 |
+| T09 | Tracking Encoder Owner | 1 | Tracking V4L2 M2M、fMP4、metadata |
+| T10 | Ctrl Encoder Owner | 1 | Ctrl V4L2 M2M、fMP4、metadata |
+| T11 | Audio Capture | 1 | ALSA PCM 读取和硬件时间戳 |
+| T12 | Audio Encoder | 1 | AAC 编码、audio.m4a 和 audio metadata |
+| T13 | Sensor Writer | 1 | accel、gyro、head pose、hand joints CSV |
+| T14 | Video Sender | 1 | TCP 8802 RGB 发送和慢客户端处理 |
+| T15 | Snapshot Worker | 1 | PNG/JPEG 快照 |
+| T16 | Export Worker | 1 | U 盘数据集复制、校验和提交 |
+| T17 | Logger Worker | 1 | 文件日志和 journald |
 
-```text
-egocollectctl       本机控制和状态查询
-egocollect-replay   离线回放完整 pipeline
-egocollect-calib    相机/IMU 标定工具
-egocollect-diag     硬件和数据诊断
-```
+如果厂商相机 SDK 自己创建 callback 线程，这些是 SDK 外部线程，不计入上述 18 个。callback 只能取得合法 buffer 所有权并投递队列，不能执行同步、Tracking、GPU、编码、文件和网络工作。
 
-不建议第一版把相机、编码器、数据写入拆成多个进程。这样可以避免：
+厂商 Tracking、AAC 或相机 SDK 如果内部还有线程，必须在启动日志中记录实际线程数。应用层仍然只能由表中的 owner thread 调用对应 SDK handle。
 
-- dma-buf fd 跨进程传递；
-- fence 所有权复杂化；
-- 多进程崩溃恢复；
-- 高带宽 IPC；
-- 额外的帧复制。
+### 3.2 线程统一规则
 
-BLE/Wi-Fi 将来可以拆成独立进程，但不是第一版要求。
-
-### 4.2 分层
-
-```text
-┌────────────────────────────────────────────────────────────┐
-│ Compatibility Layer                                       │
-│ BLE / TCP 8801 / TCP 8802 / Dataset schemas               │
-├────────────────────────────────────────────────────────────┤
-│ Application Domain                                        │
-│ OperationCoordinator / SessionCoordinator / FaultManager   │
-├────────────────────────────────────────────────────────────┤
-│ Capture and Media                                          │
-│ Camera / Tracking / IMU / Audio / Sync / GPU / Encoder     │
-├────────────────────────────────────────────────────────────┤
-│ Stable Interfaces                                          │
-│ ICameraBackend / ITrackingBackend / IVideoEncoder / IClock │
-├────────────────────────────────────────────────────────────┤
-│ Linux Backends                                             │
-│ own-camera / OpenXR / VIO / V4L2 / ALSA / IIO / BlueZ      │
-└────────────────────────────────────────────────────────────┘
-```
-
-### 4.3 总数据流
-
-```text
-Camera Drivers
-    │ Frame + exposure timestamp + dma-buf
-    ▼
-CameraService
-    ▼
-FrameSynchronizer
-    ▼ FrameSet
-FrameRouter
-    ├──────────────► SnapshotService
-    ├──────────────► Calibration/diagnostics
-    └──────────────► TimeAligner
-                         │
-                         ├── TrackingService
-                         ├── ImuService
-                         └── Audio clock mapping
-                         ▼
-                    AlignedFrameSet
-                         ▼
-                    ImageProcessor
-                         ▼
-                     VideoEncoder
-                         ▼ EncodedAccessUnit
-               EncodedPacketRouter
-                  ├────────► FileSink/fMP4
-                  └────────► TCP 8802
-```
+- 一个硬件 fd 或 SDK handle 只有一个 owner thread。
+- 其他线程不能直接调用该 fd/handle，只能向 owner 的 command queue 发命令。
+- 高频队列全部有界，并且在启动时分配完成。
+- 大图像和音频通过 lease 传递；小型 IMU、Pose、Hand、command 使用定长值对象。
+- callback 和硬件采集线程不等待下游队列。
+- 队列满时必须有明确的丢弃或故障策略。
+- Stop 顺序固定为：停止新输入、drain 已接收数据、归还全部 lease、最后销毁硬件和内存池。
 
 ---
 
-## 5. 建议仓库目录
+## 4. 统一时间和标识
+
+### 4.1 内部时间
+
+所有传感器进入系统后统一转换为：
 
 ```text
-egocollect-linux/
-├── CMakeLists.txt
-├── cmake/
-│   ├── Toolchain-aarch64.cmake
-│   ├── FindOpenXR.cmake
-│   └── BuildOptions.cmake
-├── configs/
-│   ├── egocollect.toml
-│   ├── cameras.yaml
-│   └── logging.toml
-├── schemas/
-│   ├── egocollect.proto
-│   ├── dataset_schema.json
-│   └── config_schema.json
-├── include/ego/
-│   ├── result.h
-│   ├── ids.h
-│   ├── clock_types.h
-│   ├── frame_types.h
-│   ├── sensor_types.h
-│   ├── tracking_types.h
-│   ├── media_types.h
-│   ├── operation_types.h
-│   └── capabilities.h
-├── src/
-│   ├── app/
-│   ├── core/
-│   ├── time/
-│   ├── camera/
-│   ├── tracking/
-│   ├── imu/
-│   ├── audio/
-│   ├── media/
-│   ├── dataset/
-│   ├── protocol/
-│   ├── connectivity/
-│   └── platform/
-├── apps/
-│   ├── egocollectd/
-│   ├── egocollectctl/
-│   ├── replay/
-│   ├── calibrate/
-│   └── diagnose/
-├── packaging/
-│   ├── systemd/
-│   ├── udev/
-│   └── tmpfiles.d/
-└── tests/
-    ├── unit/
-    ├── contract/
-    ├── replay/
-    ├── compatibility/
-    ├── hardware/
-    └── soak/
+CLOCK_BOOTTIME，单位 ns
 ```
 
----
-
-## 6. 公共类型文件
-
-这些头文件不能 include OpenXR、V4L2、Vulkan、ALSA、BlueZ 或厂商头文件。
-
-### 6.1 `include/ego/result.h`
-
-职责：
-
-- 定义统一错误类型 `Error`；
-- 定义 `Result<T>` / `Status`；
-- 定义错误 domain：camera、tracking、encoder、storage、network、time；
-- 保存错误码、消息、底层 errno/driver code、是否可恢复。
-
-主要接口：
+使用的 Linux API：
 
 ```text
-Status::Ok()
-Status::Error(domain, code, message)
-Result<T>::value()
-Result<T>::error()
+clock_gettime(CLOCK_BOOTTIME)
+clock_gettime(CLOCK_REALTIME)
+clock_gettime(CLOCK_MONOTONIC_RAW)
 ```
 
-线程：无。  
-内存池：无。  
-注意：普通预期错误不能通过 exception 穿过模块边界。
-
-### 6.2 `include/ego/ids.h`
-
-职责：
-
-- 强类型 ID：`CameraId`、`StreamId`、`SessionId`、`FrameId`；
-- 避免把不同 uint64 ID 混用；
-- 提供字符串序列化。
-
-线程：无。  
-内存池：无。
-
-### 6.3 `include/ego/clock_types.h`
-
-职责：
-
-- 定义 `ClockDomain`；
-- 定义 `Timestamp`、`ClockMapping`、`ClockQuality`；
-- 所有 timestamp 必须同时携带数值和 domain。
-
-时钟域至少包括：
+每次录制开始时采样：
 
 ```text
-CameraHardware
-ImuHardware
-AudioHardware
-Boottime
-Monotonic
-MonotonicRaw
-RealtimeUtc
-Tai
-XrTime
+sessionRealtimeOffsetNs = realtimeNs - boottimeNs
 ```
 
-线程：无。  
-内存池：无。
-
-### 6.4 `include/ego/frame_types.h`
-
-职责：
-
-- 定义图像 buffer、plane、fence、Frame、FrameSet；
-- 规定 dma-buf fd 和 lease 所有权；
-- 定义曝光、gain、crop、format、sequence metadata。
-
-关键类型：
+写 UTC 时使用：
 
 ```text
-UniqueFd
-BufferPlane
-ImageBuffer
-CameraMetadata
-CameraFrame
-FrameSet
-FrameSetQuality
+utcNs = bootNs + sessionRealtimeOffsetNs
 ```
 
-要求：
+录制过程中不能因为系统时间校准而修改已经建立的 session offset。
 
-- `ImageBuffer` 可移动，不可隐式复制；
-- 跨线程必须持有 `BufferLease`；
-- fence fd 只允许一个明确的 owner；
-- 不能只传裸 `int fd`。
+### 4.2 硬件时间转换
 
-线程：无。  
-内存池：对象本身由 FrameObjectPool 提供，像素 buffer 由驱动或 GPU pool 管理。
-
-### 6.5 `include/ego/sensor_types.h`
-
-职责：
-
-- 定义 `AccelSample`、`GyroSample`、`AudioChunk`；
-- 定义温度、电池、存储、Wi-Fi snapshot；
-- 定义 sample validity 和 sequence。
-
-线程：无。  
-内存池：AudioChunk 的 PCM payload 使用 AudioBlockPool。
-
-### 6.6 `include/ego/tracking_types.h`
-
-职责：
-
-- 定义 `Pose`、`PoseSample`；
-- 定义左右手关节；
-- 定义 controller pose/button；
-- 定义 validity、confidence、tracking state；
-- 内部四元数统一 `(x,y,z,w)`。
-
-线程：无。  
-内存池：无，tracking sample 为小对象。
-
-### 6.7 `include/ego/media_types.h`
-
-职责：
-
-- 定义 `ProcessedFrame`；
-- 定义 `FrameTag`；
-- 定义 `EncodedAccessUnit`；
-- 定义 codec config、NAL 类型、IDR、EOS、PTS/DTS。
-
-要求：
-
-- 编码 payload 使用引用计数的 EncodedBuffer；
-- FileSink 和 NetworkSink 共享 payload，不重复复制。
-
-### 6.8 `include/ego/operation_types.h`
-
-职责：
-
-- 定义五个 `OperationMode`；
-- 定义四个 `OperationPhase`；
-- 定义 `StateRevision`；
-- 定义所有 coordinator event 和 stop reason；
-- 值必须与 protobuf wire 定义一致。
-
-### 6.9 `include/ego/capabilities.h`
-
-职责：
-
-- 汇总 camera、tracking、encoder、audio、IMU 能力；
-- 启动时完成 capability negotiation；
-- 记录实际启用的格式和降级项。
-
----
-
-## 7. 应用入口文件
-
-### 7.1 `apps/egocollectd/main.cpp`
-
-职责：
-
-- 只处理命令行参数；
-- 创建 `Application`；
-- 调用 `initialize()`、`run()`、`shutdown()`；
-- 把退出码返回给 systemd。
-
-禁止：
-
-- 创建相机线程；
-- 处理业务命令；
-- 直接操作 encoder；
-- 直接写数据文件。
-
-线程：main thread。  
-内存池：无。
-
-### 7.2 `src/app/application.h/.cpp`
-
-职责：
-
-- 依赖装配；
-- 按顺序初始化所有 service；
-- 启动 systemd notify/watchdog；
-- 控制全局 shutdown；
-- 维护 service 的唯一所有权。
-
-主要接口：
+Camera、IMU、ALSA、Tracking 算法分别维护自己的时间映射状态：
 
 ```text
-initialize(config)
-run()
-requestShutdown(reason)
-shutdown()
+硬件 tick / MONOTONIC_RAW / driver timestamp
+  → offset + drift 拟合
+  → BOOTTIME ns
 ```
 
-初始化顺序：
+每个映射必须输出：
 
-```text
-Logger
-→ Config
-→ EventLoop
-→ TimeService
-→ Storage/SystemState
-→ Camera/Tracking/IMU/Audio probe
-→ Media/Dataset
-→ OperationCoordinator
-→ TCP/BLE/Wi-Fi
-→ READY
-```
+- 当前 offset；
+- drift；
+- 最近一次同步时间；
+- residual；
+- 是否发生 timestamp reset；
+- 当前质量状态。
 
-停止顺序反向，但先由 OperationCoordinator 完成媒体统一停止。
+不能使用 callback 到达时间、`DQBUF` 返回时间、GPU 时间或文件写入时间代替真实采样时间。
 
-线程：不额外创建线程；调用各 service 的 `start()`。  
-内存池：创建并持有各专用 pool。
+### 4.3 相机视觉锚点
 
-### 7.3 `src/app/service_registry.h/.cpp`
-
-职责：
-
-- 保存 service 引用；
-- 提供显式 dependency access；
-- 便于测试注入 fake/replay backend。
-
-不做：
-
-- 全局 singleton；
-- 隐式 service locator；
-- 自动创建线程。
-
-### 7.4 `src/app/shutdown_controller.h/.cpp`
-
-职责：
-
-- 接收 SIGTERM、SIGINT、watchdog failure；
-- 使用 eventfd 唤醒主事件循环；
-- 保证 shutdown 只执行一次；
-- 设置最大优雅停止 deadline。
-
-线程：信号由 signalfd 在主事件循环处理，不建立异步 signal handler。
-
----
-
-## 8. Core 业务状态文件
-
-### 8.1 `src/core/operation_coordinator.h/.cpp`
-
-这是业务状态唯一权威。
-
-职责：
-
-- 实现五模式、四阶段状态机；
-- 所有事件串行处理；
-- 递增 `state_revision`；
-- 计算目标 `ResourcePlan`；
-- 调用 Media、Dataset、Preview service；
-- 处理异步完成事件的 revision 校验；
-- 触发主动 Status。
-
-主要接口：
-
-```text
-post(OperationEvent)
-snapshot()
-waitUntilStable(timeout)
-```
-
-内部事件：
-
-```text
-PhoneStartCollect
-LocalStartCollect
-StopCollect
-StartPreview
-StopPreview
-LowStorage
-CameraFailure
-EncoderFailure
-NetworkFailure
-WriterArmed
-WriterFinalized
-MediaStopped
-Shutdown
-```
-
-线程：
-
-- 独立一个 coordinator thread；
-- 只有该线程可以修改 OperationState；
-- TCP、BLE、按键、health 线程只能 `post()`。
-
-队列：
-
-- 有界 MPSC command queue；
-- 容量建议 256；
-- 控制事件不得静默丢弃；
-- 队列满属于系统故障。
-
-内存池：
-
-- 事件都是小对象，不需要全局池；
-- 队列节点可预分配 256 个，避免故障风暴时分配失败。
-
-锁规则：
-
-- coordinator 内部状态只由单线程访问，通常不需要状态 mutex；
-- 不在 coordinator callback 中执行 join、send、flush、drain；
-- 长操作返回 future/event，并携带发起 revision。
-
-### 8.2 `src/core/operation_state.h/.cpp`
-
-职责：
-
-- 保存 mode、phase、revision；
-- 纯函数验证状态转移；
-- 从状态推导 `isRecording`、`shouldEncode`、`shouldStream`；
-- 生成 wire snapshot。
-
-线程：无独立线程。  
-内存池：无。
-
-### 8.3 `src/core/resource_plan.h/.cpp`
-
-职责：
-
-- 将 OperationState 转换为资源目标：
-
-```text
-encoderRequired
-datasetRequired
-previewRequired
-trackingRequired
-audioRequired
-imuRequired
-```
-
-- 比较当前 plan 与目标 plan；
-- 生成有序资源动作。
-
-示例：
-
-```text
-PHONE_PREVIEW → PHONE_RECORD
-保持 encoder
-保持 8802
-创建 dataset
-arm writer
-请求 IDR
-```
-
-线程：由 coordinator thread 调用。
-
-### 8.4 `src/core/fault_manager.h/.cpp`
-
-职责：
-
-- 管理活动 fault 和 cleared fault；
-- 去重、升级、恢复；
-- 映射当前协议故障码；
-- 决定 WARN/ERROR/FATAL；
-- 将 fatal fault 投递 coordinator。
-
-线程：
-
-- 无独立线程；
-- 内部使用短临界区 mutex；
-- 不能在锁内发送网络消息。
-
-### 8.5 `src/core/health_service.h/.cpp`
-
-职责：
-
-- 周期检查最后 camera/IMU/audio sample 时间；
-- 检查队列深度、drop、encoder latency；
-- 检查存储、温度、内存、fd 数量；
-- 生成 health snapshot；
-- 超阈值时通知 FaultManager。
-
-线程：
-
-- 不开专用 thread；
-- 由主 EventLoop 的 timerfd 每秒触发；
-- 耗时 sysfs 查询放入低优先级 platform worker。
-
-### 8.6 `src/core/event_bus.h/.cpp`
-
-职责：
-
-- 只传递低频 control/status event；
-- 不传图像、PCM 或 IMU 高频数据；
-- 支持订阅 OperationState、fault、connectivity。
-
-线程：
-
-- callback 在发布者线程执行会导致耦合，因此统一投递到 EventLoop；
-- 订阅列表只在初始化阶段修改。
-
----
-
-## 9. 时间系统文件
-
-时间系统是新框架的核心。
-
-### 9.1 `src/time/system_clock.h/.cpp`
-
-职责：
-
-- 封装 `CLOCK_BOOTTIME`、`CLOCK_REALTIME`、`CLOCK_MONOTONIC_RAW`、`CLOCK_TAI`；
-- 提供成对采样；
-- 读取 clock resolution；
-- 不允许业务模块直接调用 `clock_gettime()`。
-
-主要接口：
-
-```text
-now(domain)
-samplePair(domainA, domainB)
-```
-
-线程：无。
-
-### 9.2 `src/time/clock_mapper.h/.cpp`
-
-职责：
-
-- 将 camera/IMU/audio hardware tick 映射到 boottime；
-- 支持 offset 和 drift；
-- 使用滑动窗口拟合：
-
-```text
-boottime_ns = scale × device_tick + offset
-```
-
-- 输出 uncertainty；
-- 检测 reset、wrap、跳变和漂移异常。
-
-线程：
-
-- 不开线程；
-- 每个 source 一个 mapper；
-- producer thread 添加同步点；
-- TimeService 查询时使用 immutable snapshot，避免高频锁竞争。
-
-内存：
-
-- 每个 mapper 固定长度样本环，建议 64～256 点；
-- 不使用动态增长 vector。
-
-### 9.3 `src/time/time_service.h/.cpp`
-
-职责：
-
-- 管理所有 ClockMapper；
-- 统一转换为 boottime 和 UTC；
-- 录制开始时冻结 session UTC mapping snapshot；
-- 监控 realtime↔boottime offset 变化；
-- 向 session manifest 输出 clock quality。
-
-主要接口：
-
-```text
-toBoottime(Timestamp)
-toUtc(Timestamp, SessionClockSnapshot)
-createSessionSnapshot()
-quality(source)
-```
-
-线程：
-
-- 无独立 thread；
-- mapper update 来自各 source；
--状态变化通过 EventLoop 上报。
-
-### 9.4 `src/time/frame_time_aligner.h/.cpp`
-
-职责：
-
-- 以每个视频帧的 mid-exposure boottime 为锚点；
-- 查询 head pose、hand、controller；
-- 计算 IMU sample window；
-- 标记数据有效性和时间误差；
-- 生成 `AlignedFrameSet`。
-
-对齐规则：
-
-| 数据 | 方法 |
-|---|---|
-| Head Pose | 在 mid-exposure 时查询或插值 |
-| Hand/Controller | 在 mid-exposure 时查询或插值 |
-| IMU | 保留上一视频锚点到当前锚点之间的全部样本 |
-| Audio | 用连续 sample clock 映射，不逐帧裁成文件 |
-| 慢速状态 | last-known-value |
-
-线程：
-
-- 独立一个 aligner thread；
-- 输入为 FrameSet bounded queue；
-- 不能在 camera callback 中同步等待 OpenXR；
-- Tracking 查询通过 TrackingService request queue 或本地 ring snapshot。
-
-队列：
-
-- 容量按最大相机帧率和允许延迟计算；
-- 建议起始值 8 个 FrameSet；
-- recording 路径满时上报并停止，不允许无限堆积。
-
-### 9.5 `src/time/external_time_sync.h/.cpp`
-
-职责：
-
-- 实现 TCP custom NTP 和 BLE 四时间戳共享的数学工具；
-- 计算 offset、RTT、过滤和统计；
-- 不负责 socket 或 BLE transport；
-- 两种协议会话状态必须独立。
-
-线程：无；由各协议 service 调用。
-
----
-
-## 10. Camera 文件
-
-### 10.1 `src/camera/i_camera_backend.h`
-
-职责：
-
-- 定义相机 backend contract；
-- 隔离自有相机 SDK、libcamera、V4L2。
-
-主要接口：
-
-```text
-probe()
-configure(CameraTopology)
-start(FrameCallback)
-stop()
-getCalibration(CameraId)
-getClockDescriptor(CameraId)
-```
-
-约束：
-
-- callback 只交付 Frame，不做编码；
-- callback 返回后 buffer 的生命周期由 lease 保证；
-- backend 必须报告 timestamp clock domain；
-- stop 返回后不再发生新 callback。
-
-### 10.2 `src/camera/own_camera_backend.h/.cpp`
-
-职责：
-
-- 对接你们自己的驱动或 Camera SDK；
-- 将厂商 buffer 转为公共 ImageBuffer；
-- 转换 metadata；
-- 管理 driver buffer dequeue/queue；
-- 添加 hardware tick↔boottime 同步点。
-
-线程：
-
-- 若驱动为阻塞 `DQBUF`：一个 camera poll thread，可同时 poll 多个 fd；
-- 若自有 SDK 已有 callback thread：不再额外创建 capture thread；
-- callback 只构造 FrameEnvelope 并投递。
-
-内存池：
-
-- 图像 buffer 使用驱动预分配池；
-- 建议每个 stream 6～10 个 buffer，按实际 pipeline latency测量；
-- FrameEnvelope 使用固定对象池；
-- callback 内禁止 malloc 大块像素内存。
-
-### 10.3 `src/camera/camera_topology.h/.cpp`
-
-职责：
-
-- 从 `cameras.yaml` 加载物理相机和逻辑 stream；
-- 定义 rgb_left/right、tracking_left/right、ctrl_left/right；
-- 定义 sync group、输出布局、帧率、format；
-- 不硬编码 `/dev/videoN`。
-
-线程：无。
-
-### 10.4 `src/camera/camera_service.h/.cpp`
-
-职责：
-
-- 选择 backend；
-- probe/configure/start/stop；
-- 维护 camera health 和最后帧时间；
-- 将 Frame 投递 FrameSynchronizer；
-- 响应热插拔/driver reset。
-
-线程：
-
-- 本身不开线程；
-- backend 拥有 capture thread；
-- control 方法由 coordinator 通过异步 command 调用。
-
-### 10.5 `src/camera/frame_synchronizer.h/.cpp`
-
-职责：
-
-- 将单 camera Frame 组成 FrameSet；
-- 支持 hardware sequence、trigger ID、timestamp matching；
-- 计算跨相机 skew；
-- 处理缺帧、迟到、乱序和 sequence reset。
-
-线程：
-
-- 独立 synchronizer thread；
-- 输入为 MPSC queue；
-- 输出为 SPSC queue 到 FrameTimeAligner。
-
-队列与内存：
-
-- 每个 camera 一个小型 reorder ring；
-- 容量建议 `ceil(fps × max_wait_seconds) + 2`；
-- 通常 4～8 帧；
-- 超时 Frame 必须释放回 driver pool；
-- 不允许用 map 无界增长。
-
-### 10.6 `src/camera/calibration_repository.h/.cpp`
-
-职责：
-
-- 加载、校验和版本化相机/IMU 标定；
-- 根据分辨率、crop、binning 选择内参；
-- 提供 Camera→Body 和 IMU→Body 外参；
-- 验证 device ID 和 checksum；
-- 生成兼容 JSON view。
-
-线程：
-
-- 启动时读取；
-- 运行期只读 immutable snapshot；
-- 更新标定只允许 idle 状态并原子替换。
-
-### 10.7 `src/camera/frame_object_pool.h/.cpp`
-
-职责：
-
-- 预分配 FrameEnvelope、FrameSet、AlignedFrameSet 小对象；
-- 不管理相机像素内存；
-- 提供 RAII handle；
-- 统计池耗尽。
-
-大小：
-
-```text
-FrameEnvelope ≥ 所有 driver buffers 总数 + 25%
-FrameSet ≥ aligner queue + GPU in-flight + 2
-```
-
-池耗尽：
-
-- preview 可丢旧帧；
-- recording 记录 fatal backpressure 并有序停止；
-- 禁止回退到无限 heap allocation。
-
-### 10.8 `src/camera/frame_router.h/.cpp`
-
-职责：
-
-- 将 FrameSet 分发到 recording、preview、snapshot、diagnostics；
-- 不复制像素；
-- 每个 consumer 持有 lease；
-- 实现不同 backpressure 策略。
-
-线程：在 aligner thread 完成轻量分发，不做耗时处理。
-
----
-
-## 11. Tracking 文件
-
-### 11.1 `src/tracking/i_tracking_backend.h`
-
-职责：
-
-- 定义 Head、Hand、Controller 数据接口；
-- 上层不依赖 OpenXR 类型。
-
-主要接口：
-
-```text
-probe()
-start()
-stop()
-queryHeadPose(boottimeNs)
-queryHands(boottimeNs)
-queryControllers(boottimeNs)
-pollInputEvents()
-```
-
-### 11.2 `src/tracking/openxr_tracking_backend.h/.cpp`
-
-职责：
-
-- 创建 Linux OpenXR instance/session；
-- 建立 root/local/view/action spaces；
-- 创建 hand trackers 和 controller actions；
-- 处理 session event；
-- 将 boottime 转成 XrTime；
-- 在指定历史时刻执行 locate；
-- 将 XrPose 转成内部 Pose。
-
-明确不做：
-
-- 场景渲染；
-- 相机纹理显示；
-- XR swapchain 图像合成；
-- cube、quad、KTX、UI。
-
-线程：
-
-- 一个专用 OpenXR owner thread；
-- 所有 runtime 调用默认在该线程串行；
-- tracking query 通过有界 request queue；
-- owner thread 同时 pump OpenXR event 和最小 frame loop。
-
-队列：
-
-- query request queue 建议 128；
-- response 写入 promise 或无锁 response slot；
-- aligner 设置短 deadline；
-- 超时标记 tracking invalid，不阻塞 camera capture。
-
-### 11.3 `src/tracking/xr_session_loop.h/.cpp`
-
-职责：
-
-- 管理 `READY/RUNNING/STOPPING/EXITING`；
-- 执行必要的 `xrWaitFrame/xrBeginFrame/xrEndFrame`；
-- 提交零 layer 或 runtime 要求的最小 layer；
-- 保证 tracking runtime 处于可提供数据状态。
-
-线程：OpenXR owner thread 内运行，不另开线程。
-
-### 11.4 `src/tracking/minimal_graphics_binding.h/.cpp`
-
-职责：
-
-- 只在 OpenXR runtime 不支持 headless 时创建最小 graphics binding；
-- backend 可为 Vulkan/EGL/OpenGL；
-- 不创建业务渲染资源；
-- 提供 session create 所需 handles。
-
-线程：只能由 OpenXR owner thread 创建和销毁。
-
-### 11.5 `src/tracking/pose_ring_buffer.h/.cpp`
-
-职责：
-
-- 缓存连续 pose/hand/controller sample；
-- 支持时间范围查询；
-- position 插值；
-- quaternion SLERP；
-- 禁止超过阈值的远距离外推。
-
-内存：
-
-- 固定时间窗口 3～5 秒；
-- 按最大 tracking rate 预分配；
-- 单生产者单消费者时使用 SPSC ring。
-
-### 11.6 `src/tracking/tracking_service.h/.cpp`
-
-职责：
-
-- 选择 OpenXR/VIO/replay backend；
-- 对上提供统一 query；
-- 保存 health、confidence、last sample；
-- 将 controller button 转为 OperationEvent；
-- 生成兼容 hand/controller CSV sample。
-
-线程：backend owner thread；service 本身不再开线程。
-
-### 11.7 `src/tracking/vio_tracking_backend.h/.cpp`
-
-职责：
-
-- 作为未来不依赖 OpenXR 的 Head Pose backend；
-- 接收相机/IMU；
-- 输出相同 Pose contract。
-
-第一版若不用可以只保留接口 target，不实现产品逻辑。
-
----
-
-## 12. IMU 文件
-
-### 12.1 `src/imu/i_imu_backend.h`
-
-接口：
-
-```text
-probe()
-configure(rate, ranges)
-start(ImuCallback)
-stop()
-clockDescriptor()
-```
-
-### 12.2 `src/imu/own_imu_backend.h/.cpp`
-
-职责：
-
-- 连接自有 IMU driver/SDK；
-- 读取 accel/gyro；
-- 提供 hardware timestamp；
-- 处理 rollover/reset；
-- 添加 clock mapping 同步点。
-
-线程：
-
-- 阻塞设备读取时一个 IMU capture thread；
-- callback SDK 情况不额外创建；
-- capture thread 不写 CSV。
-
-### 12.3 `src/imu/imu_normalizer.h/.cpp`
-
-职责：
-
-- raw unit 转 m/s² 和 rad/s；
-- axis 转 Body 坐标；
-- 应用 bias/scale/nonorthogonality；
-- 保留 raw 和 calibrated validity。
-
-线程：在 IMU capture thread 做固定成本计算。
-
-### 12.4 `src/imu/imu_ring_buffer.h/.cpp`
-
-职责：
-
-- 保存完整高频 IMU；
-- 支持按 `[previousVideoAnchor, currentVideoAnchor]` 取窗口；
-- 支持 recorder 独立顺序消费。
-
-内存：
-
-- 固定 2～5 秒；
-- 1 kHz、双流时按最大 rate 预分配；
-- 使用 sequence 检测覆盖；
-- recording consumer 不能悄悄漏样。
-
-### 12.5 `src/imu/imu_service.h/.cpp`
-
-职责：
-
-- backend 生命周期；
-- normalizer；
-- ring；
-- health/drop 计数；
-- 向 DatasetSession 提供顺序 sample stream。
-
-线程：使用 backend capture thread，不另开线程。
-
----
-
-## 13. Audio 文件
-
-### 13.1 `src/audio/i_audio_backend.h`
-
-接口：
-
-```text
-probe()
-configure(sampleRate, channels, format, period)
-start(AudioCallback)
-stop()
-clockDescriptor()
-```
-
-### 13.2 `src/audio/alsa_audio_backend.h/.cpp`
-
-职责：
-
-- ALSA PCM open/configure/read；
-- 获取 hardware timestamp；
-- 处理 xrun/recover；
-- 报告实际 sample rate 和 latency。
-
-线程：
-
-- 一个 audio capture thread；
-- 使用 blocking read/poll；
-- 不在该线程执行 AAC 编码或文件写入。
-
-### 13.3 `src/audio/audio_block_pool.h/.cpp`
-
-职责：
-
-- 预分配固定 PCM block；
-- block 大小等于 ALSA period 或其整数倍；
-- capture、encoder 间用 RAII handle。
-
-大小：
-
-```text
-blockCount = ceil(maxAudioPipelineLatency / periodDuration) + safety
-```
-
-建议从 16～32 blocks 起测。
-
-池耗尽：
-
-- 记录 xrun/backpressure；
-- recording 状态下触发音频故障；
-- 不临时分配无限 PCM buffer。
-
-### 13.4 `src/audio/aac_encoder.h/.cpp`
-
-职责：
-
-- PCM→AAC-LC；
-- 输出 codec config；
-- PTS 由累计 sample count 生成；
-- 输出 AudioAccessUnit。
-
-线程：
-
-- 一个 audio encode thread；
-- 输入 SPSC queue；
-- 该线程拥有 AAC encoder handle。
-
-### 13.5 `src/audio/audio_service.h/.cpp`
-
-职责：
-
-- backend、pool、AAC encoder 生命周期；
-- 建立 audio hardware time→boottime mapping；
-- 将 AudioAccessUnit 交给 DatasetSession；
-- 维护 audio metadata。
-
----
-
-## 14. Media 文件
-
-### 14.1 `src/media/image_processor.h`
-
-接口：
-
-```text
-probe()
-configure(ProcessingGraph)
-submit(AlignedFrameSet)
-flush()
-stop()
-```
-
-### 14.2 `src/media/vulkan_image_processor.h/.cpp`
-
-职责：
-
-- import dma-buf；
-- 等待 acquire fence；
-- YUV/RGB/gray format conversion；
-- RGB 左右眼 SBS；
-- tracking/ctrl 兼容布局；
-- 可选 hand/controller overlay；
-- 输出 encoder-compatible buffer；
-- 输出 release fence。
-
-线程：
-
-- 一个 GPU submission thread；
-- 所有 Vulkan queue submit 在该线程；
-- CPU 线程不直接竞争同一个 VkQueue。
-
-队列：
-
-- recording 输入 queue 4～8；
-- preview 不建立第二套处理，复用 RGB 编码结果；
-- queue 满时不能无限增长。
-
-内存池：
-
-- 每个输出 stream 一个 GPU image pool；
-- 每个 stream 建议 4～6 张，按 camera+GPU+encoder in-flight 实测；
-- descriptor set、command buffer 预分配；
-- shader pipeline 启动时创建，不逐帧创建。
-
-### 14.3 `src/media/cpu_image_processor.h/.cpp`
-
-职责：
-
-- 提供像素正确性的 reference backend；
-- 用于 CI、replay 和硬件诊断；
-- 支持相同 ProcessingGraph。
-
-不作为高分辨率量产默认路径。
-
-### 14.4 `src/media/processing_graph.h/.cpp`
-
-职责：
-
-- 根据 topology 和配置生成静态 graph；
-- 节点：import、convert、crop、scale、SBS、gray、overlay；
-- 启动时验证格式兼容；
-- 运行时不做动态 graph 重建。
-
-### 14.5 `src/media/i_video_encoder.h`
-
-接口：
-
-```text
-probe()
-configure(EncodeConfig)
-start(OutputCallback)
-queue(ProcessedFrame, FrameTag)
-requestIdr()
-signalEos()
-drain()
-stop()
-```
-
-约束：
-
-- `queue()` 明确传 capture PTS；
-- `signalEos()` 和 `stop()` 不等价；
-- stop 返回后 handle 已释放；
-- 一个 encoder handle 只有一个 owner。
-
-### 14.6 `src/media/v4l2_video_encoder.h/.cpp`
-
-职责：
-
-- V4L2 M2M/厂商 codec 配置；
-- dma-buf input；
-- HEVC output dequeue；
-- VPS/SPS/PPS；
-- IDR 请求；
-- EOS/drain；
-- 将 driver flag 和 NAL parser 结果写入 access unit。
-
-线程：
-
-- 每个 encoder instance 一个 output dequeue thread；
-- RGB、tracking、ctrl 最多三个；
-- input queue 由 GPU submission thread 投递；
-- output thread 是该 encoder 和对应 file writer 的唯一串行 owner。
-
-内存：
-
-- codec capture buffers 启动时分配；
-- EncodedBufferPool 管理复制后的 access unit；
-- 如驱动 buffer 能安全引用到 sink 完成，可以零复制，否则只复制一次。
-
-### 14.7 `src/media/encoded_buffer_pool.h/.cpp`
-
-职责：
-
-- 提供编码 access unit slab；
-- 避免每帧 `std::vector` 扩容；
-- 支持 FileSink 和 NetworkSink 共享。
-
-设计：
-
-- 按小/中/大三个 size class；
-- 总字节上限固定；
-- 记录 high-water mark；
-- 网络慢时丢网络引用，不保留 pool；
-- 文件慢时不能丢，进入故障停止。
-
-### 14.8 `src/media/hevc_parser.h/.cpp`
-
-职责：
-
-- 解析 Annex-B/length-prefixed NAL；
-- 识别 VPS/SPS/PPS、IDR、CRA；
-- 验证“真实 IDR”；
-- 格式转换；
-- 不进行完整视频解码。
-
-线程：纯函数/无线程。
-
-### 14.9 `src/media/idr_gate.h/.cpp`
-
-职责：
-
-- 实现动态 writer ARMING；
-- 请求 IDR 后过滤文件首帧；
-- IDR 前帧继续送 TCP 8802，不写文件；
-- 缓存 VPS/SPS/PPS；
-- 真实 IDR 成为 fMP4 第一帧和 PTS 零点；
-- 超时回滚到 preview。
-
-线程：
-
-- 只由 RGB encoder output thread 调用；
-- 状态变化投递 coordinator。
-
-### 14.10 `src/media/encoded_packet_router.h/.cpp`
-
-职责：
-
-- 同一 EncodedAccessUnit 分发给 FileSink 和 PreviewSink；
-- RGB 可进网络；
-- tracking/ctrl 只落盘；
-- 根据当前 ResourcePlan 动态 attach/detach sink。
-
-线程：每个 encoder output thread 内调用。
-
-### 14.11 `src/media/media_pipeline.h/.cpp`
-
-职责：
-
-- 统一管理 ImageProcessor 和三个 VideoEncoder；
-- 根据 ResourcePlan 启停；
-- 动态 arm/finalize writers；
-- 关闭新输入、发送 EOS、等待 drain；
-- 提供异步完成 event。
-
-线程：
-
-- 本身不开长期 thread；
-- 使用 GPU thread 和 encoder output threads；
-- control 操作通过专用 media command queue 串行执行。
-
-### 14.12 `src/media/snapshot_service.h/.cpp`
-
-职责：
-
-- 接收一次性 snapshot 请求；
-- 选择下一组完整 FrameSet；
-- CPU/GPU 转换后写 PNG/JPEG；
-- 不能阻塞 camera callback；
-- 同时最多一个活动请求。
-
-线程：
-
-- 一个低优先级 snapshot worker；
-- queue 容量 1～2；
-- 快照失败不影响录制。
-
----
-
-## 15. Dataset 文件
-
-### 15.1 `src/dataset/dataset_service.h/.cpp`
-
-职责：
-
-- 创建和管理唯一活动 DatasetSession；
-- 检查存储；
-- 建立 `.partial` 目录；
-- 协调 audio、IMU、pose、video writer；
-- 完成后原子 rename；
-- 启动时扫描未完成 session。
-
-线程：
-
-- 本身无高频线程；
-- start/stop 由 coordinator 触发；
-- finalize 通过异步任务执行，完成后投递 revision event。
-
-### 15.2 `src/dataset/dataset_session.h/.cpp`
-
-职责：
-
-- 保存 SessionId、路径、SessionClockSnapshot；
-- 持有所有 writer；
-- 提供 `recording/finalizing/complete` 状态；
-- 生成 capture_status 和 manifest；
-- 统计各流 sample/drop。
-
-原则：
-
-- 一个 session 只有一个 owner；
-- 不允许第二次 start；
-- stop 幂等；
-- writer attach/finalize 状态显式。
-
-### 15.3 `src/dataset/fmp4_writer.h/.cpp`
-
-职责：
-
-- 写 `ftyp+moov`；
-- 每 sample 写 `styp+moof+mdat`；
-- HEVC/AAC track；
-- crash-safe append；
-- fsync policy 可配置。
-
-线程：
-
-- 不内部开线程；
-- 只能由对应 encoder output thread 调用；
-- 一个实例只能有一个调用线程。
-
-可参考当前 `FMP4Writer` 行为，但作为新模块重新测试。
-
-### 15.4 `src/dataset/video_track_writer.h/.cpp`
-
-职责：
-
-- 管理 fMP4 video track；
-- 管理兼容 metadata CSV；
-- PTS 零基；
-- 保证视频 sample 与 metadata 一一对应；
-- finalize/close。
-
-线程：
-
-- 由对应 encoder output thread 独占；
-- 不单独开 disk thread；
-- 避免视频和 metadata 分属两个队列导致行数不一致。
-
-### 15.5 `src/dataset/audio_track_writer.h/.cpp`
-
-职责：
-
-- 写 audio fMP4；
-- 写 `audio_metainfo.csv`；
-- sample count 到 PTS；
-- capture UTC。
-
-线程：由 audio encode thread 独占。
-
-### 15.6 `src/dataset/imu_writer.h/.cpp`
-
-职责：
-
-- 写 accel/gyro CSV；
-- 按 timestamp 排序；
-- 批量缓冲；
-- 定期 flush；
-- 记录丢样。
-
-线程：
-
-- 一个 IMU writer thread；
-- 输入 SPSC queue；
-- 不在 IMU capture thread 做文件 I/O。
-
-队列：
-
-- 至少容纳 2 秒最大 ODR；
-- queue 满时视为录制完整性故障。
-
-### 15.7 `src/dataset/tracking_writer.h/.cpp`
-
-职责：
-
-- 写 head_pose；
-- 写 hand 或 controller；
-- 100 ms 可配置 reorder window；
-- 保证 UTC timestamp 单调；
-- 保存 invalid/confidence 的兼容策略。
-
-线程：
-
-- 一个 tracking writer thread；
-- head/hand/controller 共用，保证同一时间顺序；
-- 输入为小对象 queue。
-
-### 15.8 `src/dataset/calibration_writer.h/.cpp`
-
-职责：
-
-- 从 CalibrationRepository 导出兼容相机 JSON；
-- 导出 IMU calibration；
-- 每 session 只写一次；
-- 记录 calibration version/checksum。
-
-线程：session start 的低频任务，不另开线程。
-
-### 15.9 `src/dataset/session_manifest_writer.h/.cpp`
-
-职责：
-
-- 新增内部 `session_manifest.json`；
-- 不替代现有兼容文件；
-- 记录实际设备、软件版本、clock mapping、queue drops、encoder 参数；
-- 用于诊断和追溯。
-
-### 15.10 `src/dataset/recovery_service.h/.cpp`
-
-职责：
-
-- 扫描 `.partial`；
-- 验证最后完整 fMP4 fragment；
-- 生成 recovery status；
-- 不伪造 `complete`；
-- 保留可读数据。
-
-线程：启动时低优先级 worker。
-
-### 15.11 `src/dataset/dataset_export_service.h/.cpp`
-
-职责：
-
-- 保留当前 SDK 的数据集导出能力；
-- 枚举已完成和可恢复 session；
-- 将选定 session 复制到指定挂载点；
-- 使用临时目录，全部复制和校验成功后原子 rename；
-- 校验目标可用空间、文件大小和可选 checksum；
-- 支持 cancel、进度、完成和错误事件；
-- 绝不导出正在写入的活动 session；
-- 导出失败不修改源数据。
-
-主要接口：
-
-```text
-listExportableSessions()
-startExport(sessionId, targetRoot)
-cancelExport(exportId)
-queryProgress(exportId)
-```
-
-线程：
-
-- 一个低优先级 export worker；
-- 同时只执行一个 export；
-- 使用分块 buffer，不能一次把大文件读入内存；
-- 进度通过 EventLoop 发布。
-
-内存：
-
-- 固定 1～4 MiB copy buffer；
-- 不使用媒体内存池；
-- buffer 大小按存储吞吐实测配置。
-
----
-
-## 16. Protocol 和网络文件
-
-### 16.1 `src/protocol/packet_codec.h/.cpp`
-
-职责：
-
-- EG frame 编解码；
-- protobuf payload；
-- 长度、magic、version 校验；
-- 处理粘包和半包；
-- 限制最大 packet；
-- 不处理业务状态。
-
-线程：纯解析器，无线程。
-
-### 16.2 `src/protocol/command_dispatcher.h/.cpp`
-
-职责：
-
-- protobuf Command → OperationEvent；
-- 参数校验；
-- 生成立即 Response；
-- 不直接 start/stop encoder；
-- 所有状态变更由 coordinator。
-
-线程：ControlServer event loop thread。
-
-### 16.3 `src/protocol/control_server.h/.cpp`
-
-职责：
-
-- TCP 8801 listen/accept/read/write；
-- 同一连接区分 `EG` frame 和 newline JSON；
-- 连接断开清理；
-- 输出 Response、Status、Fault；
-- 限制单连接 buffer。
-
-线程：
-
-- 使用主 epoll EventLoop；
-- 不需要一连接一线程；
-- protobuf 编解码在 event loop 做；
-- 大量序列化可转 control worker，但第一版不需要。
-
-内存：
-
-- 每连接固定 read buffer；
-- 最大 packet 按协议限制；
-- write queue 有字节上限；
-- Status 可合并为最新 revision，Response 不可丢。
-
-### 16.4 `src/protocol/status_publisher.h/.cpp`
-
-职责：
-
-- 根据 OperationState/SystemState 生成 Status；
-- 状态变化立即发布；
-- 周期心跳发布；
-- 过滤过期 revision。
-
-线程：由 EventLoop 调用。
-
-### 16.5 `src/protocol/custom_ntp_service.h/.cpp`
-
-职责：
-
-- 实现 TCP 8801 上的 custom NTP JSON；
-- 管理独立会话；
-- 在收包点尽早记录 t2；
-- 在发包前尽晚记录 t3；
-- `_ns` 使用十进制字符串；
-- 不开启 UDP 123 或新端口。
-
-线程：ControlServer EventLoop。
-
-### 16.6 `src/protocol/video_server.h/.cpp`
-
-职责：
-
-- TCP 8802 listen/accept；
-- 新连接先发送缓存 VPS/SPS/PPS；
-- 请求 RGB IDR；
-- 发送 Annex-B；
-- disconnect 不停止本地录制；
-- 按当前 mode 决定是否允许重连。
-
-线程：
-
-- 一个 video accept/send thread，或集成 epoll；
-- 建议独立 send thread，避免大视频 write 占用 control event loop；
-- `shutdown(fd)` 用于停止时解除阻塞。
-
-队列：
-
-- 仅 preview 使用；
-- 以字节数和帧数双重限制；
-- 慢客户端丢旧 P-frame，保留最近 config/IDR 策略；
-- 网络队列满不得阻塞 encoder output/file writer；
-- 网络引用释放后立即归还 EncodedBufferPool。
-
----
-
-## 17. Connectivity 文件
-
-### 17.1 `src/connectivity/ble_service.h/.cpp`
-
-职责：
-
-- BlueZ GATT application；
-- FFE0/FFE1～FFE4；
-- time sync/control characteristics；
-- notify subscription；
-- manufacturer payload；
-- 连接状态；
-- 将命令投递 dispatcher/coordinator。
-
-线程：
-
-- 使用 system D-Bus event integration；
-- 接入主 EventLoop；
-- 不另建 Binder 风格 service thread。
-
-### 17.2 `src/connectivity/ble_time_sync_session.h/.cpp`
-
-职责：
-
-- BLE sync/verify 状态机；
-- session_id、phase、sample_index；
-- timeout/retry/cancel/status；
-- 使用 ExternalTimeSync 数学模块。
-
-线程：主 EventLoop。
-
-### 17.3 `src/connectivity/wifi_service.h/.cpp`
-
-职责：
-
-- 统一 Wi-Fi 接口；
-- scan/connect/disconnect；
-- SSID/IP/RSSI/channel；
-- timeout 和 link event；
-- 凭据不写日志。
-
-backend：
-
-- `network_manager_backend.h/.cpp`
-- `wpa_supplicant_backend.h/.cpp`
-
-线程：
-
-- D-Bus backend 接 EventLoop；
-- wpa_supplicant control fd 接 epoll；
-- 不轮询 sleep。
-
----
-
-## 18. Platform 文件
-
-### 18.1 `src/platform/event_loop.h/.cpp`
-
-职责：
-
-- epoll；
-- eventfd；
-- timerfd；
-- signalfd；
-- fd callback；
-- 延迟任务；
-- 不执行媒体重活。
-
-线程：main thread。
-
-### 18.2 `src/platform/config_service.h/.cpp`
-
-职责：
-
-- TOML/YAML 加载；
-- schema 校验；
-- 默认值和范围；
-- 生成 immutable ConfigSnapshot；
-- reload 只允许修改运行期安全字段。
-
-### 18.3 `src/platform/storage_service.h/.cpp`
-
-职责：
-
-- 数据根目录；
-- `statvfs`；
-- 1 GiB 和百分比阈值；
-- inode、只读、短写；
-- 原子目录/文件操作；
-- 预估当前配置每分钟数据量。
-
-### 18.4 `src/platform/system_state_service.h/.cpp`
-
-职责：
-
-- power_supply；
-- thermal/hwmon；
-- 内存、CPU、fd；
-- Wi-Fi snapshot；
-- peripheral health 汇总。
-
-### 18.5 `src/platform/logger.h/.cpp`
-
-职责：
-
-- 统一结构化日志；
-- journald；
-- module/session/frame/error 字段；
-- rate limit；
-- dataset session 可选日志副本。
-
-禁止任何 core 文件直接调用 syslog/journald。
-
-### 18.6 `src/platform/systemd_notifier.h/.cpp`
-
-职责：
-
-- READY；
-- WATCHDOG；
-- STATUS；
-- STOPPING。
-
-### 18.7 `src/platform/thread_utils.h/.cpp`
-
-职责：
-
-- thread name；
-- priority；
-- CPU affinity 可配置；
-- realtime scheduling 的能力检查；
-- 统一 join deadline。
-
-原则：
-
-- camera/IMU 只有在测量证明需要时使用实时优先级；
-- disk/network 不得与 capture 使用同等实时优先级。
-
-### 18.8 `src/platform/local_input_service.h/.cpp`
-
-职责：
-
-- 通过 evdev/libinput 读取设备按键；
-- 将录制键转换为统一 LocalStart/Stop toggle event；
-- 实现 debounce 和 long-press；
-- 不直接创建 DatasetSession 或控制 encoder；
-- 按键事件必须进入 OperationCoordinator。
-
-线程：
-
-- input fd 接入主 EventLoop；
-- 不需要独立线程。
-
-### 18.9 `src/platform/removable_storage_monitor.h/.cpp`
-
-职责：
-
-- 监听 udev block device/mount 事件；
-- 识别允许的导出目标；
-- 提供挂载点、容量、只读状态；
-- 设备拔出时取消 DatasetExportService；
-- 不在 udev callback 中执行复制。
-
-线程：udev monitor fd 接入主 EventLoop。
-
-### 18.10 `src/platform/audio_prompt_service.h/.cpp`
-
-职责：
-
-- 播放开始、停止、存储不足、导出完成等提示音；
-- 使用预录 WAV/OGG，不把 TTS 设为核心依赖；
-- 与采集 PCM 设备协调，避免抢占 microphone；
-- 提示失败只记录 WARN，不改变业务状态。
-
-线程：
-
-- 一个低优先级 prompt worker；
-- 有界队列，容量建议 8；
-- 相同低优先级提示可合并；
-- fatal/stop 提示优先但不得阻塞 coordinator。
-
-内存：启动时缓存小型提示音，或使用固定流式 decode buffer。
-
-### 18.11 `src/platform/backend_factory.h/.cpp`
-
-职责：
-
-- 根据配置创建 Camera、Tracking、IMU、Audio、ImageProcessor、Encoder backend；
-- 校验 backend capability；
-- 明确链接静态 backend 或加载有版本的 plugin；
-- 不允许业务代码中散布 backend `#ifdef`。
-
-线程：只在 Application 初始化阶段使用。
-
----
-
-## 19. CLI 和工具文件
-
-### 19.1 `apps/egocollectctl/main.cpp`
-
-职责：
-
-- Unix domain socket 调用；
-- `status/start/stop/preview/snapshot/reload/diagnose`；
-- JSON 输出；
-- 不直接访问设备。
-
-### 19.2 `apps/replay/main.cpp`
-
-职责：
-
-- 从 recorded raw source 驱动 Camera/IMU/Audio/Tracking fake backend；
-- 复现时钟、丢帧、乱序；
-- 运行完整 coordinator/media/dataset/protocol；
-- CI 核心入口。
-
-### 19.3 `apps/calibrate/main.cpp`
-
-职责：
-
-- 相机内参、双目外参、Camera→Body、IMU→Body；
-- 时间偏移；
-- 输出 CalibrationRepository 格式；
-- 不属于 daemon。
-
-### 19.4 `apps/diagnose/main.cpp`
-
-职责：
-
-- 枚举设备；
-- 检查 camera formats/dma-buf/modifier；
-- 多相机同步；
-- encoder 并发；
-- ALSA/IIO；
-- OpenXR tracking；
-- 生成机器可读报告。
-
----
-
-## 20. 完整线程模型
-
-### 20.1 推荐线程清单
-
-| 线程 | 数量 | Owner | 主要工作 |
-|---|---:|---|---|
-| Main EventLoop | 1 | Application | epoll、signal、timer、TCP control、D-Bus |
-| Operation Coordinator | 1 | OperationCoordinator | 串行业务状态 |
-| Camera Poll | 0 或 1 | Camera backend | poll/DQBUF；SDK callback 时为 0 |
-| Frame Synchronizer | 1 | FrameSynchronizer | 组成 FrameSet |
-| Time Aligner | 1 | FrameTimeAligner | pose/hand/controller/IMU 对齐 |
-| OpenXR Owner | 1 | OpenXR backend | session、event、frame loop、locate |
-| IMU Capture | 0 或 1 | IMU backend | 读取 IMU |
-| Audio Capture | 1 | ALSA backend | 读取 PCM |
-| Audio Encode | 1 | AAC encoder | AAC、audio writer |
-| GPU Submit | 1 | Vulkan processor | import/process/submit |
-| Video Encoder Output | 3 | 各 encoder | dequeue、IDR gate、file/network route |
-| IMU Writer | 1 | DatasetSession | accel/gyro CSV |
-| Tracking Writer | 1 | DatasetSession | pose/hand/controller CSV |
-| Video Network Send | 1 | VideoServer | TCP 8802 |
-| Snapshot Worker | 1 | SnapshotService | PNG/JPEG |
-| Export Worker | 1 | DatasetExportService | 数据集分块导出 |
-| Prompt Worker | 1 | AudioPromptService | 提示音 |
-| Recovery/Low-priority | 1 | Platform worker | 恢复、慢速诊断 |
-
-典型总数约 16～18。实际数量根据 camera SDK、是否有 ctrl stream、是否使用 OpenXR、是否启用导出调整。
-
-### 20.2 为什么不使用万能线程池
-
-以下资源需要线程亲和或单一 owner：
-
-- OpenXR session；
-- Vulkan queue；
-- encoder handle；
-- ALSA PCM；
-- fMP4 writer 顺序；
-- 业务状态机。
-
-万能线程池会让资源所有权模糊，停止顺序困难。因此：
-
-- 高频实时链路使用专用线程；
-- 低频无状态任务可以使用一个 1～2 线程低优先级 worker；
-- 不建立大型通用线程池。
-
-### 20.3 线程间规则
-
-- camera callback 不做文件 I/O、网络发送、OpenXR query、编码 drain；
-- encoder output thread 不等待网络；
-- coordinator 不在状态处理函数里 join；
-- 状态锁内禁止系统调用和耗时操作；
-- 同一 writer 只能由一个线程调用；
-- stop 操作必须幂等；
-- 所有线程有名称、owner 和最大停止时间；
-- shutdown 时先关闭 admission，再 drain，最后销毁资源。
-
----
-
-## 21. 队列和背压
-
-| 通路 | 队列 | 建议初值 | 满时策略 |
-|---|---|---:|---|
-| Camera→Synchronizer | MPSC bounded | 每相机 4～8 帧 | 释放迟到帧；recording 连续超限报错 |
-| Synchronizer→Aligner | SPSC bounded | 8 FrameSet | recording 停止；preview 丢旧 |
-| Tracking query | MPSC bounded | 128 request | 超时标 invalid；不阻塞 camera |
-| Aligner→GPU | SPSC bounded | 4～8 | recording backpressure fault |
-| PCM→AAC | SPSC bounded | 16～32 blocks | audio fault |
-| IMU→Writer | SPSC bounded | ≥2 秒样本 | 数据完整性 fault |
-| Tracking→Writer | SPSC bounded | ≥2 秒样本 | fault，不静默丢 |
-| Encoded→Network | bounded bytes+frames | 0.5～1 秒 | 丢旧网络帧 |
-| Control Event | MPSC bounded | 256 | system fault |
-| Snapshot | bounded | 1～2 | 拒绝新请求 |
-
-所有队列必须暴露：
-
-- current depth；
-- capacity；
-- high-water mark；
-- push failure；
-- dropped count；
-- oldest item age。
-
-禁止：
-
-- 无界 `std::queue/deque`；
-- 队列满后自动无限 heap allocation；
-- 所有通路统一使用“丢最旧”。
-
----
-
-## 22. 内存池设计
-
-### 22.1 必须使用的池
-
-1. 驱动 camera buffer pool；
-2. FrameEnvelope/FrameSet object pool；
-3. GPU output image pool；
-4. AudioBlockPool；
-5. EncodedBufferPool；
-6. 固定 tracking/IMU ring buffer。
-
-### 22.2 不建立全局万能内存池
-
-原因：
-
-- 图像、PCM、编码包大小和生命周期不同；
-- 一个 pool 的碎片和锁会污染所有链路；
-- 难以区分哪个模块泄漏；
-- 回收线程不明确。
-
-每个 pool 必须：
-
-- 有唯一 owner；
-- 固定最大字节数；
-- 提供 RAII lease；
-- 统计 outstanding/high-water；
-- shutdown 时验证全部归还；
-- debug 模式记录最后持有者。
-
-### 22.3 零拷贝边界
-
-理想路径：
-
-```text
-Camera dma-buf
-→ Vulkan import
-→ GPU output dma-buf
-→ Encoder import
-→ encoded buffer single copy/shared reference
-→ file + network
-```
-
-允许的复制：
-
-- driver encoded output 生命周期过短时，复制一次到 EncodedBufferPool；
-- CPU reference backend；
-- snapshot；
-- 调试 dump。
-
-禁止：
-
-- 每个 consumer 各复制一份原始图像；
-- TCP send 前重新拼接整个视频帧；
-- 逐帧新建大 `std::vector`。
-
----
-
-## 23. 时间同步完整设计
-
-### 23.1 三个不同问题
-
-不能把三者混为一谈：
-
-1. **设备内部传感器同步**：camera、IMU、audio、tracking；
-2. **媒体时间轴**：capture time→encoder PTS→fMP4；
-3. **设备间同步**：BLE 四时间戳和 TCP custom NTP。
-
-### 23.2 内部标准时间轴
-
-内部标准使用 `CLOCK_BOOTTIME` ns：
-
-```text
-camera hardware tick ─┐
-IMU hardware tick ────┼→ ClockMapper → BOOTTIME
-audio hardware time ──┤
-OpenXR XrTime ────────┘
-```
-
-写文件时：
-
-```text
-UTC ns = BOOTTIME ns + sessionBoottimeToRealtimeOffset
-```
-
-为了与当前 schema 兼容，每个 session 仍保存一个 mapping snapshot；同时 manifest 记录录制期间 offset 是否变化。
-
-### 23.3 视频锚点
-
-视频真实采样时间：
+每只眼分别计算：
 
 ```text
 midExposureBootNs =
     exposureStartBootNs + exposureDurationNs / 2
 ```
 
-不是：
-
-- callback 到达时间；
-- GPU submit 时间；
-- encoder output 时间；
-- 文件写入时间。
-
-文件 PTS：
+当前 Android 行为使用 RGB 左眼作为主要视觉锚点，因此 Linux 固定：
 
 ```text
-pts_us = (midExposureBootNs - firstWrittenIdrMidExposureBootNs) / 1000
+visualAnchorBootNs = RGB left midExposureBootNs
 ```
 
-### 23.4 Head Pose 对齐
+右眼时间仍然单独保存，并记录左右眼曝光偏差。
 
-```text
-Camera mid-exposure BOOTTIME
-→ TimeService BOOTTIME→XrTime
-→ xrLocateSpace(head, root, targetXrTime)
-→ Pose at exposure
-```
+### 4.4 全局标识
 
-如果 backend 只提供连续 sample：
+所有跨线程对象至少携带：
 
-- 保存 pose ring；
-- position 插值；
-- orientation SLERP；
-- 超过最大 gap 标 invalid；
-- 不使用“当前 pose”冒充曝光时 pose。
+- `sessionGeneration`：区分不同录制 session；
+- `streamId`：RGB、Tracking、Ctrl、Audio、IMU 等；
+- `sequence`：数据源连续序号；
+- `FrameId`：进入 Camera Sync 后分配的全局帧标识；
+- `timestampBootNs`。
 
-### 23.5 IMU 对齐
-
-IMU 保留全部样本，不压成“一视频帧一个 IMU”：
-
-```text
-previous video mid-exposure
-    < IMU samples >
-current video mid-exposure
-```
-
-可以额外计算当前视频时刻插值值，但不能替代原始 CSV。
-
-### 23.6 Audio 对齐
-
-- PTS 由累计 PCM sample 数产生；
-- capture UTC 由 ALSA hardware timestamp 映射；
-- 不以视频帧切分音频；
-- 定期验证 sample clock 与 boottime drift；
-- 记录 xrun 和补偿策略。
-
-### 23.7 外部设备同步
-
-BLE 和 TCP NTP 对外继续使用 UTC ns：
-
-- t1/t2/t3/t4 含义不变；
-- TCP t2 尽量靠近接收，t3 尽量靠近发送；
-- BLE sync 与 TCP custom NTP 维护独立 session；
-- 外部 offset 不直接修改 session 内部历史 timestamp；
-- 系统校时应优先 slew，录制期间避免 wall clock step。
+旧 session 的异步结果如果 `sessionGeneration` 不匹配，只能释放自己的内存，不能写入新 session。
 
 ---
 
-## 24. 动态录制与预览的关键实现
+## 5. 相机链路
 
-### 24.1 Preview→Record
+### 5.1 当前 Android 语义和 Linux 变化
 
-严格流程：
+当前 Android 使用：
 
 ```text
-PHONE_PREVIEW/STABLE
-→ PHONE_RECORD/STARTING
-→ encoder 和 8802 保持运行
-→ 创建 DatasetSession
-→ arm RGB/tracking/ctrl writer
-→ 在下一输入边界 request IDR
-→ IDR 前继续 preview，不落盘
-→ 验证真实 IDR
-→ 用缓存 VPS/SPS/PPS 创建 fMP4
-→ IDR 作为文件第一帧和 PTS=0
-→ PHONE_RECORD/STABLE
+sxr_camera_open_group(RGB)
+sxr_camera_open_group(TRACKING)
+sxr_camera_open_group(CTRL)
 ```
 
-IDR 超时：
+每次 callback 已经包含一个双目 group：
 
-- 删除/标记未完成 session；
-- 回滚 `PHONE_PREVIEW/STABLE`；
-- 不断开 8802；
-- 不重启 encoder。
+- RGB：左右眼两个 `AHardwareBuffer`；
+- Tracking：一个左右拼接灰度 buffer；
+- Ctrl：一个左右拼接灰度 buffer。
 
-### 24.2 Record 中开关 Preview
+Linux 必须保留这个 group 语义：
 
-`LOCAL_RECORD → LOCAL_RECORD_WITH_PREVIEW`：
+```text
+CameraGroupBlock
+  group             RGB / TRACKING / CTRL
+  groupSequence
+  triggerId
+  bufferCount
+  buffers[]         dma-buf/CPU block 描述和 lease
+  leftEye           曝光、crop、内参、外参
+  rightEye          曝光、crop、内参、外参
+```
 
-- writer 和文件时间轴不变；
-- 启动 8802；
-- 发送 VPS/SPS/PPS；
-- 请求 IDR 供客户端起解；
-- 新 IDR 仍正常写原文件。
+左右眼不能先拆到两个异步队列再重新配对。若 Linux 驱动分别暴露左右眼 node，T02 必须先在相机 backend 内形成完整 `CameraGroupBlock`。
 
-反向：
+### 5.2 T02 Camera IO Owner
 
-- 停止网络 admission；
-- 清网络 queue；
-- shutdown socket；
-- 不向 encoder 发 EOS；
-- 不 finalize writer。
+#### V4L2 模式使用的关键 API
 
-### 24.3 全局 Stop
+```text
+open(O_NONBLOCK | O_CLOEXEC)
+VIDIOC_QUERYCAP
+VIDIOC_ENUM_FMT
+VIDIOC_S_FMT
+VIDIOC_REQBUFS
+VIDIOC_QUERYBUF
+VIDIOC_EXPBUF
+VIDIOC_QBUF
+VIDIOC_STREAMON
+epoll_wait
+VIDIOC_DQBUF
+VIDIOC_STREAMOFF
+close
+```
 
-顺序：
+T02 同时监听：
 
-1. coordinator 设置 `STOPPING`、revision++、主动上报；
-2. 关闭 preview admission，shutdown 8802；
-3. 关闭新 camera frame 进入 encoder 的 admission；
-4. 确定最后输入边界；
-5. encoder signal EOS；
-6. output thread drain 全部有效 sample；
-7. output thread finalize video writer；
-8. 停 audio/IMU/tracking writers；
-9. 写 capture status/manifest；
-10. 销毁 encoder/GPU resources；
-11. 回收所有 lease，检查 pool；
-12. 设置 `IDLE/STABLE`、revision++、主动上报。
+- camera fd；
+- CameraCommand eventfd；
+- CameraRequeue eventfd。
+
+T02 是所有 camera `DQBUF/QBUF/STREAMON/STREAMOFF` 的唯一调用线程。
+
+每次 `DQBUF` 后：
+
+1. 读取 group、sequence、trigger ID；
+2. 读取左右眼曝光开始、曝光时长、gain、crop、内外参；
+3. 将硬件时间转换成 BOOTTIME；
+4. 建立 camera buffer lease；
+5. 组成完整 `CameraGroupBlock`；
+6. 投递到对应 group 的 CameraIngressQueue；
+7. 返回 epoll。
+
+#### 厂商 callback 模式
+
+Android 的 `JavaVM*`、`jobject`、`AHardwareBuffer*` ABI 不能直接用于 Linux。厂商必须提供 Linux 原生 camera SDK。
+
+SDK 必须明确提供以下语义，实际函数名由厂商文档确定：
+
+- 枚举 camera group 和能力；
+- 配置格式、分辨率和帧率；
+- 启动、停止 group；
+- frame callback；
+- buffer retain/release；
+- timestamp domain 和曝光单位；
+- 获取标定参数；
+- reset 和错误通知。
+
+callback 内只允许：
+
+1. 校验 frame descriptor；
+2. retain 厂商 buffer，或者复制到预分配 CameraCopyPool；
+3. 转换时间和填充 `CameraGroupBlock`；
+4. `try_push` 到对应 CameraIngressQueue；
+5. 返回。
+
+只 `dup()` dma-buf fd 不能证明 buffer 在 callback 返回后仍然有效。必须有厂商 retain/release 合同，或者在 callback 返回前完成一次固定池复制。
+
+### 5.3 CameraIngressQueue
+
+使用三条独立队列：
+
+| 队列 | Producer | Consumer | 类型 | 初始容量 |
+|---|---|---|---|---:|
+| RGB ingress | RGB callback/T02 | T03 | MPSC bounded | 8 group |
+| Tracking ingress | Tracking callback/T02 | T03 | MPSC bounded | 8 group |
+| Ctrl ingress | Ctrl callback/T02 | T03 | MPSC bounded | 8 group |
+
+三条队列共用一个 eventfd 唤醒 T03。T03 使用 round-robin drain，防止 60 fps Tracking/Ctrl 挤占 30 fps RGB。
+
+队列元素是 `CameraGroupBlock` 和 camera buffer lease，不复制像素。
+
+满队列：
+
+- 预览模式：丢弃本次新 group，立即释放 lease；
+- 录制模式：记录 sequence gap；连续满超过阈值后通知 T01 有序停止；
+- producer 不能反向 pop 队列中的旧元素。
+
+### 5.4 Camera buffer 内存保护
+
+camera buffer lease 内保存：
+
+- buffer index/token；
+- dma-buf fd 所有权；
+- plane offset、stride、modifier；
+- acquire fence；
+- 原子引用计数；
+- backend lifetime token；
+- generation；
+- 最后持有模块。
+
+最后一个引用释放时：
+
+```text
+V4L2：
+  释放线程 → CameraRequeueQueue
+  → eventfd 唤醒 T02
+  → T02 执行 VIDIOC_QBUF
+
+厂商 SDK：
+  释放线程 → 厂商声明为 thread-safe 的 release
+  或 → CameraRequeueQueue → T02 调用厂商 release
+```
+
+不能从 T05、T07、T08～T10 直接 `QBUF`。
+
+STREAMOFF 后 T02 保持 requeue-only 状态，等待全部 lease 归零后才能 unmap、close 或销毁 camera SDK。
+
+### 5.5 T03 Camera Sync & Router
+
+T03 从三条 ingress queue 取得 group 后执行：
+
+1. 检查每组左右眼 sequence 和曝光偏差；
+2. 放入 RGB、Tracking、Ctrl 三个固定 reorder ring；
+3. 按 trigger ID、已验证的公共 sequence 或曝光中点匹配同步 epoch；
+4. 生成 `VisualEpoch`；
+5. 为每个 group 分配 `FrameId`；
+6. 将图像发送到 T07；
+7. 将 Tracking/Ctrl 图像发送到 T05；
+8. 将不带图像的 RGB `FrameAnchor` 发送到 T06。
+
+`VisualEpoch` 保存：
+
+```text
+epochId
+optional RGB CameraGroupBlock
+optional Tracking CameraGroupBlock
+optional Ctrl CameraGroupBlock
+sync method
+group skew
+quality
+```
+
+RGB、Tracking、Ctrl 不能假定同帧率。以 RGB 30 fps、Tracking/Ctrl 60 fps 为例：
+
+```text
+60 Hz epoch 100：RGB + Tracking + Ctrl
+60 Hz epoch 101：      Tracking + Ctrl
+60 Hz epoch 102：RGB + Tracking + Ctrl
+```
+
+有效的 group sample 必须恰好向下游发送一次，不能为凑齐三个 group 而丢掉一半 Tracking/Ctrl。
+
+没有硬件同步时可以按时间相关形成 epoch，但必须标记 `timestamp_correlated`，不能写成 `hardware_synchronized`。
 
 ---
 
-## 25. 配置
+## 6. IMU 链路
 
-示例：
+### 6.1 T04 IMU Capture
 
-```toml
-[device]
-id_source = "eeprom"
-input_mode = "hand"
+优先使用 Linux IIO。
 
-[storage]
-root = "/var/lib/egocollect"
-min_free_bytes = 1073741824
-min_free_percent = 5
+配置接口：
 
-[camera]
-backend = "own"
-topology = "/etc/egocollect/cameras.yaml"
-calibration_root = "/var/lib/egocollect/calibration"
-
-[tracking]
-backend = "openxr"
-root_space = "vendor_root_or_local"
-history_seconds = 5
-query_timeout_ms = 5
-
-[processing]
-backend = "vulkan"
-zero_copy = true
-project_hand = false
-project_controller = false
-
-[video.rgb]
-fps = 30
-bitrate = 8000000
-
-[video.tracking]
-fps = 60
-bitrate = 4000000
-
-[video.ctrl]
-fps = 60
-bitrate = 4000000
-
-[audio]
-sample_rate = 44100
-channels = 1
-bitrate = 96000
-
-[network]
-control_port = 8801
-video_port = 8802
+```text
+/sys/bus/iio/devices/iio:deviceX/
+scan_elements/*_en
+scan_elements/*_index
+scan_elements/*_type
+buffer/length
+buffer/enable
+sampling_frequency
 ```
 
-启动后生成 `EffectiveConfig`，记录：
+读取 API：
 
-- 请求值；
-- backend 实际值；
-- 降级原因；
-- buffer/queue 实际容量；
-- codec profile；
-- clock quality。
+```text
+open("/dev/iio:deviceX", O_NONBLOCK | O_CLOEXEC)
+poll({iioFd, commandEventFd})
+read
+close
+```
+
+T04 每次读取后：
+
+1. 按 scan element 的 index、type 和 alignment 解析，不能直接强转固定结构体；
+2. 区分 accel、gyro 和硬件 timestamp；
+3. 应用 scale、bias、轴向和量纲转换；
+4. 转换成 BOOTTIME；
+5. 分配连续 sequence；
+6. 组成固定容量 `ImuBatch`；
+7. 写入 ImuRing；
+8. 把一份值对象投递 TrackingImuQueue；
+9. 把一份值对象投递 ImuRecordQueue。
+
+`ImuBatch` 是小型定长结构：
+
+```text
+count
+samples[N]
+  kind             accel / gyro
+  sequence
+  timestampBootNs
+  x, y, z
+  temperature
+  validity
+```
+
+IMU 不需要大内存 lease。`ImuBatch` 直接复制到预分配 queue slot。
+
+### 6.2 ImuRing
+
+ImuRing 保存最近 2～5 秒所有 accel/gyro 原始样本。
+
+用途：
+
+- T06 查询两个 RGB 曝光锚点之间的完整 IMU window；
+- 故障检测 sequence gap；
+- Tracking reset 后短时间回放 IMU。
+
+ImuRing 单 writer 为 T04。reader 使用 sequence snapshot，不能持有 ring slot 裸指针。
+
+### 6.3 IMU 队列策略
+
+| 队列 | Producer → Consumer | 类型 | 容量 |
+|---|---|---|---:|
+| TrackingImuQueue | T04 → T05 | SPSC | 至少 500 ms 最大 ODR |
+| ImuRecordQueue | T04 → T13 | SPSC | 至少 2 秒最大 ODR |
+
+TrackingImuQueue 满：
+
+- 说明 Tracking 算法跟不上 IMU；
+- 不能覆盖中间 IMU 后继续输出“正常 Pose”；
+- T05 进入 degraded/reset，持续发生则停止录制。
+
+ImuRecordQueue 满：
+
+- 数据集已不完整；
+- 通知 T01 停止录制；
+- session 标记 incomplete。
 
 ---
 
-## 26. systemd 与权限
+## 7. Linux 原生 Head Pose 和双手链路
 
-```ini
-[Unit]
-Description=EgoCollect Service
-After=local-fs.target bluetooth.service network.target
-Wants=bluetooth.service
+### 7.1 数据来源
 
-[Service]
+T05 使用一个 Linux 原生 Tracking backend，输入：
+
+- Tracking 左右灰度图；
+- Ctrl 左右灰度图；
+- 连续 accel/gyro；
+- camera intrinsics/extrinsics；
+- IMU calibration；
+- camera 与 IMU 时间偏移。
+
+输出：
+
+- Head position 和 orientation；
+- tracking state 和 confidence；
+- 左右手每个关节的位置、方向、半径和 validity；
+- 输出数据对应的 BOOTTIME。
+
+厂商 Linux SDK 必须提供的操作语义：
+
+1. 创建算法实例；
+2. 加载 camera/IMU 标定；
+3. 启动；
+4. 提交 IMU batch；
+5. 提交 Tracking stereo frame；
+6. 提交 Ctrl stereo frame；
+7. 取得 Pose/Hand 输出；
+8. reset；
+9. stop；
+10. destroy。
+
+这些不是本文虚构的函数名。最终实际符号、参数、返回值和线程约束必须来自厂商 Linux SDK 文档，并作为 Phase 0 交付物冻结。
+
+### 7.2 TrackingImageQueue
+
+T03 把 Tracking/Ctrl 图像交给 T05。
+
+推荐的队列元素：
+
+```text
+TrackingImagePacket
+  group
+  frameId
+  left/right timestamp
+  left/right image descriptor
+  calibration revision
+  image lease
+```
+
+队列类型：
+
+```text
+T03 → T05
+SPSC bounded
+容量 8～16 个 group
+```
+
+两种内存模式必须在启动时二选一：
+
+#### 模式 A：算法支持 dma-buf，并保证释放 deadline
+
+- T03 增加 camera lease 引用；
+- T05 将 dma-buf 提交给算法；
+- 算法完成输入消费后 T05 释放 lease；
+- CameraPool 必须覆盖算法最大在途帧数。
+
+#### 模式 B：算法不能及时释放 camera buffer
+
+- T03 从 TrackingImagePool 取得固定 block；
+- 将灰度图复制一次；
+- 立即释放 camera lease；
+- T05 只持有 TrackingImagePool lease。
+
+模式 B 内存更多，但不会因为 Tracking 算法延迟耗尽 camera driver buffer。厂商不能明确承诺输入生命周期时，必须使用模式 B。
+
+TrackingImageQueue 满不能静默丢中间帧后继续宣称 tracking 正常。T05 必须收到 discontinuity/reset 事件，并将相应时间段 Pose/Hand 标记 invalid。
+
+### 7.3 T05 Native Tracking
+
+T05 是 Tracking SDK handle 的唯一 owner。
+
+线程循环按时间顺序处理：
+
+```text
+poll TrackingCommand eventfd
+  → drain TrackingImuQueue
+  → drain TrackingImageQueue
+  → 按 timestamp 提交 IMU 和图像
+  → poll/drain Tracking 输出
+  → 写 TrackingRing
+  → 发布 health metrics
+```
+
+T05 不写 CSV、不编码视频、不发送网络。
+
+### 7.4 TrackingRing
+
+TrackingRing 是 T05 单 writer 的固定环：
+
+```text
+TrackingSample
+  timestampBootNs
+  head position/orientation
+  head validity/confidence
+  left hand joints[]
+  right hand joints[]
+  hand validity/confidence
+  source sequence
+  algorithm state
+```
+
+保存时间至少覆盖：
+
+```text
+最大算法输出延迟 + Sensor Aligner 最大等待 + 2 秒余量
+```
+
+T06 查询目标曝光时刻时：
+
+- position 线性插值；
+- orientation 使用 quaternion SLERP；
+- Hand joints 使用相邻有效结果插值或最近有效结果；
+- 超过最大 gap 返回 invalid；
+- 不能用“当前最新 Pose”冒充历史曝光时刻 Pose。
+
+---
+
+## 8. 传感器对齐链路
+
+### 8.1 FrameAnchorQueue
+
+T03 对每个 RGB frame 产生一个不带图像的小对象：
+
+```text
+FrameAnchor
+  sessionGeneration
+  frameId
+  rgb left/right sequence
+  left/right exposure start
+  left/right exposure duration
+  visualAnchorBootNs
+  sync quality
+  calibration revision
+```
+
+通过 SPSC bounded FrameAnchorQueue 从 T03 传给 T06。容量覆盖：
+
+```text
+RGB fps × 最大 Tracking 输出延迟 + safety
+```
+
+该队列不持有相机图像，因此 T06 等待 Tracking 结果不会占用 camera buffer。
+
+### 8.2 T06 Sensor Aligner
+
+T06 每次处理一个 `FrameAnchor`：
+
+1. 等待 TrackingRing 覆盖 `visualAnchorBootNs`，但不超过配置 deadline；
+2. 查询或插值该时刻 Head Pose；
+3. 查询或插值该时刻左右手；
+4. 从 ImuRing 取得 `(previousRgbAnchor, currentRgbAnchor]` 的全部 IMU；
+5. 计算 pose/hand 时间误差；
+6. 记录 camera、IMU、Tracking clock quality；
+7. 生成 `AlignedSensorRecord`；
+8. 投递 AlignedSensorQueue 给 T13。
+
+`AlignedSensorRecord` 是小型值对象：
+
+```text
+sessionGeneration
+frameId
+visualAnchorBootNs
+head pose + validity
+left/right hand joints + validity
+imu window begin/end sequence
+sync method
+time error
+clock quality
+```
+
+Tracking deadline 超时：
+
+- 当前 frame 的 Pose/Hand 标记 invalid；
+- 图像和视频仍然正常写入；
+- 连续 invalid 超过阈值才触发 Tracking fault；
+- 不能反向阻塞 Camera、GPU 或 Encoder。
+
+---
+
+## 9. 图像处理链路
+
+### 9.1 ImageProcessQueue
+
+T03 将每个有效 CameraGroupBlock 投递给 T07。
+
+元素保存：
+
+```text
+streamId
+frameId
+capture timestamp
+camera metadata
+camera buffer lease
+acquire fence
+```
+
+使用一条 SPSC bounded queue，或 RGB/Tracking/Ctrl 三条独立 SPSC queue。建议使用三条，避免 60 fps 灰度图阻塞 RGB。
+
+### 9.2 T07 Image Processor
+
+优先使用 Vulkan。
+
+关键 API：
+
+```text
+vkCreateInstance
+vkEnumeratePhysicalDevices
+vkCreateDevice
+vkGetDeviceQueue
+vkCreateImage
+vkGetMemoryFdPropertiesKHR
+VkImportMemoryFdInfoKHR + vkAllocateMemory
+vkBindImageMemory
+vkCreateSemaphore
+vkImportSemaphoreFdKHR
+vkQueueSubmit2 / vkQueueSubmit
+vkWaitSemaphores
+```
+
+T07 是 `VkQueue` 的唯一 submit 线程。
+
+每个输入执行：
+
+1. import 或查找已缓存的 dma-buf image；
+2. 等待 acquire fence；
+3. 根据 group layout 处理 SBS、crop、旋转、灰度和格式；
+4. 从对应 GPU ImagePool 取得输出 image；
+5. submit GPU command；
+6. 产生 release fence；
+7. 生成 `ProcessedFrame`；
+8. 投递到对应 EncoderInputQueue；
+9. GPU 不再读取 camera buffer 后释放 camera lease。
+
+`ProcessedFrame` 保存：
+
+```text
+streamId
+frameId
+captureBootNs
+camera metadata
+GPU image lease
+release fence
+```
+
+没有 Vulkan 时使用 CPU/libyuv fallback，但必须从固定 CPU ImagePool 取得输出，不能逐帧分配大 `std::vector`。
+
+### 9.3 GPU ImagePool
+
+RGB、Tracking、Ctrl 各自独立。
+
+容量至少为：
+
+```text
+EncoderInputQueue 容量
++ encoder OUTPUT buffer 数
++ GPU 最大 in-flight
++ 1
+```
+
+最后一个 encoder input 引用释放后，image 才能回到对应 pool。
+
+---
+
+## 10. 视频编码和落盘
+
+### 10.1 三个 Encoder Owner
+
+T08、T09、T10 分别独占一个 V4L2 M2M encoder fd。
+
+关键 API：
+
+```text
+VIDIOC_QUERYCAP
+VIDIOC_S_FMT
+VIDIOC_S_EXT_CTRLS
+VIDIOC_REQBUFS
+VIDIOC_QUERYBUF
+VIDIOC_QBUF
+VIDIOC_STREAMON
+poll/epoll
+VIDIOC_DQBUF
+VIDIOC_STREAMOFF
+```
+
+每个 encoder 使用：
+
+- OUTPUT queue：GPU/CPU 处理后的原始图像；
+- CAPTURE queue：编码后的 HEVC；
+- B-frame 关闭；
+- 固定 GOP；
+- 明确 bitrate/profile/level；
+- 支持 request IDR；
+- 支持 EOS drain。
+
+T07 只向 EncoderInputQueue push，不能直接调用 encoder ioctl。
+
+### 10.2 Encoder owner loop
+
+每个 encoder owner 同时监听：
+
+- input queue eventfd；
+- encoder fd；
+- command eventfd。
+
+处理顺序：
+
+```text
+ProcessedFrame
+  → QBUF OUTPUT
+  → 保存 frameId/metadata 到固定 in-flight table
+  → DQBUF OUTPUT
+  → 释放 GPU image lease
+
+DQBUF CAPTURE
+  → 取得 bytesused、timestamp、flags
+  → 从 EncodedBufferPool 取得 block
+  → 将编码 payload 复制一次
+  → 立即 QBUF CAPTURE
+  → 解析 VPS/SPS/PPS、IDR、PTS
+  → 按 timestamp/sequence 找回 frameId 和 camera metadata
+  → 写对应 fMP4 和 camera metadata
+```
+
+V4L2 CAPTURE buffer 如果能在多个 sink 完成前保持有效，也可以直接 lease；否则必须复制一次到 EncodedBufferPool。文件和网络不能各复制一份。
+
+### 10.3 编码数据结构
+
+```text
+EncodedPacket
+  streamId
+  frameId
+  captureBootNs
+  ptsUs
+  codecConfig
+  idr
+  payload lease
+  camera metadata
+```
+
+RGB `EncodedPacket` 有两个只读消费者：
+
+- T08 自己的 FileSink；
+- PreviewQueue/T14。
+
+Tracking 和 Ctrl 只有 FileSink。
+
+网络丢帧只释放网络引用，不能影响文件引用。
+
+### 10.4 fMP4
+
+每个 encoder owner 只写自己的视频和 metadata：
+
+| 线程 | 文件 |
+|---|---|
+| T08 | `rgb.mp4`、`rgb_metainfo.csv` |
+| T09 | `tracking.mp4`、`tracking_metainfo.csv` |
+| T10 | `ctrl.mp4`、`ctrl_metainfo.csv` |
+
+文件 API：
+
+```text
+open
+write/writev
+fdatasync
+fsync
+close
+```
+
+fMP4 使用：
+
+```text
+ftyp + moov
+styp + moof + mdat
+styp + moof + mdat
+...
+```
+
+视频 sample 和对应 metadata 必须在同一 owner thread 中按同一 `FrameId` 提交，避免视频帧数和 CSV 行数不一致。
+
+磁盘持续变慢时不能静默丢录制视频；应通知 T01 停止并 finalize 已经接收的数据。
+
+---
+
+## 11. 音频链路
+
+### 11.1 T11 Audio Capture
+
+使用 ALSA libasound。
+
+关键 API：
+
+```text
+snd_pcm_open
+snd_pcm_hw_params_any
+snd_pcm_hw_params_set_access
+snd_pcm_hw_params_set_format
+snd_pcm_hw_params_set_channels
+snd_pcm_hw_params_set_rate_near
+snd_pcm_hw_params_set_period_size_near
+snd_pcm_hw_params_set_buffer_size_near
+snd_pcm_hw_params
+snd_pcm_prepare
+snd_pcm_start
+snd_pcm_poll_descriptors
+snd_pcm_readi / snd_pcm_mmap_readi
+snd_pcm_status
+snd_pcm_status_get_htstamp
+snd_pcm_recover
+snd_pcm_drop
+snd_pcm_close
+```
+
+T11 是 ALSA handle 的唯一 owner。
+
+每个 period：
+
+1. 从 AudioBlockPool 取得 PCM block；
+2. `snd_pcm_readi` 直接写入 block；
+3. 取得硬件 timestamp 和 frame position；
+4. 计算第一个 sample 的 BOOTTIME；
+5. 生成 `AudioBlock`；
+6. 投递 PcmQueue。
+
+`AudioBlock` 保存：
+
+```text
+firstSampleIndex
+firstSampleBootNs
+frameCount
+sampleRate
+channels
+PCM block lease
+```
+
+发生 xrun 时使用 `snd_pcm_recover`，记录 gap 和 gap 长度。超过阈值后停止录制。
+
+### 11.2 AudioBlockPool 和 PcmQueue
+
+```text
+blockBytes = periodFrames × channels × bytesPerSample
+blockCount = ceil(maxPipelineLatency / periodDuration) + safety
+```
+
+建议初始 16～32 blocks。pool 耗尽时不能临时 heap 分配。
+
+PcmQueue：
+
+```text
+T11 → T12
+SPSC bounded
+容量不大于 AudioBlockPool blockCount
+```
+
+### 11.3 T12 Audio Encoder
+
+T12 独占 AAC encoder。
+
+Linux AAC backend 优先级：
+
+1. SoC 厂商硬件 AAC API；
+2. FFmpeg `libavcodec`；
+3. 其他已确认许可的 AAC encoder。
+
+厂商 API 的实际函数名必须在 Phase 0 冻结。需要具备 configure、submit PCM、drain output、EOS、flush、stop 语义。
+
+AAC PTS 使用累计 sample 数：
+
+```text
+ptsUs = totalSamples × 1,000,000 / sampleRate
+```
+
+T12 直接写：
+
+- `audio.m4a`；
+- `audio_metainfo.csv`。
+
+PCM 编码完成后释放 AudioBlock lease。
+
+---
+
+## 12. Sensor Writer 和数据集
+
+### 12.1 T13 Sensor Writer
+
+T13 独占：
+
+- `accel.csv`；
+- `gyro.csv`；
+- `head_pose.csv`；
+- `hand_tracking.csv`。
+
+输入使用两条独立 SPSC queue：
+
+| 队列 | Producer |
+|---|---|
+| ImuRecordQueue | T04 |
+| AlignedSensorQueue | T06 |
+
+T13 round-robin 批量 drain，防止高频 IMU 长期阻塞 Head/Hand。
+
+写入 API：
+
+```text
+open
+writev
+fdatasync
+close
+```
+
+不要求每行 fsync。按时间或数据量执行批量 `fdatasync`。
+
+### 12.2 Session 文件
+
+```text
+rgb.mp4
+rgb_metainfo.csv
+tracking.mp4
+tracking_metainfo.csv
+ctrl.mp4
+ctrl_metainfo.csv
+audio.m4a
+audio_metainfo.csv
+accel.csv
+gyro.csv
+head_pose.csv
+hand_tracking.csv
+camera_params_rgb.json
+camera_params_tracking.json
+camera_params_ctrl.json
+imu_calibration.json
+tracking_calibration.json
+capture_status.json
+session_manifest.json
+capture.log
+```
+
+录制先创建：
+
+```text
+<session>.partial
+```
+
+只有全部 writer finalize、文件同步和 manifest 完成后才：
+
+```text
+rename <session>.partial → <session>
+fsync parent directory
+```
+
+发生数据丢失时 session 必须标记 incomplete，不能只保留日志而继续标记 complete。
+
+---
+
+## 13. TCP 8801 控制链路
+
+T00 Main EventLoop 使用：
+
+```text
+epoll_create1
+epoll_ctl
+epoll_wait
+eventfd
+timerfd_create
+signalfd
+socket
+bind
+listen
+accept4
+recv
+send
+```
+
+链路：
+
+```text
+TCP 8801
+  → T00 connection read buffer
+  → packet framing / protobuf decode
+  → CoordinatorQueue
+  → T01 Operation Coordinator
+  → 模块 command queue
+  → completion event
+  → T00 response write queue
+```
+
+控制连接不使用“一连接一线程”。
+
+每个连接使用固定最大 read/write buffer，必须处理半包、粘包、非法长度和超时。
+
+T01 是唯一可以修改以下状态的线程：
+
+- Idle/Preview/Recording/Export；
+- Starting/Stable/Stopping/Fault；
+- state revision；
+- session generation；
+- ResourcePlan。
+
+T01 不执行 camera ioctl、encoder drain、文件 fsync 或 socket 大包发送。
+
+---
+
+## 14. TCP 8802 RGB 视频链路
+
+```text
+T08 RGB EncodedPacket
+  → PreviewQueue
+  → T14 Video Sender
+  → TCP 8802
+```
+
+T14 使用：
+
+```text
+socket(SOCK_NONBLOCK | SOCK_CLOEXEC)
+setsockopt
+bind
+listen
+accept4
+poll/epoll
+sendmsg/writev
+shutdown
+close
+```
+
+PreviewQueue 同时限制：
+
+- 最大帧数；
+- 最大总字节数；
+- 最大帧年龄。
+
+队列元素只保存共享 `EncodedPacket` lease。
+
+慢客户端策略：
+
+1. 丢弃网络队列中的旧 P 帧；
+2. 保留最新 VPS/SPS/PPS；
+3. 请求 T08 产生新 IDR；
+4. 从新 IDR 恢复；
+5. 持续超时则断开客户端。
+
+任何网络行为都不能阻塞 T08 写本地文件。
+
+---
+
+## 15. BLE、Wi-Fi 和时间同步
+
+### 15.1 BLE
+
+Linux 使用 BlueZ D-Bus GATT，不使用 Android `BluetoothGattServer`。
+
+T00 使用 sd-bus：
+
+```text
+sd_bus_open_system
+sd_bus_add_object_vtable
+sd_bus_request_name
+org.bluez.GattManager1.RegisterApplication
+org.bluez.LEAdvertisingManager1.RegisterAdvertisement
+org.freedesktop.DBus.ObjectManager.GetManagedObjects
+sd_bus_match_signal
+sd_bus_get_fd
+sd_bus_get_events
+sd_bus_get_timeout
+sd_bus_process
+UnregisterAdvertisement
+UnregisterApplication
+sd_bus_unref
+```
+
+BlueZ D-Bus fd 接入 T00 epoll，不增加 BLE 线程。
+
+GATT callback 只执行：
+
+1. 检查 characteristic 和 payload 长度；
+2. 复制小型 request；
+3. 记录接收 BOOTTIME；
+4. 投递 CoordinatorQueue 或 TimeSyncSession；
+5. 返回 D-Bus。
+
+BLE 功能包括：
+
+- SSID/Password 配网；
+- Wi-Fi 状态和 IP notify；
+- 控制命令和响应；
+- 错误通知；
+- 设备信息；
+- 时间同步。
+
+Wi-Fi 密码不能写入日志，D-Bus message 发送完成后清零临时内存。
+
+### 15.2 Wi-Fi
+
+优先使用 NetworkManager D-Bus：
+
+```text
+org.freedesktop.NetworkManager
+AddAndActivateConnection
+ActivateConnection
+DeactivateConnection
+PropertiesChanged
+IP4Config
+```
+
+没有 NetworkManager 时才使用 wpa_supplicant D-Bus。不能执行 `nmcli`/`wpa_cli` 后解析 shell 文本。
+
+Wi-Fi D-Bus fd 同样由 T00 epoll 管理。
+
+状态变化：
+
+```text
+D-Bus signal
+  → T00
+  → WifiState event
+  → T01
+  → TCP/BLE status response
+```
+
+### 15.3 BLE 时间同步
+
+每个 BLE peer 保存一个小型 TimeSyncSession：
+
+```text
+peer id
+request id
+t1/t2/t3/t4
+RTT
+offset
+quality
+state
+```
+
+接收入口立即采样 `t2 = CLOCK_BOOTTIME`，notify 前采样 `t3`。
+
+BLE 同步结果只描述 Linux 设备和手机之间的 offset，不能反向修改 Camera、IMU、Audio 已采集的内部 BOOTTIME。
+
+---
+
+## 16. U 盘、快照和日志
+
+### 16.1 U 盘检测与导出
+
+T00 使用：
+
+```text
+udev_new
+udev_monitor_new_from_netlink
+udev_monitor_filter_add_match_subsystem_devtype
+udev_monitor_enable_receiving
+udev_monitor_get_fd
+udev_monitor_receive_device
+statvfs
+```
+
+udev fd 接入 epoll。T00 只检测设备并创建 ExportRequest，不复制文件。
+
+T16 Export Worker：
+
+```text
+ExportRequest
+  → 检查 session 为 complete
+  → 检查目标空间
+  → 创建 <session>.tmp
+  → copy_file_range 或 read/write fallback
+  → 校验大小和可选 SHA-256
+  → fdatasync files
+  → fsync directory
+  → rename 到正式目录
+  → fsync export 根目录
+```
+
+U 盘拔出时保留 `.tmp`，不修改源数据。默认导出成功后仍保留本地数据。
+
+### 16.2 T15 Snapshot Worker
+
+快照请求链路：
+
+```text
+T01
+  → CameraRouterCommandQueue
+  → T03 标记下一张完整 group
+  → T07 生成 readback image lease
+  → SnapshotImageQueue
+  → T15 使用 libpng、libjpeg-turbo 或已确认的图片库编码
+  → completion event
+  → T01
+```
+
+快照不能在 camera callback、T03 或 T07 中执行 PNG/JPEG 压缩。
+
+SnapshotImageQueue 容量 1～2；已有活动请求时拒绝新请求，不影响录制。
+
+### 16.3 T17 Logger Worker
+
+所有线程向有界 LoggerQueue 写定长 LogRecord：
+
+```text
+boottime
+realtime
+thread id/name
+module
+session generation
+stream/frame/sequence
+level
+message
+```
+
+T17 写：
+
+- stdout/stderr，由 systemd 收集；
+- journald；
+- app log；
+- session `capture.log`。
+
+LoggerQueue 满时 DEBUG/INFO 可以丢并计数，ERROR/FATAL 使用 stderr/journald fallback。日志不能阻塞 camera callback。
+
+---
+
+## 17. 队列和内存池总表
+
+### 17.1 队列
+
+| 队列 | Producer → Consumer | 类型 | 元素 | 满时处理 |
+|---|---|---|---|---|
+| CameraIngress[3] | callback/T02 → T03 | MPSC bounded | CameraGroupBlock lease | Preview 丢当前；Recording fault |
+| CameraRequeue | 任意 lease releaser → T02 | MPSC bounded | buffer token/index | 不应满；满为生命周期错误 |
+| ImageProcess[3] | T03 → T07 | SPSC bounded | CameraGroupBlock lease | Recording fault |
+| TrackingImage | T03 → T05 | SPSC bounded | camera/copy-pool lease | Tracking discontinuity/reset |
+| TrackingImu | T04 → T05 | SPSC bounded | ImuBatch 值 | Tracking reset/fault |
+| FrameAnchor | T03 → T06 | SPSC bounded | FrameAnchor 值 | Recording incomplete/stop |
+| EncoderInput[3] | T07 → T08/T09/T10 | SPSC bounded | ProcessedFrame lease | Recording fault |
+| PcmQueue | T11 → T12 | SPSC bounded | AudioBlock lease | Audio fault |
+| ImuRecord | T04 → T13 | SPSC bounded | ImuBatch 值 | Recording incomplete/stop |
+| AlignedSensor | T06 → T13 | SPSC bounded | AlignedSensorRecord 值 | Recording incomplete/stop |
+| Preview | T08 → T14 | SPSC/有界 deque | EncodedPacket lease | 丢网络旧 P 帧 |
+| Coordinator | T00/Health/worker → T01 | MPSC bounded | OperationEvent | System fault |
+| ModuleCommand | T01 → 各 owner | 每模块 SPSC | Command + revision | System fault |
+| SnapshotImage | T07 → T15 | SPSC，容量 2 | CPU image lease | 拒绝新请求 |
+| Export | T01 → T16 | SPSC，容量 2 | ExportRequest | 拒绝或合并 |
+| Logger | 所有线程 → T17 | MPSC bounded | LogRecord | 低级日志可丢 |
+
+### 17.2 内存池
+
+| Pool | 保存内容 | 归还条件 |
+|---|---|---|
+| Camera driver pool | 原始 camera buffer | 所有 camera lease 释放 |
+| CameraCopyPool | callback 无 retain 时的完整 group copy | T07/T05 不再使用 |
+| TrackingImagePool | Tracking 算法专用灰度输入 | T05 完成提交/消费 |
+| GPU ImagePool[3] | RGB/Tracking/Ctrl 处理结果 | encoder DQBUF OUTPUT |
+| EncodedBufferPool | HEVC payload | FileSink 和 PreviewSink 都释放 |
+| AudioBlockPool | PCM period | T12 编码完成 |
+| ObjectPool | CameraGroupBlock、VisualEpoch 等描述对象 | 最后一个引用释放 |
+| ImuRing | 最近 IMU 值 | 固定 slot 被 sequence 安全覆盖 |
+| TrackingRing | 最近 Pose/Hand 值 | 固定 slot 被 sequence 安全覆盖 |
+
+所有 pool 在硬件启动前建立。pool 耗尽后禁止回退到 `new/malloc`。
+
+### 17.3 Lease 和数据安全
+
+- pool handle 使用 `{slotIndex, generation}`，防止 slot 重用后的 ABA。
+- lease control block 使用原子引用计数。
+- 大 payload 发布后只读。
+- dma-buf fd 由 lease control block 唯一拥有，业务对象只保存 fd index/plane 描述。
+- fence 必须明确 move 所有权，不能把同一个整数 fd 交给多个析构者。
+- ring writer 先写 payload，最后 release-store sequence；reader acquire-load sequence，复制后再次校验。
+- queue push 成功后所有权转给 queue；push 失败后所有权仍归 producer。
+- queue close 后拒绝新 push，consumer drain 完已有元素后返回 closed。
+
+### 17.4 内存预算
+
+启动时计算：
+
+```text
+camera driver/copy pool
++ tracking image pool
++ GPU image pool
++ encoder driver buffers
++ encoded payload pool
++ PCM pool
++ ring/queue/object pool
+```
+
+总量超过 `memory_budget_bytes` 时拒绝开始采集。
+
+容量至少满足：
+
+```text
+camera buffers
+  >= driver 最小 queued
+   + ingress/reorder/image process in-flight
+   + tracking in-flight
+   + GPU in-flight
+
+GPU images
+  >= encoder input queue
+   + encoder OUTPUT in-flight
+   + GPU in-flight
+
+PCM blocks
+  >= 最大音频链路延迟 / period 时长 + safety
+```
+
+---
+
+## 18. 启动顺序
+
+```text
+1. 读取配置
+2. 启动 T17 Logger
+3. 建立 CLOCK_BOOTTIME/REALTIME 基准
+4. 初始化 T00 epoll、signalfd、timerfd
+5. probe Camera、IIO、ALSA、Tracking SDK、GPU、HEVC、AAC
+6. 校验 timestamp domain、buffer lifetime、格式和标定
+7. 计算并创建全部 queue、ring 和 pool
+8. 启动 T13 Sensor Writer 等等待型线程
+9. 启动 T05 Native Tracking
+10. 启动 T04 IMU Capture
+11. 启动 T02 Camera IO 和 T03/T06/T07
+12. 启动三个 encoder owner
+13. 启动 Audio Capture/Encoder
+14. 注册 BlueZ GATT 和 NetworkManager 订阅
+15. 启动 TCP 8801/8802 listen
+16. 启动 T01 Coordinator
+17. sd_notify READY=1
+```
+
+任何硬件 capability 未确认时只能进入诊断模式，不能开始正式录制。
+
+---
+
+## 19. 录制开始顺序
+
+```text
+START command
+  → T01 phase=STARTING，sessionGeneration++
+  → 检查存储、硬件和 queue/pool health
+  → 创建 <session>.partial
+  → 记录 sessionRealtimeOffsetNs 和标定 revision
+  → 打开所有 CSV/fMP4 writer
+  → 清空旧 ring/query 状态
+  → 启动 IMU、Tracking、Camera、Audio admission
+  → 启动三个 encoder stream
+  → 请求三个 encoder IDR
+  → 第一张真实 IDR 建立各自 PTS 零点
+  → capture_status=recording
+  → T01 phase=STABLE
+```
+
+任一步失败都要关闭已经打开的资源，并把 partial session 标记为 startup_failed。
+
+---
+
+## 20. 停止和内存回收顺序
+
+```text
+STOP command
+  → T01 phase=STOPPING，记录 stopBootNs
+
+  → 关闭新 preview/snapshot/export admission
+
+  → 同时通知硬件 producer 停止新数据：
+       T02 stop camera / STREAMOFF
+       T04 stop IIO
+       T11 stop ALSA capture
+     T02 保持 requeue-only 状态
+
+  → 等待厂商 callback active count=0
+  → close CameraIngress[3]、TrackingImu、PcmQueue、ImuRecordQueue
+
+  → T03 drain camera，关闭 ImageProcess、TrackingImage、FrameAnchor
+  → T05 drain tracking input，输出最后结果
+  → T06 drain FrameAnchor，关闭 AlignedSensorQueue
+  → T07 drain GPU，关闭 EncoderInput[3]
+
+  → T08/T09/T10 drain encoder input
+  → signal EOS
+  → DQBUF 到真实 EOS
+  → finalize 三路 fMP4 和 metadata
+
+  → T12 drain PCM、AAC EOS、finalize audio
+  → T13 drain IMU/AlignedSensor、flush CSV
+
+  → 停止 T05 Tracking backend
+
+  → 等待 Camera/GPU/Encoded/PCM/Object pool outstanding=0
+  → T02 处理最后 CameraRequeue 后才能 close camera
+
+  → 写 manifest/capture_status
+  → fdatasync 文件
+  → fsync session 目录
+  → rename partial
+  → fsync 父目录
+
+  → T01 phase=IDLE
+```
+
+每一步都有 deadline。超时后记录具体未归还的 pool slot、线程和 frame/sequence，继续执行仍然安全的清理。
+
+Stop 必须幂等。第二个 Stop 等待第一次 Stop 的结果，不能启动第二套 drain。
+
+---
+
+## 21. 故障和背压
+
+| 故障 | 检测线程 | 处理 |
+|---|---|---|
+| Camera queue 持续满 | T03/Health | Preview 丢当前；Recording 停止 |
+| camera timestamp reset | T02 | 当前 session incomplete，reset 映射 |
+| 左右眼曝光偏差超限 | T03 | group invalid；持续则停止 |
+| 30/60 fps cadence 错误 | T03 | 记录 sequence/trigger fault |
+| TrackingImage/IMU 丢失 | T05 | Tracking reset；输出 invalid |
+| Tracking 输出超时 | T06 | 当前 FrameId invalid；持续则 fault |
+| ImuRecordQueue 满 | T04/T13 | session incomplete，停止 |
+| Audio xrun | T11 | recover 并记录 gap；超阈值停止 |
+| GPU pool 耗尽 | T07 | 停止录制 |
+| Encoder hang | T08～T10 | EOS deadline 后故障清理 |
+| 文件短写/磁盘慢 | writer owner | 停止录制并 finalize |
+| TCP 慢客户端 | T14 | 丢网络 P 帧或断开 |
+| BLE/Wi-Fi 断开 | T00 | 发布状态，不影响本地录制 |
+| U 盘拔出 | T16 | 取消 export，保留 `.tmp` 和源数据 |
+| pool lease 泄漏 | Stop/Health | 报告 slot/generation/owner，不销毁悬空 backend |
+
+Health timer 每秒采集：
+
+- 每个线程最后 progress 时间；
+- queue depth/capacity/high-water；
+- pool available/outstanding；
+- sensor rate 和 sequence gap；
+- clock mapping residual；
+- Tracking latency/validity；
+- encoder latency；
+- writer latency；
+- 磁盘空间；
+- fd 数量。
+
+---
+
+## 22. systemd 和权限
+
+systemd 服务使用非 root 用户。
+
+需要的设备权限：
+
+- `/dev/video*`；
+- `/dev/media*`；
+- `/dev/dri/renderD*`；
+- `/dev/iio:device*`；
+- ALSA capture device；
+- BlueZ system D-Bus；
+- NetworkManager system D-Bus。
+
+服务配置至少包括：
+
+```text
 Type=notify
-User=egocollect
-Group=egocollect
-ExecStart=/usr/bin/egocollectd --config /etc/egocollect/config.toml
 Restart=on-failure
-RestartSec=2
-TimeoutStopSec=30
-WatchdogSec=10
+WatchdogSec
+TimeoutStopSec
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/egocollect
 SupplementaryGroups=video render audio input iio
-
-[Install]
-WantedBy=multi-user.target
 ```
 
-原则：
-
-- 默认不以 root 运行；
-- udev 配置 camera/render/audio/IIO 权限；
-- Wi-Fi/BLE 通过受控 D-Bus policy；
-- 配网密码不进入日志；
-- Unix control socket 由 group 控制；
-- 数据目录 `0750`，文件 `0640`。
+SIGTERM/SIGINT 通过 signalfd 进入 T00，不能在异步 signal handler 中调用 C++ 对象、文件或硬件 API。
 
 ---
 
-## 27. CMake Targets
+## 23. 移植前必须由硬件/算法团队确认的内容
 
-```text
-ego_types                 INTERFACE
-ego_core                  STATIC
-ego_time                  STATIC
-ego_camera                STATIC
-ego_tracking              STATIC
-ego_imu                   STATIC
-ego_audio                 STATIC
-ego_media                 STATIC
-ego_dataset               STATIC
-ego_protocol              STATIC
-ego_connectivity          STATIC
-ego_platform_linux        STATIC
+### 23.1 Camera
 
-camera_backend_own        MODULE/STATIC
-tracking_backend_openxr   MODULE/STATIC
-tracking_backend_vio      MODULE/STATIC
-image_backend_vulkan      MODULE/STATIC
-encoder_backend_v4l2      MODULE/STATIC
-audio_backend_alsa        MODULE/STATIC
-imu_backend_own           MODULE/STATIC
-
-egocollectd               EXECUTABLE
-egocollectctl             EXECUTABLE
-egocollect-replay         EXECUTABLE
-egocollect-calib          EXECUTABLE
-egocollect-diag           EXECUTABLE
-```
-
-要求：
-
-- C++20；
-- CMake 3.22+；
-- 禁止全局 `file(GLOB *.cpp)`；
-- core 不链接平台库；
-- backend 通过 factory 显式创建；
-- 支持 x86_64 host 和 aarch64 cross-build；
-- replay backend 在无硬件 CI 可运行；
-- Debug 支持 ASan/UBSan/TSan；
-- 生成 build-id、debug symbols、SBOM。
-
----
-
-## 28. 测试文件和验收
-
-### 28.1 Unit
-
-```text
-test_operation_state.cpp
-test_resource_plan.cpp
-test_clock_mapper.cpp
-test_frame_synchronizer.cpp
-test_pose_interpolation.cpp
-test_hevc_parser.cpp
-test_idr_gate.cpp
-test_fmp4_writer.cpp
-test_packet_codec.cpp
-test_external_time_sync.cpp
-test_dataset_schema.cpp
-```
-
-### 28.2 Backend Contract
-
-每个 backend 必须运行统一 contract：
-
-```text
-camera_backend_contract.cpp
-tracking_backend_contract.cpp
-video_encoder_contract.cpp
-audio_backend_contract.cpp
-imu_backend_contract.cpp
-```
-
-检查：
-
-- start/stop 幂等；
-- stop 后无 callback；
+- Linux 实际 API 和 so；
+- RGB/Tracking/Ctrl topology；
+- 左右眼独立 buffer 还是 SBS；
+- dma-buf 格式、plane、stride、modifier；
+- acquire/release fence；
+- callback buffer retain/release；
 - timestamp domain；
-- buffer lease；
-- queue/backpressure；
-- EOS/drain；
-- 故障恢复。
+- exposure 单位；
+- trigger ID、sequence domain；
+- RGB 30、Tracking/Ctrl 60 的 divisor/phase；
+- 最大在途 buffer；
+- 标定参数格式。
 
-### 28.3 Compatibility
+### 23.2 IMU
 
-建立黄金资产：
+- Linux IIO node 或厂商 API；
+- ODR；
+- accel/gyro 单位；
+- 轴向；
+- timestamp domain；
+- bias、scale、non-orthogonal calibration；
+- camera-IMU time offset；
+- reset 行为。
 
-- 当前 Android SDK TCP pcap；
-- BLE 广播/GATT trace；
-- 正常/短时/长时/强杀数据集；
-- 当前 HEVC config/IDR；
-- 状态转移序列；
-- 时间同步 JSON；
-- 手机 App 联调脚本。
+### 23.3 Native Tracking
 
-Linux 验收：
+- Linux 原生 Tracking SDK；
+- 实际函数和 ABI；
+- 所需 Camera/IMU 输入；
+- dma-buf 支持；
+- 输入 buffer 生命周期；
+- 最大输入/输出延迟；
+- Pose 坐标系；
+- Hand joints 定义；
+- reset 和 lost 状态；
+- 内部线程数。
 
-- 现有 App 不改协议即可配网、控制、预览；
-- 当前分析脚本可直接读取；
-- CSV 行数与媒体 packet 数一致；
-- PTS 从 0 严格单调；
-- fMP4 强杀后可读；
-- Head/Hand/Controller 对齐 mid-exposure；
-- IMU/audio/video 在同一 UTC 时间线；
-- preview→record 不断流；
-- record 中开关 preview 不重启 encoder；
-- Stop 严格排空末帧。
+### 23.4 Codec/GPU/Audio
 
-### 28.4 Soak/Fault
+- Vulkan dma-buf/modifier 支持；
+- V4L2 M2M HEVC 格式和 controls；
+- IDR/EOS 行为；
+- AAC backend；
+- ALSA device、采样率、声道和硬件 timestamp；
+- Android 侧软件增益/AGC 是否需要等价实现。
+
+这些内容未冻结前，文档中的 Linux 标准 API 可以实现，但厂商链路不能标记为完成。
+
+---
+
+## 24. 验收测试
+
+### 24.1 数据链路
+
+- RGB 30 fps、Tracking/Ctrl 60 fps 全部有效 group 恰好处理一次；
+- 左右眼 sequence、曝光和 calibration 正确；
+- RGB FrameId 与 Head/Hand CSV 一一对应；
+- Head/Hand 使用 RGB 曝光中点，不使用 callback 时间；
+- 两个 RGB 锚点之间的 IMU window 无重复、无遗漏；
+- Audio PTS 连续，xrun 有明确 gap；
+- 三路视频 sample 和 metadata 行数一致；
+- TCP 慢客户端不影响本地文件；
+- Preview 转 Recording 从真实 IDR 开始；
+- 强杀后 fMP4 可恢复到最后完整 fragment。
+
+### 24.2 内存和并发
+
+- callback 返回后立即复用底层 buffer，验证 retain/copy 正确；
+- 一个 SBS buffer 被左右 eye view 引用时只 release 一次；
+- 最后 lease 在任意线程释放，V4L2 QBUF 仍只发生在 T02；
+- dma-buf/fence fd 无重复 close、无泄漏；
+- pool slot generation 能检测 ABA；
+- queue close 和 producer push 并发安全；
+- pool 耗尽不回退 heap；
+- Stop 后所有 outstanding lease 为零；
+- 厂商 callback 晚到不会访问已销毁 backend。
+
+### 24.3 压力和故障
 
 - 12/24 小时录制；
 - 1000 次 start/stop；
-- TCP 8802 慢客户端；
-- TCP 8801 断连重连；
-- BLE 断连；
-- Wi-Fi 丢失；
-- camera 丢帧/reset；
-- OpenXR session loss；
-- encoder hang/EOS timeout；
-- 磁盘满、短写、只读；
-- audio xrun；
+- camera 丢帧、reset、timestamp 跳变；
 - IMU timestamp reset；
-- wall clock step；
-- SIGTERM/断电恢复；
-- pool/queue 泄漏。
+- Tracking 输入丢失、延迟和 reset；
+- Audio xrun；
+- GPU/encoder hang；
+- 磁盘满、短写和只读；
+- TCP/BLE/Wi-Fi 反复断连；
+- U 盘复制中拔出；
+- SIGTERM；
+- 断电恢复；
+- queue/pool 泄漏检测。
 
 ---
 
-## 29. 实施阶段
+## 25. 实施顺序
 
-### Phase 0：兼容规格冻结
+### Phase 0：冻结硬件和算法合同
 
-- 从当前 SDK 生成 golden dataset、pcap、BLE trace；
-- 冻结 OperationMode/Phase/revision；
-- 冻结数据 schema；
-- 测量当前性能、同步和稳定性；
-- 明确自有相机 timestamp、同步和 calibration contract。
+- Camera Linux ABI；
+- IIO/IMU 参数；
+- Native Tracking Linux SDK；
+- timestamp 和 trigger cadence；
+- dma-buf/fence/GPU/encoder 能力；
+- ALSA/AAC；
+- 真实数据 replay trace。
 
-### Phase 1：无硬件框架
+### Phase 1：时间、队列和内存
 
-- 新建仓库和公共类型；
-- OperationCoordinator；
-- TimeService；
-- replay backends；
-- packet/protocol；
-- DatasetSession/FMP4；
-- 用 replay 跑通五模式。
+- Clock mapping；
+- SPSC/MPSC bounded queue；
+- lease/generation；
+- Camera/Tracking/GPU/Audio pool；
+- replay backend；
+- Stop/drain 单元测试。
 
-### Phase 2：相机、IMU、Audio
+### Phase 2：Camera 和 IMU
 
-- OwnCameraBackend；
-- FrameSynchronizer；
-- calibration；
-- ClockMapper；
-- IMU/ALSA；
-- 原始数据正确性验证。
+- T02/T03/T04；
+- 三条 CameraIngressQueue；
+- 30/60 fps cadence；
+- ImuRing；
+- 原始 dump 和时间戳验证。
 
-### Phase 3：Tracking 和 Media
+### Phase 3：Native Tracking 和对齐
 
-- 最小 OpenXR TrackingService；
-- Head/Hand/Controller；
-- Vulkan processing；
-- V4L2/厂商 HEVC；
-- IDR gate；
-- fMP4 + preview。
+- T05 Linux Native Tracking；
+- TrackingImagePool；
+- TrackingRing；
+- T06 Sensor Aligner；
+- RGB FrameId 对齐验收。
 
-### Phase 4：连接与系统
+### Phase 4：GPU、HEVC、AAC 和数据集
 
-- BlueZ；
-- Wi-Fi；
+- T07～T13；
+- 三路 HEVC；
+- AAC；
+- fMP4/CSV；
+- partial/finalize/recovery。
+
+### Phase 5：TCP、BLE、Wi-Fi 和导出
+
 - TCP 8801/8802；
-- systemd、udev、health、fault、CLI。
+- BlueZ GATT；
+- NetworkManager；
+- BLE time sync；
+- snapshot；
+- U 盘 export。
 
-### Phase 5：兼容和量产
+### Phase 6：长稳和故障注入
 
-- 手机端兼容；
-- 数据质量；
-- 长稳和故障注入；
-- 性能、温度、功耗；
-- 权限、安全、诊断、升级；
-- 文档和配置冻结。
+- systemd/watchdog；
+- health metrics；
+- 12/24 小时；
+- 1000 次启停；
+- 断电和存储故障；
+- buffer/queue/pool 泄漏。
 
 ---
 
-## 30. 最终技术结论
-
-Linux 新版本应当是一个**以统一时间轴为核心的多传感器采集服务**：
+## 26. 最终设计原则
 
 ```text
-Drivers
-→ Typed C++ Services
-→ Clock Mapping
-→ Frame Synchronization
-→ Pose/Hand/Controller Alignment
-→ Image Processing
-→ Encoding
-→ Dataset + TCP Preview
+每个外设由一个明确 owner thread 调用真实 Linux/厂商 API
+  → 采样时间全部映射为 BOOTTIME
+  → 大图像/PCM 通过专用 pool lease 传输
+  → IMU/Pose/Hand 通过定长值对象和固定 ring 传输
+  → Camera 图像编码与传感器对齐解耦
+  → Head Pose 和双手由 Linux Native Tracking 产生
+  → 文件完整性优先，网络预览允许丢帧
+  → Stop 先停 producer，再逐级 drain，最后销毁 pool 和硬件
 ```
 
-最重要的设计不是把所有数据“贴到最近的视频 PTS”，而是：
-
-1. 每个 source 明确原始时钟域；
-2. 映射到统一 boottime；
-3. 以视频 mid-exposure 为视觉锚点；
-4. Pose/Hand/Controller 在该时刻查询或插值；
-5. IMU 保留完整时间窗口；
-6. Audio 保持连续 sample clock；
-7. encoder PTS 从 capture time 派生；
-8. 写文件时再映射 UTC；
-9. BLE/TCP 设备间同步与内部同步分开处理。
-
-代码结构上，业务状态、资源计划、时间系统、设备 backend、媒体处理和兼容输出必须彼此独立。高频链路使用专用线程、有界队列和专用内存池；低频系统事件使用主 epoll loop。每个 encoder、OpenXR session、Vulkan queue 和 writer 都有唯一线程 owner。
-
-按照这个框架实现，可以保留当前 SDK 的功能和对外行为，同时完全摆脱 Android 工程结构。后续更换相机、Tracking backend、编码器或 Linux 发行版时，只需要替换 backend，不需要再次重写整个采集服务。
+这份方案的实施重点不是类名和文件名，而是每条链路的 owner、API、队列、内存和生命周期必须严格一致。
